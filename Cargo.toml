@@ -1,0 +1,20 @@
+[package]
+name = "hel"
+version = "0.1.0"
+edition = "2024"
+authors = ["Bieliaiev Vladyslav <vladbpython@gmail.com>"]
+
+[dependencies]
+futures = "0.3.32"
+
+
+[dev-dependencies]
+flume     = "0.12"
+criterion = { version = "0.8.2", features = ["async_tokio"] }
+tokio = { version ="1.49.0", features = ["full"]}
+
+[[bench]]
+name    = "channel_bench"
+harness = false
+path = "benches/channel_bench.rs"
+
