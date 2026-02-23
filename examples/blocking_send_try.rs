@@ -19,6 +19,7 @@ fn main() {
         Ok(()) => println!("sent"),
         Err(SendError::Full(v)) => println!("buffer full, dropped: {v}"),
         Err(SendError::Disconnected(v)) => println!("no receivers, dropped: {v}"),
+        _ => unreachable!(),
     }
 
     // Дренируем

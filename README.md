@@ -110,9 +110,26 @@ Found 7 outliers among 100 measurements (7.00%)
   3 (3.00%) low severe
   4 (4.00%) low mild
 
-batch_recv/batch_64     time:   [17.063 ms 17.240 ms 17.422 ms]
-                        thrpt:  [57.398 Melem/s 58.004 Melem/s 58.607 Melem/s]
-Found 1 outliers among 100 measurements (1.00%)
-  1 (1.00%) high mild
+batch_recv/batch_64     time:   [11.731 ms 11.900 ms 12.093 ms]
+                        thrpt:  [82.694 Melem/s 84.035 Melem/s 85.245 Melem/s]
+                 change:
+                        time:   [−36.592% −35.159% −33.666%] (p = 0.00 < 0.05)
+                        thrpt:  [+50.753% +54.223% +57.708%]
+
+batch_recv/send_batch   time:   [15.022 ms 15.361 ms 15.696 ms]
+                        thrpt:  [63.709 Melem/s 65.099 Melem/s 66.567 Melem/s]
+                 change:
+                        time:   [−26.988% −23.727% −20.619%] (p = 0.00 < 0.05)
+                        thrpt:  [+25.975% +31.108% +36.963%]
+
+batch_recv/send_batch_async
+                        time:   [17.935 ms 18.242 ms 18.588 ms]
+                        thrpt:  [53.799 Melem/s 54.818 Melem/s 55.758 Melem/s]
+                 change:
+                        time:   [−14.401% −12.302% −10.260%] (p = 0.00 < 0.05)
+                        thrpt:  [+11.433% +14.027% +16.824%]
+Found 14 outliers among 100 measurements (14.00%)
+  8 (8.00%) high mild
+  6 (6.00%) high severe
 
 ```

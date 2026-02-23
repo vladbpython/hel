@@ -2,7 +2,7 @@ use hel::{
     channel::{
         scsp_bounded,
     },
-    errors::RecvError,
+    errors::AsyncRecvError,
 };
 
 #[tokio::main]
@@ -17,8 +17,7 @@ async fn main() {
     loop {
         match rx.recv_async().await {
             Ok(v) => sum += v,
-            Err(RecvError::Disconnected) => break,
-            Err(RecvError::Empty) => unreachable!(),
+            Err(AsyncRecvError::Disconnected) => break,
         }
     }
     println!("spsc async sum: {sum}");

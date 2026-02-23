@@ -2,7 +2,7 @@ use hel::{
     channel::{
         bounded
     },
-    errors::RecvError,
+    errors::AsyncRecvError,
 };
 
 #[tokio::main]
@@ -21,8 +21,7 @@ async fn main() {
     loop {
         match rx.recv_async().await {
             Ok(v) => sum += v,
-            Err(RecvError::Disconnected) => break,
-            Err(RecvError::Empty) => unreachable!(),
+            Err(AsyncRecvError::Disconnected) => break,
         }
     }
     println!("async sum: {sum}");

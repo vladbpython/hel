@@ -29,7 +29,10 @@ pub mod channel{
 mod tests {
     use super::{
         channel::{bounded,scsp_bounded},
-        errors::RecvError,
+        errors::{
+            RecvError,AsyncRecvError,
+            SendError,
+        },
     };
     use std::{
         sync::{
@@ -37,6 +40,7 @@ mod tests {
             atomic::{AtomicU64, Ordering::Relaxed as Rlx}
         },
         task::{Context,Poll},
+        time::Duration,
         thread,
     };
 
@@ -53,7 +57,7 @@ mod tests {
             match rx.recv() {
                 Ok(v) => { sum += v; count += 1; }
                 Err(RecvError::Disconnected) => break,
-                Err(RecvError::Empty) => unreachable!(),
+                _ => unreachable!(),
             }
         }
         h1.join().unwrap();
@@ -80,7 +84,7 @@ mod tests {
                     match rx.recv() {
                         Ok(v) => sum += v,
                         Err(RecvError::Disconnected) => break,
-                        Err(RecvError::Empty) => unreachable!(),
+                        _ => unreachable!(),
                     }
                 }
                 total.fetch_add(sum, Rlx);
@@ -92,7 +96,7 @@ mod tests {
                 match rx2.recv() {
                     Ok(v) => sum += v,
                     Err(RecvError::Disconnected) => break,
-                    Err(RecvError::Empty) => unreachable!(),
+                    _ => unreachable!(),
                 }
             }
             total2.fetch_add(sum, Rlx);
@@ -124,8 +128,7 @@ mod tests {
                 loop {
                     match rx.recv_async().await {
                         Ok(v) => sum += v,
-                        Err(RecvError::Disconnected) => break,
-                        Err(RecvError::Empty) => unreachable!(),
+                        Err(AsyncRecvError::Disconnected) => break,
                     }
                 }
                 c1_total.fetch_add(sum, Rlx);
@@ -135,8 +138,7 @@ mod tests {
                 loop {
                     match rx2.recv_async().await {
                         Ok(v) => sum += v,
-                        Err(RecvError::Disconnected) => break,
-                        Err(RecvError::Empty) => unreachable!(),
+                        Err(AsyncRecvError::Disconnected) => break,
                     }
                 }
                 total2.fetch_add(sum, Rlx);
@@ -154,10 +156,10 @@ mod tests {
             let (tx, rx) = bounded::<u64, 4>();
             let rx2 = rx.clone();
             let h1 = tokio::spawn(async move {
-                assert_eq!(rx.recv_async().await, Err(RecvError::Disconnected));
+                assert_eq!(rx.recv_async().await, Err(AsyncRecvError::Disconnected));
             });
             let h2 = tokio::spawn(async move {
-                assert_eq!(rx2.recv_async().await, Err(RecvError::Disconnected));
+                assert_eq!(rx2.recv_async().await, Err(AsyncRecvError::Disconnected));
             });
             tokio::task::yield_now().await;
             drop(tx);
@@ -214,8 +216,7 @@ mod tests {
             loop {
                 match rx.recv_async().await {
                     Ok(v) => sum += v,
-                    Err(RecvError::Disconnected) => break,
-                    Err(RecvError::Empty) => unreachable!(),
+                    Err(AsyncRecvError::Disconnected) => break,
                 }
             }
             assert_eq!(sum, 4_999_950_000u64);
@@ -233,7 +234,7 @@ mod tests {
             match rx.recv() {
                 Ok(v) => sum += v,
                 Err(RecvError::Disconnected) => break,
-                Err(RecvError::Empty) => unreachable!(),
+                _ => unreachable!(),
             }
         }
         h.join().unwrap();
@@ -252,8 +253,7 @@ mod tests {
             loop {
                 match rx.recv_async().await {
                     Ok(v) => sum += v,
-                    Err(RecvError::Disconnected) => break,
-                    Err(RecvError::Empty) => unreachable!(),
+                    Err(AsyncRecvError::Disconnected) => break,
                 }
             }
             assert_eq!(sum, 4_999_950_000u64);
@@ -413,6 +413,177 @@ mod tests {
             while let Some(v) = stream.next().await { sum += v; }
             assert_eq!(sum, 4_999_950_000u64);
         });
+    }
+
+     #[test]
+    fn recv_timeout_returns_timeout_when_empty() {
+        let (_tx, rx) = bounded::<u64, 4>();
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Err(RecvError::TimeOut(_)) => {}
+            other => panic!("expected Timeout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn recv_timeout_returns_value_before_deadline() {
+        let (tx, rx) = bounded::<u64, 4>();
+        let h = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            tx.send(99u64).unwrap();
+        });
+        assert_eq!(rx.recv_timeout(Duration::from_millis(500)), Ok(99));
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn send_timeout_returns_timeout_when_full() {
+        let (tx, _rx) = bounded::<u64, 2>();
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        match tx.send_timeout(3, Duration::from_millis(20)) {
+            Err(SendError::TimeOut((3, _))) => {}
+            other => panic!("expected Timeout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn send_timeout_succeeds_when_slot_freed() {
+        let (tx, rx) = bounded::<u64, 2>();
+        let rx2  = rx.clone();
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        let h = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            rx2.recv().unwrap();
+        });
+        assert!(tx.send_timeout(3, Duration::from_millis(500)).is_ok());
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn spsc_recv_timeout() {
+        let (_tx, rx) = scsp_bounded::<u64, 4>();
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Err(RecvError::TimeOut(_)) => {}
+            other => panic!("expected Timeout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn spsc_send_timeout() {
+        let (tx, _rx) = scsp_bounded::<u64, 2>();
+        tx.try_send(1).unwrap();
+        tx.try_send(2).unwrap();
+        match tx.send_timeout(3, Duration::from_millis(20)) {
+            Err(SendError::TimeOut((3, _))) => {}
+            other => panic!("expected Timeout, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn send_batch_all_sent() {
+        let (tx, rx) = bounded::<u64, 256>();
+        let mut buf: Vec<u64> = (0..100).collect();
+        let sent = tx.send_batch(&mut buf);
+        assert_eq!(sent, 100);
+        assert!(buf.is_empty());
+        drop(tx);
+        let collected: Vec<u64> = rx.iter().collect();
+        assert_eq!(collected, (0..100u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn send_batch_partial_when_disconnected() {
+        let (tx, rx) = bounded::<u64, 256>();
+        drop(rx);
+        let mut buf: Vec<u64> = (0..10).collect();
+        let sent = tx.send_batch(&mut buf);
+        assert_eq!(sent, 0);
+        // Неотправленные элементы остаются в buf в исходном порядке
+        assert_eq!(buf, (0..10u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn send_batch_timeout_partial_when_full() {
+        let (tx, _rx) = bounded::<u64, 4>();
+        let mut buf: Vec<u64> = (0..10).collect();
+        let sent = tx.send_batch_timeout(&mut buf, Duration::from_millis(20));
+        // Отправлено не больше CAP=4, остаток в buf
+        assert!(sent <= 4);
+        assert_eq!(sent + buf.len(), 10);
+        // Порядок сохранён
+        assert_eq!(buf, (sent as u64..10).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn send_batch_async_all_sent() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (tx, rx) = bounded::<u64, 256>();
+            let mut buf: Vec<u64> = (0..100).collect();
+            let sent = tx.send_async_batch(&mut buf).await;
+            assert_eq!(sent, 100);
+            assert!(buf.is_empty());
+            drop(tx);
+            let mut collected = Vec::new();
+            loop {
+                match rx.recv_async().await {
+                    Ok(v) => collected.push(v),
+                    Err(AsyncRecvError::Disconnected) => break,
+                }
+            }
+            assert_eq!(collected, (0..100u64).collect::<Vec<_>>());
+        });
+    }
+
+    #[test]
+    fn spsc_send_batch() {
+        let (tx, rx) = scsp_bounded::<u64, 256>();
+        let mut buf: Vec<u64> = (0..100).collect();
+        let sent = tx.send_batch(&mut buf);
+        assert_eq!(sent, 100);
+        assert!(buf.is_empty());
+        drop(tx);
+        let collected: Vec<u64> = rx.iter().collect();
+        assert_eq!(collected, (0..100u64).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn recv_batch_timeout_returns_empty_on_timeout() {
+        let (_tx, rx) = bounded::<u64, 4>();
+        let mut buf = Vec::new();
+        let (n, disc) = rx.recv_batch_timeout(&mut buf, 8, Duration::from_millis(20));
+        assert_eq!(n, 0);
+        assert!(!disc);
+    }
+
+    #[test]
+    fn recv_batch_timeout_collects_data() {
+        let (tx, rx) = bounded::<u64, 256>();
+        for i in 0..50u64 { tx.try_send(i).unwrap(); }
+        let mut buf = Vec::new();
+        let (n, _) = rx.recv_batch_timeout(&mut buf, 64, Duration::from_millis(100));
+        assert!(n >= 1);
+        assert_eq!(buf.iter().copied().sum::<u64>(), (0..n as u64).sum());
+    }
+
+    #[test]
+    fn recv_batch_timeout_disconnected() {
+        let (tx, rx) = bounded::<u64, 4>();
+        drop(tx);
+        let mut buf = Vec::new();
+        let (n, disc) = rx.recv_batch_timeout(&mut buf, 8, Duration::from_millis(20));
+        assert_eq!(n, 0);
+        assert!(disc);
+    }
+
+    #[test]
+    fn spsc_recv_batch_timeout() {
+        let (_tx, rx) = scsp_bounded::<u64, 4>();
+        let mut buf = Vec::new();
+        let (n, disc) = rx.recv_batch_timeout(&mut buf, 8, Duration::from_millis(20));
+        assert_eq!(n, 0);
+        assert!(!disc);
     }
 
     #[test]

@@ -2,7 +2,7 @@ use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::{hint::black_box, time::{Duration, Instant}};
 use hel::{
     channel::{bounded, scsp_bounded},
-    errors::RecvError,
+    errors::{RecvError,AsyncRecvError}
 };
 
 fn percentile(mut s: Vec<u128>, p: f64) -> u128 {
@@ -71,7 +71,7 @@ fn async_mpmc_hel(n: u64) {
         let total = Arc::new(AtomicU64::new(0));
         let ps: Vec<_> = (0..P).map(|_| { let tx=tx.clone(); tokio::spawn(async move { for i in 0..n/P { tx.send_async(i).await.unwrap(); } }) }).collect();
         drop(tx);
-        let cs: Vec<_> = (0..C).map(|_| { let rx=rx.clone(); let t=total.clone(); tokio::spawn(async move { let mut s=0u64; loop { match rx.recv_async().await { Ok(v)=>s+=v, Err(RecvError::Disconnected)=>break, _=>unreachable!() } } t.fetch_add(s,Relaxed); }) }).collect();
+        let cs: Vec<_> = (0..C).map(|_| { let rx=rx.clone(); let t=total.clone(); tokio::spawn(async move { let mut s=0u64; loop { match rx.recv_async().await { Ok(v)=>s+=v, Err(AsyncRecvError::Disconnected)=>break} } t.fetch_add(s,Relaxed); }) }).collect();
         for h in ps { h.await.unwrap(); } for h in cs { h.await.unwrap(); }
     });
 }
@@ -82,7 +82,7 @@ fn async_spsc(n: u64) {
         let (tx, rx) = scsp_bounded::<u64, 128>();
         tokio::spawn(async move { for i in 0..n { tx.send_async(i).await.unwrap(); } });
         let mut s = 0u64;
-        loop { match rx.recv_async().await { Ok(v)=>s+=v, Err(RecvError::Disconnected)=>break, _=>unreachable!() } }
+        loop { match rx.recv_async().await { Ok(v)=>s+=v, Err(AsyncRecvError::Disconnected)=>break } }
         let _ = s;
     });
 }
@@ -108,17 +108,61 @@ fn bench_batch_vs_tryrecv(n: u64) {
     loop {
         let (cnt, disc) = rx.recv_batch(&mut buf, 64);
         buf.clear();
-        if disc && cnt == 0 { break; }
-        if cnt == 0 { std::hint::spin_loop(); }
+        if disc || cnt == 0 { break; }
     }
     h.join().unwrap();
 }
 
+fn bench_send_batch(n: u64) {
+    use std::thread;
+    let (tx, rx) = bounded::<u64, 256>();
+    let h = thread::spawn(move || {
+        let mut buf = Vec::with_capacity(64);
+        loop {
+            let (count,disconnected) = rx.recv_batch(&mut buf, 64);
+            buf.clear();
+            if count == 0 || disconnected {
+                break;
+            }
+        }
+    });
+    let mut buf: Vec<u64> = (0..n).collect();
+    while !buf.is_empty() {
+        tx.send_batch(&mut buf);
+    }
+    drop(tx);
+    h.join().unwrap();
+}
+
+
+fn bench_send_batch_async(n: u64) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2).build().unwrap();
+    rt.block_on(async move {
+        let (tx, rx) = bounded::<u64, 256>();
+        let consumer = tokio::spawn(async move {
+            let mut buf = Vec::with_capacity(64);
+            loop {
+                let (count, disconnected) = rx.recv_batch_async(&mut buf, 64).await;
+                buf.clear();
+                if count == 0 || disconnected { break; }
+            }
+        });
+        // Правильно — батчами по 64
+        let mut buf: Vec<u64> = (0..n).collect();
+        while !buf.is_empty() {
+            tx.send_async_batch(&mut buf).await;
+        }
+        drop(tx);
+        consumer.await.unwrap();
+    });
+}
+
 fn bench_latency(c: &mut Criterion) {
-    println!("=== Latency distribution (100k samples) ===");
+    println!("\n=== Latency distribution (100k samples) ===");
     print_lat("hel  mpmc hot_path", lat_mpmc(100_000));
     print_lat("hel  spsc hot_path", lat_spsc(100_000));
-    print_lat("flume     hot_path", lat_flume(100_000));
+    print_lat("flume      hot_path", lat_flume(100_000));
 
     let mut g = c.benchmark_group("hot_path_throughput");
     g.throughput(Throughput::Elements(1_000_000));
@@ -154,8 +198,10 @@ fn bench_batch(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1_000_000));
     g.measurement_time(Duration::from_secs(15));
     g.bench_function("batch_64", |b| b.iter(|| bench_batch_vs_tryrecv(1_000_000)));
+    g.bench_function("send_batch", |b| b.iter(|| bench_send_batch(1_000_000)));
+    g.bench_function("send_batch_async", |b| b.iter(|| bench_send_batch_async(1_000_000)));
     g.finish();
 }
 
-criterion_group!(benches, bench_latency, bench_blocking, bench_async, bench_batch);
+criterion_group!(benches,bench_latency, bench_blocking, bench_async, bench_batch);
 criterion_main!(benches);

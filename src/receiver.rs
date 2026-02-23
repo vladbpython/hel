@@ -1,20 +1,21 @@
 use crate::core::SingleInner;
 
 use super::{
-    errors::RecvError,
-    result::ResultReceiver,
+    errors::{RecvError,AsyncRecvError},
+    result::{ResultReceiver,ResultAsyncReceiver},
     core::Inner,
     sync::SyncNode,
 };
 use std::{
-    future::Future,
-    pin::Pin,
+    future::Future, 
+    pin::Pin, 
     sync::{
         Arc,
         atomic::Ordering,
-    },
-    task::{Context,Poll},
-    thread::park,
+    }, 
+    task::{Context,Poll}, 
+    time::{Duration,Instant},
+    thread::{park,park_timeout}
 };
 
 // Может быть как Single Consumer так и Milto Consumer
@@ -44,7 +45,8 @@ impl<T,const CAP: usize>  Receiver<T,CAP> {
         }
     }
 
-    pub fn recv(&self) -> ResultReceiver<T> {
+    fn recv_impl(&self, deadline: Option<Instant>) -> ResultReceiver<T> 
+    {
         loop {
             match self.inner.pop() {
                 Some(v) => {
@@ -56,6 +58,14 @@ impl<T,const CAP: usize>  Receiver<T,CAP> {
                 },
                 None => {},
             }
+
+            if let Some(dl) = deadline {
+                match dl.checked_duration_since(Instant::now()) {
+                    Some(d) if d > Duration::ZERO => {},
+                    _ => return Err(RecvError::TimeOut(dl.elapsed()))
+                }
+            }
+
 
             let mut node = SyncNode::new_blocking();
             let node_ptr = &mut node as *mut SyncNode;
@@ -77,20 +87,30 @@ impl<T,const CAP: usize>  Receiver<T,CAP> {
                 },
                 None => {},
             }
-
-            park();
+            match deadline {
+                Some(dl) => park_timeout(dl.saturating_duration_since(Instant::now())),
+                None => park(),
+            }
             // ОБЯЗАТЕЛЬНО: remove до следующей итерации (spurious wakeup protection).
             self.inner.receiver_waiters().remove(node_ptr);
             self.inner.receiver_wait_counter_sub(Ordering::Relaxed);
         }
     }
 
-    // Drain up to max items into buf in one call.
+    pub fn recv(&self) -> ResultReceiver<T> {
+        self.recv_impl(None)
+    }
+
+    pub fn recv_timeout(&self, duration: Duration) -> ResultReceiver<T> {
+        self.recv_impl(Some(Instant::now() + duration))
+    }
+
+    // Drain up to `max` items into `buf` in one call.
     // Notifies senders **once** at the end instead of once per item —
-    // reduces WaiterList::mutex contention by up to max vs looping try_recv.
-    // Returns number of items added to buf.
+    // reduces WaiterList::mutex contention by up to `max`x vs looping try_recv.
+    // Returns number of items added to `buf`.
     // Returns 0 + sets disconnected=true when channel is closed and empty.
-    pub fn recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize,bool){
+    fn _recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize,bool){
         let mut count = 0;
         while count < max {
             match self.inner.pop(){
@@ -109,6 +129,41 @@ impl<T,const CAP: usize>  Receiver<T,CAP> {
         (count,disconnected)
     }
 
+    fn _recv_batch_join(&self,buf: &mut Vec<T>, max: usize) -> (usize,bool) {
+        let (count,disconeected) = self._recv_batch(buf, max-1);
+        (1+ count,disconeected)
+    }
+
+    pub fn recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize,bool) {
+        if max == 0 {
+            return (0,false)
+        }
+        match self.recv(){
+            Ok(v) => buf.push(v),
+            Err(RecvError::Disconnected) => return (0,true),
+            Err(RecvError::Empty) | Err(RecvError::TimeOut(_)) => return (0,false),
+        }
+        self._recv_batch_join(buf, max)
+    }
+
+    pub fn recv_batch_timeout(
+        &self, 
+        buf: &mut Vec<T>, 
+        max: usize, 
+        duration: Duration
+    ) -> (usize,bool) {
+        if max == 0 {
+            return (0,false)
+        }
+        match self.recv_timeout(duration){
+            Ok(v) => buf.push(v),
+            Err(RecvError::Disconnected) => return (0,true),
+            Err(RecvError::TimeOut(_)) => return (0,false),
+            Err(RecvError::Empty) => unreachable!() ,
+        }
+        self._recv_batch_join(buf, max)
+    }
+
     // Blocking iterator — блокирует поток до каждого item.
     pub fn iter(&self) -> Iter<'_, T, CAP> {
         Iter { receiver: self }
@@ -121,15 +176,16 @@ impl<T,const CAP: usize>  Receiver<T,CAP> {
     // Async batch recv — ждёт хотя бы один item, затем дренирует до max.
     // Позволяет обрабатывать burstы без лишних await.
     pub async fn recv_batch_async(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
+        if max == 0 {
+            return (0,false)
+        }
         // Ждём первый item через обычный async recv
         match self.recv_async().await {
             Ok(v) => buf.push(v),
-            Err(RecvError::Disconnected) => return (0, true),
-            Err(RecvError::Empty) => unreachable!(),
+            Err(AsyncRecvError::Disconnected) => return (0, true),
         }
         // Дренируем остаток без ожидания
-        let (extra, disconnected) = self.recv_batch(buf, max - 1);
-        (1 + extra, disconnected)
+        self._recv_batch_join(buf, max-1)
     }
 
     // Async stream — совместим с StreamExt::next(), for_each, select!.
@@ -167,6 +223,7 @@ impl<'a, T, const CAP: usize> Iterator for Iter<'a, T, CAP> {
         match self.receiver.recv() {
             Ok(v) => Some(v),
             Err(RecvError::Disconnected) => None,
+            Err(RecvError::TimeOut(_)) => None,
             Err(RecvError::Empty) => unreachable!(),
         }
     }
@@ -184,6 +241,7 @@ impl<T, const CAP: usize> Iterator for IntoIter<T, CAP> {
         match self.receiver.recv() {
             Ok(v) => Some(v),
             Err(RecvError::Disconnected) => None,
+            Err(RecvError::TimeOut(_)) => None,
             Err(RecvError::Empty) => unreachable!(),
         }
     }
@@ -214,7 +272,7 @@ pub struct ReceiverFuture<'a, T, const CAP: usize> {
 }
 
 impl<T, const CAP: usize> Future for ReceiverFuture<'_, T, CAP> {
-    type Output = Result<T, RecvError>;
+    type Output = ResultAsyncReceiver<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.as_mut().get_unchecked_mut() };
@@ -239,7 +297,7 @@ impl<T, const CAP: usize> Future for ReceiverFuture<'_, T, CAP> {
                     inner.receiver_wait_counter_sub(Ordering::Relaxed);
                     this.in_queue = false;
                 }
-                return Poll::Ready(Err(RecvError::Disconnected));
+                return Poll::Ready(Err(AsyncRecvError::Disconnected));
             }
             None => {}
         }
@@ -266,7 +324,7 @@ impl<T, const CAP: usize> Future for ReceiverFuture<'_, T, CAP> {
                 inner.receiver_waiters().remove(node_ptr);
                 inner.receiver_wait_counter_sub(Ordering::Relaxed);
                 this.in_queue = false;
-                Poll::Ready(Err(RecvError::Disconnected))
+                Poll::Ready(Err(AsyncRecvError::Disconnected))
             }
             None => Poll::Pending,
         }
@@ -406,7 +464,7 @@ impl<T, const CAP: usize> SingleReceiver<T, CAP> {
         }
     }
 
-    pub fn recv(&self) -> ResultReceiver<T> {
+    fn recv_impl(&self,deadline: Option<Instant>) -> ResultReceiver<T> {
         loop {
             match self.inner.pop() {
                 Some(v) => { 
@@ -417,6 +475,13 @@ impl<T, const CAP: usize> SingleReceiver<T, CAP> {
                     return Err(RecvError::Disconnected);
                 }
                 None => {}
+            }
+
+            if let Some(dl) = deadline{
+                match dl.checked_duration_since(Instant::now()) {
+                    Some(d) if d > Duration::ZERO => {},
+                    _ => return Err(RecvError::TimeOut(dl.elapsed())),
+                }
             }
 
             let mut node = SyncNode::new_blocking();
@@ -437,26 +502,78 @@ impl<T, const CAP: usize> SingleReceiver<T, CAP> {
                 }
                 None => {}
             }
-
-            park();
+            match deadline {
+                Some(dl) => park_timeout(dl.saturating_duration_since(Instant::now())),
+                None => park(),
+            }
             self.inner.receiver_waiters().remove(node_ptr);
             self.inner.receiver_wait_counter_sub(Ordering::Relaxed);
         }
     }
 
-    pub fn recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
+
+    pub fn recv(&self) -> ResultReceiver<T> {
+        self.recv_impl(None)
+    }
+
+    pub fn recv_timeout(&self, duration: Duration) -> ResultReceiver<T> {
+        self.recv_impl(Some(Instant::now() + duration))
+    }
+
+
+    fn _recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize,bool){
         let mut count = 0;
         while count < max {
-            match self.inner.pop() {
-                Some(v) => { buf.push(v); count += 1; }
-                None => break,
+            match self.inner.pop(){
+                Some(v) => {
+                    buf.push(v);
+                    count += 1;
+                },
+                None => break
             }
         }
-        if count > 0 { self.inner.notify_senders(); }
-        let disconnected = count == 0
-            && self.inner.is_tx_closed()
-            && self.inner.is_empty();
-        (count, disconnected)
+
+        if count > 0 {
+            self.inner.notify_senders();
+        }
+        let disconnected = count == 0 && self.inner.is_tx_closed() && self.inner.is_empty();
+        (count,disconnected)
+    }
+
+    fn _recv_batch_join(&self,buf: &mut Vec<T>, max: usize) -> (usize,bool) {
+        let (count,disconeected) = self._recv_batch(buf, max-1);
+        (1+ count,disconeected)
+    }
+
+    pub fn recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize,bool) {
+        if max == 0 {
+            return (0,false)
+        }
+        match self.recv(){
+            Ok(v) => buf.push(v),
+            Err(RecvError::Disconnected) => return (0,true),
+            Err(RecvError::TimeOut(_)) => return (0,false),
+            Err(RecvError::Empty) => unreachable!(),
+        }
+        self._recv_batch_join(buf, max)
+    }
+
+        pub fn recv_batch_timeout(
+            &self, 
+            buf: &mut Vec<T>, 
+            max: usize,
+            duration: Duration,
+        ) -> (usize,bool) {
+        if max == 0 {
+            return (0,false)
+        }
+        match self.recv_timeout(duration){
+            Ok(v) => buf.push(v),
+            Err(RecvError::Disconnected) => return (0,true),
+            Err(RecvError::TimeOut(_)) => return (0,false),
+            Err(RecvError::Empty) => unreachable!(),
+        }
+        self._recv_batch_join(buf, max)
     }
 
     // Blocking iterator, эквивалентно for v in &rx.
@@ -469,13 +586,14 @@ impl<T, const CAP: usize> SingleReceiver<T, CAP> {
     }
 
     pub async fn recv_batch_async(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
+        if max == 0 {
+            return (0,false)
+        }
         match self.recv_async().await {
             Ok(v) => buf.push(v),
-            Err(RecvError::Disconnected) => return (0, true),
-            Err(RecvError::Empty) => unreachable!(),
+            Err(AsyncRecvError::Disconnected) => return (0, true),
         }
-        let (extra, disconnected) = self.recv_batch(buf, max - 1);
-        (1 + extra, disconnected)
+        self._recv_batch_join(buf, max-1)
     }
 
     pub fn stream(&self) -> SignleRecvStream<'_, T, CAP> {
@@ -498,9 +616,10 @@ impl<'a, T, const CAP: usize> Iterator for SingleIter<'a, T, CAP> {
     #[inline]
     fn next(&mut self) -> Option<T> {
         match self.receiver.recv() {
-            Ok(v)                        => Some(v),
+            Ok(v) => Some(v),
             Err(RecvError::Disconnected) => None,
-            Err(RecvError::Empty)        => unreachable!(),
+            Err(RecvError::TimeOut(_)) => None,
+            Err(RecvError::Empty) => unreachable!(),
         }
     }
 }
@@ -515,9 +634,10 @@ impl<T, const CAP: usize> Iterator for SingleIntoIter<T, CAP> {
     #[inline]
     fn next(&mut self) -> Option<T> {
         match self.receiver.recv() {
-            Ok(v)                        => Some(v),
+            Ok(v) => Some(v),
             Err(RecvError::Disconnected) => None,
-            Err(RecvError::Empty)        => unreachable!(),
+            Err(RecvError::TimeOut(_)) => None,
+            Err(RecvError::Empty) => unreachable!(),
         }
     }
 }
@@ -551,7 +671,7 @@ pub struct SingleRecvFuture<'a, T, const CAP: usize> {
 unsafe impl<T: Send, const CAP: usize> Send for SingleRecvFuture<'_, T, CAP> {}
 
 impl<T, const CAP: usize> Future for SingleRecvFuture<'_, T, CAP> {
-    type Output = Result<T, RecvError>;
+    type Output = ResultAsyncReceiver<T>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.as_mut().get_unchecked_mut() };
@@ -574,7 +694,7 @@ impl<T, const CAP: usize> Future for SingleRecvFuture<'_, T, CAP> {
                     inner.receiver_wait_counter_sub(Ordering::Relaxed);
                     this.in_queue = false;
                 }
-                return Poll::Ready(Err(RecvError::Disconnected));
+                return Poll::Ready(Err(AsyncRecvError::Disconnected));
             }
             None => {}
         }
@@ -599,7 +719,7 @@ impl<T, const CAP: usize> Future for SingleRecvFuture<'_, T, CAP> {
                 inner.receiver_waiters().remove(node_ptr);
                 inner.receiver_wait_counter_sub(Ordering::Relaxed);
                 this.in_queue = false;
-                Poll::Ready(Err(RecvError::Disconnected))
+                Poll::Ready(Err(AsyncRecvError::Disconnected))
             }
             None => Poll::Pending,
         }

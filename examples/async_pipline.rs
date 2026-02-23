@@ -2,7 +2,7 @@ use hel::{
     channel::{
         bounded
     },
-    errors::RecvError,
+    errors::AsyncRecvError,
 };
 
 #[tokio::main]
@@ -21,8 +21,7 @@ async fn main() {
         loop {
             match rx1.recv_async().await {
                 Ok(v) => tx2.send_async(v * 2).await.unwrap(),
-                Err(RecvError::Disconnected) => break,
-                Err(RecvError::Empty) => unreachable!(),
+                Err(AsyncRecvError::Disconnected) => break,
             }
         }
     });
@@ -32,8 +31,7 @@ async fn main() {
     loop {
         match rx2.recv_async().await {
             Ok(v) => sum += v,
-            Err(RecvError::Disconnected) => break,
-            Err(RecvError::Empty) => unreachable!(),
+            Err(AsyncRecvError::Disconnected) => break,
         }
     }
     println!("pipeline sum: {sum}"); // sum(0..1000) * 2 = 999_000
