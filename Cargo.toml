@@ -1,20 +1,28 @@
 [package]
 name = "hel"
-version = "0.1.1"
+version = "1.0.0"
 edition = "2024"
 authors = ["Bieliaiev Vladyslav <vladbpython@gmail.com>"]
 
 [dependencies]
+atomic-waker = "1"
 futures = "0.3.32"
+num_cpus = "1.17.0"
+parking_lot = "0.12"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 
 [dev-dependencies]
-flume     = "0.12"
-criterion = { version = "0.8.2", features = ["async_tokio"] }
+flume = "0.12"
+criterion = { version = "0.8.2", features = ["async_tokio","html_reports"] }
+crossbeam-channel = "0.5.15"
 tokio = { version ="1.49.0", features = ["full"]}
+tokio-util = { version = "0.7.18"}
+
 
 [[bench]]
-name    = "channel_bench"
+name = "channel_bench"
 harness = false
 path = "benches/channel_bench.rs"
+
 

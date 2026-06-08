@@ -1,24 +1,40 @@
-use hel::{
-    channel::{
-        scsp_bounded,
-    },
-    errors::AsyncRecvError,
-};
+use hel::channel::{errors::*, spsc::shard_spsc};
+use tokio::runtime::Builder;
+const CAPACITY: usize = 256;
 
-#[tokio::main]
-async fn main() {
-    let (tx, rx) = scsp_bounded::<u64, 128>();
+fn main() {
+    let rt = Builder::new_multi_thread()
+        .worker_threads(8)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let ch = shard_spsc::<u64, CAPACITY>(4);
 
-    tokio::spawn(async move {
-        for i in 0..100_000u64 { tx.send_async(i).await.unwrap(); }
-    });
+        let handles: Vec<_> = ch
+            .into_pairs()
+            .map(|(shard_id, tx, rx)| {
+                let consumer = tokio::spawn(async move {
+                    let mut total = 0u64;
+                    loop {
+                        match rx.recv_async().await {
+                            Ok(v) => total += v,
+                            Err(AsyncRecvError::Disconnected) => break,
+                        }
+                    }
+                    println!("[spsc shard {shard_id}] total = {total}");
+                });
+                let producer = tokio::spawn(async move {
+                    for i in 0..10_000u64 {
+                        tx.send_async(i).await.unwrap();
+                    }
+                });
+                (producer, consumer)
+            })
+            .collect();
 
-    let mut sum = 0u64;
-    loop {
-        match rx.recv_async().await {
-            Ok(v) => sum += v,
-            Err(AsyncRecvError::Disconnected) => break,
+        for (p, c) in handles {
+            p.await.unwrap();
+            c.await.unwrap();
         }
-    }
-    println!("spsc async sum: {sum}");
+    });
 }
