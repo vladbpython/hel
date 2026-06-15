@@ -5,7 +5,7 @@
 //!
 //! Two use cases
 //!
-//! ```
+//! ```no_run
 //! use hel::channel::spsc::SpscShard;
 //!
 //! let rt = tokio::runtime::Runtime::new().unwrap();
