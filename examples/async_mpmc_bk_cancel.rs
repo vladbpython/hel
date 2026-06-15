@@ -1,10 +1,12 @@
-use hel::channel::{errors::*, mpmc::shard_key};
+use hel::channel::{errors::*, mpmc::shard_key, nearest_power_of_two};
 use std::time::Duration;
 use tokio::runtime::Builder;
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 
 // Shutdown via oneshot channel is a typical pattern for trading systems
 // main loop receives a completion signal and drops senders.
+// CONSUMER: initial break by shutdown lost to CAPACITY
+// unread messages. Here by cancel → DRAIN (read to Disconnected), do not exit immediately.
 
 fn main() {
     let rt = Builder::new_multi_thread()
@@ -18,7 +20,6 @@ fn main() {
 
         let symbols = ["AAPL", "MSFT", "GOOG", "AMZN"];
 
-        // Consumers: recv per-symbol shard + watch shutdown
         let consumers: Vec<_> = rx
             .into_receivers()
             .into_iter()
@@ -29,7 +30,6 @@ fn main() {
                     let mut count = 0u64;
                     loop {
                         tokio::select! {
-                            biased; // safe ordering, no random!
                             Ok(_) = shutdown.changed() => {
                                 if *shutdown.borrow() {
                                     println!("[key shard {id}] shutdown, count = {count}");

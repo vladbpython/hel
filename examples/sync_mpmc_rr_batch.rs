@@ -1,10 +1,13 @@
-use hel::channel::mpmc::round_robin;
+use hel::channel::{
+    mpmc::round_robin,
+    nearest_power_of_two,
+};
 use std::thread;
 
 // Batch send: groups messages per shard one lock per shard.
 // ~1.5–2× faster than per-element for large batches.
 const BATCH: usize = 64;
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 
 fn main() {
     let (tx, rx) = round_robin::<u64, CAPACITY>(4);

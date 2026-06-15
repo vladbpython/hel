@@ -1,9 +1,13 @@
-use hel::channel::{errors::*, mpmc::round_robin};
+use hel::channel::{
+    errors::*, 
+    mpmc::round_robin,
+    nearest_power_of_two,
+};
 use std::thread;
 
 // N producers → round-robin → S shards → S consumers.
 // Optimal for stateless workers: logs, HTTP requests, task queues.
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 
 fn main() {
     let (tx, rx) = round_robin::<String, CAPACITY>(4);

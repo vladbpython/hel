@@ -24,6 +24,10 @@ pub trait InnerChannel<T: Send + 'static, const CAP: usize>: Send + Sync {
     fn sender_waiters(&self) -> &SyncList;
     fn tx_close(&self);
     fn rx_close(&self);
+    #[inline]
+    fn yield_before_park(&self) -> bool {
+        true
+    }
 }
 
 // Minimal trait over inner state needed by sender logic.
@@ -107,6 +111,10 @@ pub trait ReceiverOps<T, const CAP: usize>: Send + 'static {
     fn rx_close(&self);
     fn notify_all_on_rx_close(&self);
     fn pop_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool);
+    #[inline]
+    fn yield_before_park(&self) -> bool {
+        true
+    }
 }
 
 impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + Send + 'static>
@@ -151,4 +159,18 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + Send + 'stat
     fn pop_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         self.pop_batch(buf, max)
     }
+
+    #[inline]
+    fn yield_before_park(&self) -> bool {
+        InnerChannel::yield_before_park(self)
+    }
 }
+
+/// Marker: inner protocol allows MORE than ONE producer
+/// (slot reservation via CAS/fetch_add on tail).
+/// `SingleInner` does NOT implement it so `Clone` for `SingleSender`
+/// does not exist at the type level: two producers on the SPSC protocol
+/// (push without CAS on tail) this is a data race on tail and slots.
+/// Any new inner gets a `Clone` for its `Sender` only
+/// consciously declaring himself a multi producer.
+pub trait MultiProducer {}

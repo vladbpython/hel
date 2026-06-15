@@ -1,8 +1,13 @@
-use hel::channel::{errors::*, mpmc::shard_key};
+use hel::channel::{
+    errors::*, 
+    nearest_power_of_two,
+    mpmc::shard_key,
+    
+};
 use std::thread;
 use tokio::runtime::Builder;
 
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 
 // Async producers → by-key routing → sync consumers.
 // Real world: async WebSocket feed → sync DB writers per symbol.

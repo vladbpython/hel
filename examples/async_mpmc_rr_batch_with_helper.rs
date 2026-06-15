@@ -1,6 +1,9 @@
-use hel::channel::{
-    mpmc::round_robin,
-    nearest_power_of_two,
+use hel::{
+    channel::{
+        mpmc::round_robin,
+        nearest_power_of_two
+    },
+    helper::batch::drain_batch_async
 };
 use tokio::runtime::Builder;
 const BATCH: usize = 64;
@@ -19,17 +22,17 @@ fn main() {
             .enumerate()
             .map(|(id, r)| {
                 tokio::spawn(async move {
-                    let mut total = 0u64;
-                    let mut buf = Vec::with_capacity(BATCH);
-                    loop {
-                        let (n, dc) = r.recv_batch_async(&mut buf, BATCH).await;
-                        for v in buf.drain(..n) {
-                            total += v;
-                        }
-                        if dc {
-                            break;
-                        }
-                    }
+                    let total = drain_batch_async(
+                        r,
+                        BATCH,
+                        |rx, mut buf, max| async move {
+                            let (n, dc) = rx.recv_batch_async(&mut buf, max).await;
+                            (rx, buf, n, dc)
+                        },
+                        |v: u64, acc: &mut u64| *acc += v, // sum up
+                        0u64,
+                    )
+                    .await;
                     println!("[batch shard {id}] total = {total}");
                 })
             })

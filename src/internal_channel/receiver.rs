@@ -1,18 +1,21 @@
 use super::{
-    core::{MPMCInner, SingleInner},
+    core::{SeqInner, SingleInner},
     errors::{AsyncRecvError, RecvError, TryRecvError},
     sync::{AsyncSlot, SyncList, SyncNode},
     traits::{InnerChannel, ReceiverOps},
 };
 use std::{
     future::Future,
+    hint::spin_loop,
     marker::PhantomData,
     pin::Pin,
     sync::{Arc, atomic::Ordering},
     task::{Context, Poll},
-    thread::{park, park_timeout},
+    thread::{park, park_timeout,yield_now},
     time::{Duration, Instant},
 };
+
+const SPIN_COUNT: u32 = 128;
 
 #[inline]
 pub fn try_recv<T, const CAP: usize>(inner: &impl ReceiverOps<T, CAP>) -> Result<T, TryRecvError> {
@@ -49,6 +52,37 @@ pub fn recv_impl<T, const CAP: usize>(
                 return Err(RecvError::TimeOut(dl.elapsed()));
             }
         }
+ 
+        if inner.yield_before_park() {
+            // Adaptive spin before parking symmetry to SPIN_COUNT on
+            // sender's side. Without it, consumer in the streaming pattern
+            // parks on EVERY message: futex wait+wake ~1-3 µs per
+            // circle → collapse on Linux (17-24% high-severe outliers, rr worse than key).
+            // Spin holds the consumer hot while the producer adds the next element.
+            for _ in 0..SPIN_COUNT {
+                spin_loop();
+                match inner.pop() {
+                    Some(v) => {
+                        inner.notify_senders();
+                        return Ok(v);
+                    }
+                    None => {}
+                }
+            }
+            yield_now();
+        }
+        match inner.pop() {
+            Some(v) => {
+                inner.notify_senders();
+                return Ok(v);
+            }
+            None if inner.is_tx_closed() && inner.is_empty() => {
+                return Err(RecvError::Disconnected);
+            }
+            None => {}
+        }
+
+        // Sleep phase only after yield didn't help
         let mut node = SyncNode::new_blocking();
         let ptr = &mut node as *mut SyncNode;
         inner.receiver_waiters().push_blocking(ptr);
@@ -260,7 +294,7 @@ impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Drop
 pub struct Receiver<
     T: Send + 'static,
     const CAP: usize,
-    I: InnerChannel<T, CAP> + 'static = MPMCInner<T, CAP>,
+    I: InnerChannel<T, CAP> + 'static = SeqInner<T, CAP>,
 > {
     inner: Arc<I>,
     _t: PhantomData<T>,
@@ -410,10 +444,10 @@ pub type SingleRecvFuture<'a, T, const CAP: usize> =
     GenericRecvFuture<'a, T, CAP, SingleInner<T, CAP>>;
 
 pub type SignleRecvStream<'a, T, const CAP: usize> =
-    GenericRecvStream<'a, T, CAP, SingleInner<T, CAP>>;
+    GenericRecvStream<'a, T, CAP, SingleInner<T, CAP>>;    
 
 impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
-    pub(crate) fn new(inner: Arc<SingleInner<T, CAP>>) -> Self {
+    pub fn new(inner: Arc<SingleInner<T, CAP>>) -> Self {
         Self { inner }
     }
 

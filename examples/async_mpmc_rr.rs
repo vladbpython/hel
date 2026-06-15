@@ -1,6 +1,10 @@
-use hel::channel::{errors::*, mpmc::round_robin};
+use hel::channel::{
+    errors::*, 
+    mpmc::round_robin,
+    nearest_power_of_two,
+};
 use tokio::runtime::Builder;
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 
 fn main() {
     let rt = Builder::new_multi_thread()

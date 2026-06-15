@@ -1,7 +1,11 @@
-use hel::channel::{errors::*, spsc::shard_spsc};
+use hel::channel::{
+    errors::*, 
+    nearest_power_of_two,
+    spsc::shard_spsc
+};
 use std::thread;
 
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 // N independent SPSC channels 1 producer per shard, 1 consumer per shard.
 // Fastest option when routing is known upfront.
 

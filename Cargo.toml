@@ -1,6 +1,6 @@
 [package]
 name = "hel-rs"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 authors = ["Bieliaiev Vladyslav <vladbpython@gmail.com>"]
 description = "High-performance unified sync+async MPMC/SPSC channel"
@@ -25,11 +25,10 @@ crossbeam-channel = "0.5.15"
 tokio = { version ="1.49.0", features = ["full"]}
 tokio-util = { version = "0.7.18"}
 
-
 [[bench]]
-name = "channel_bench"
+name = "trade_bench"
 harness = false
-path = "benches/channel_bench.rs"
+path = "benches/trade_bench.rs"
 
 
 [lib]

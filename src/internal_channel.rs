@@ -10,7 +10,7 @@ use std::sync::Arc;
 // Lock free CAS ring buffer.
 pub fn mpmc_bounded<T: Send, const CAP: usize>()
 -> (sender::Sender<T, CAP>, receiver::Receiver<T, CAP>) {
-    let inner = Arc::new(core::MPMCInner::new());
+    let inner = Arc::new(core::SeqInner::new());
     (
         sender::Sender::new(inner.clone()),
         receiver::Receiver::new(inner),
@@ -30,7 +30,6 @@ pub fn scsp_bounded<T: Send, const CAP: usize>() -> (
 }
 
 /// Helper function: Rounds n to the nearest power of two.
-#[doc(hidden)]
 #[inline]
 pub const fn nearest_power_of_two(n: usize) -> usize {
     if n == 0 {
@@ -49,10 +48,13 @@ pub const fn nearest_power_of_two(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
+        core::SeqInner,
         errors::{AsyncRecvError, RecvError, TryRecvError},
         mpmc_bounded, scsp_bounded,
+        sender::Sender,
+        traits::InnerChannel,
     };
-    use std::{thread, time::Duration};
+    use std::{sync::Arc, thread, time::Duration};
 
     // Try recv
 
@@ -284,6 +286,161 @@ mod tests {
             last = v;
         }
         p.join().unwrap();
+    }
+
+    #[test]
+    fn miri_seq_push_batch_concurrent_with_pop() {
+        const N: u64 = 16;
+        let (tx, rx) = mpmc_bounded::<u64, 4>(); // CAP=4 — постоянный wrap-around
+        let c = thread::spawn(move || {
+            let mut got = Vec::new();
+            while got.len() < N as usize {
+                let mut buf = Vec::new();
+                let (n, dc) = rx.recv_batch(&mut buf, 8);
+                got.extend(buf);
+                if dc && n == 0 {
+                    break;
+                }
+            }
+            got
+        });
+        let mut next = 0u64;
+        while next < N {
+            let mut buf: Vec<u64> = (next..N.min(next + 3)).collect();
+            let want = buf.len();
+            let sent = tx.try_send_batch(&mut buf).map_or_else(|e| e.sent, |s| s);
+            next += sent as u64;
+            let _ = want;
+            std::thread::yield_now();
+        }
+        drop(tx);
+        let mut got = c.join().unwrap();
+        got.sort_unstable();
+        assert_eq!(got, (0..N).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn miri_spsc_push_batch_concurrent_with_pop() {
+        const N: u64 = 16;
+        let (tx, rx) = scsp_bounded::<u64, 4>(); // CAP=4 — постоянный wrap-around
+        let c: thread::JoinHandle<Vec<_>> = thread::spawn(move || {
+            let mut got = Vec::new();
+            loop {
+                let mut buf = Vec::new();
+                let (n, dc) = rx.recv_batch(&mut buf, 8);
+                got.extend(buf);
+                if dc && n == 0 {
+                    break;
+                }
+            }
+            got
+        });
+        let mut next = 0u64;
+        while next < N {
+            let mut buf: Vec<u64> = (next..N.min(next + 3)).collect();
+            match tx.try_send_batch(&mut buf) {
+                Ok(sent) => next += sent as u64,
+                Err(e) => next += e.sent as u64,
+            }
+            thread::yield_now();
+        }
+        drop(tx);
+        let got = c.join().unwrap();
+        assert_eq!(
+            got,
+            (0..N).collect::<Vec<_>>(),
+            "SPSC: FIFO without losses and duplicates"
+        );
+    }
+
+    #[test]
+    fn miri_seq_push_batch_two_producers() {
+        use crate::internal_channel::mpmc_bounded;
+        const N: u64 = 16; // на продюсера
+        let (tx1, rx) = mpmc_bounded::<u64, 4>();
+        let tx2 = tx1.clone();
+        let c = thread::spawn(move || {
+            let mut sum = 0u64;
+            loop {
+                let mut buf = Vec::new();
+                let (n, dc) = rx.recv_batch(&mut buf, 8);
+                sum += buf.iter().sum::<u64>();
+                if dc && n == 0 {
+                    break;
+                }
+            }
+            sum
+        });
+        let producer = |tx: Sender<u64, 4>, base: u64| {
+            thread::spawn(move || {
+                let mut next = base;
+                while next < base + N {
+                    let mut buf: Vec<u64> = (next..(base + N).min(next + 3)).collect();
+                    match tx.try_send_batch(&mut buf) {
+                        Ok(sent) => next += sent as u64,
+                        Err(e) => next += e.sent as u64,
+                    }
+                    thread::yield_now();
+                }
+            })
+        };
+        let p1 = producer(tx1, 0);
+        let p2 = producer(tx2, 1000);
+        p1.join().unwrap();
+        p2.join().unwrap();
+        let expected: u64 = (0..N).sum::<u64>() + (1000..1000 + N).sum::<u64>();
+        assert_eq!(
+            c.join().unwrap(),
+            expected,
+            "MPMC 2p: lossless and duplicates"
+        );
+    }
+
+    // Drop channel with undelivered String: leak before Drop fix
+    // (caught by Miri leak checker), with the fix all elements are dropped.
+    #[test]
+    fn miri_drop_undelivered_mpmc() {
+        let (tx, rx) = mpmc_bounded::<String, 4>();
+        for i in 0..4 {
+            tx.try_send(format!("payload {i}")).unwrap();
+        }
+        drop(tx);
+        drop(rx); // 4 String остаются в кольце → Drop обязан их дропнуть
+    }
+
+    #[test]
+    fn miri_drop_undelivered_spsc() {
+        let (tx, rx) = scsp_bounded::<String, 4>();
+        for i in 0..4 {
+            tx.try_send(format!("payload {i}")).unwrap();
+        }
+        drop(tx);
+        drop(rx);
+    }
+
+    // Abort path push_fetch_add: producer blocked on full channel,
+    // receiver closes. push must return Err with the value (do not hang up the old seal was waiting for a consumer who no longer exists),
+    // and drop the Drop channel exactly the written String and do not touch
+    // reserved but not written slot assume_init_drop
+    // uninitialized memory = UB, Miri will catch instantly).
+    #[test]
+    fn miri_fetch_add_abort_seal_then_drop() {
+        let inner: Arc<SeqInner<String, 2>> = Arc::new(SeqInner::new());
+        inner.push_fetch_add("a".to_string()).unwrap();
+        inner.push_fetch_add("b".to_string()).unwrap();
+        // The third push waits for seq (channel is full).
+        let i2 = inner.clone();
+        let blocked = thread::spawn(move || {
+            // Either Err immediately (rx is already closed), or waits and Err after
+            // close in both cases the value is returned, there is no leak.
+            i2.push_fetch_add("c".to_string())
+        });
+        thread::yield_now();
+        inner.rx_close();
+        inner.notify_all_on_rx_close();
+        let r = blocked.join().unwrap();
+        assert!(r.is_err(), "rx закрыт — push обязан вернуть значение");
+        drop(inner); // Drop: drop a,b; skip the abortion hole
     }
 
     // Async recv

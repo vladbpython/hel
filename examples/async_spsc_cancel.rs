@@ -1,9 +1,13 @@
-use hel::channel::{errors::*, spsc::shard_spsc};
+use hel::channel::{
+    errors::*, 
+    nearest_power_of_two,
+    spsc::shard_spsc
+};
 use std::time::Duration;
 use tokio::{runtime::Builder, task::AbortHandle};
 use tokio_util::sync::CancellationToken;
 
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 // SPSC + cancellation: each pair is independent.
 // Use AbortHandle to force abort a specific shard.
 
@@ -27,14 +31,13 @@ fn main() {
                     let mut total = 0u64;
                     loop {
                         tokio::select! {
-                            biased; // safe ordering, no random!
                             _ = token_c.cancelled() => {
                                 println!("[spsc shard {shard_id}] cancelled, total = {total}");
                                 break;
                             }
                             result = rx.recv_async() => {
                                 match result {
-                                    Ok(v)                             => total += v,
+                                    Ok(v) => total += v,
                                     Err(AsyncRecvError::Disconnected) => {
                                         println!("[spsc shard {shard_id}] done, total = {total}");
                                         break;

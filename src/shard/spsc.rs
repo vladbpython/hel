@@ -263,8 +263,6 @@ impl<T: Send + 'static, const CAP: usize> SpscShard<T, CAP> {
     }
 }
 
-// Builder через Channel::sharded_spsc
-
 /// Creates a sharded SPSC channel short alias.
 /// `num_shards` the number of independent SPSC channels (not necessarily degree 2).
 pub fn shard_spsc<T: Send + 'static, const CAP: usize>(num_shards: usize) -> SpscShard<T, CAP> {

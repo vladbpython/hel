@@ -1,8 +1,12 @@
-use hel::channel::{errors::*, mpmc::round_robin};
+use hel::channel::{
+    errors::*, 
+    mpmc::round_robin,
+    nearest_power_of_two
+};
 use std::thread;
 use tokio::runtime::Builder;
 
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 
 // Sync OS threads produce → same channel ← async tokio tasks consume.
 // Real world: blocking I/O producers (file, serial, legacy SDK)

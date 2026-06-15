@@ -1,9 +1,13 @@
-use hel::channel::{errors::*, mpmc::round_robin};
+use hel::channel::{
+    errors::*, 
+    nearest_power_of_two,
+    mpmc::round_robin
+};
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;
 
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 
 //Graceful shutdown: CancellationToken signals all tasks to stop.
 //Producers drop tx → consumers get Disconnected.
@@ -30,7 +34,6 @@ fn main() {
                     let mut total = 0u64;
                     loop {
                         tokio::select! {
-                            biased; // safe ordering, no random!
                             // Cancellation has priority
                             _ = token.cancelled() => {
                                 println!("[rr shard {id}] cancelled, total = {total}");

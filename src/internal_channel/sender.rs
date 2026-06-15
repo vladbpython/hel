@@ -1,10 +1,10 @@
 use super::{
-    core::{MPMCInner, SingleInner},
+    core::{SENDER_SPIN_COUNT, SeqInner, SingleInner},
     errors::{
         AsyncSendError, BatchSendError, SendBatchError, SendError, TrySendBatchError, TrySendError,
     },
     sync::{AsyncSlot, SyncList, SyncNode},
-    traits::SenderOps,
+    traits::{MultiProducer, SenderOps},
 };
 use std::{
     future::Future,
@@ -15,8 +15,6 @@ use std::{
     thread::{park, park_timeout},
     time::{Duration, Instant},
 };
-
-const SPIN_COUNT: u8 = 64;
 
 // Unify methods
 
@@ -58,12 +56,12 @@ pub fn send_impl<T: Send + 'static, const CAP: usize>(
                 if inner.is_rx_closed() {
                     return Err(SendError::Disconnected(v));
                 }
-                value = v; // Err(Full) on Intel/SPSC — fall through to spin+park
+                value = v; // Err(Full) on Intel/SPSC fall through to spin+park
             }
         }
     }
 
-    // Deadline path OR Intel/SPSC buffer-full fallback.
+    // Deadline path OR Intel/SPSC buffer full fallback.
     loop {
         if inner.is_rx_closed() {
             return Err(SendError::Disconnected(value));
@@ -86,7 +84,7 @@ pub fn send_impl<T: Send + 'static, const CAP: usize>(
         // Adaptive spin: ~64ns wait without park().
         // On multi core: consumer can pop() while we spin.
         // On single core: pause instruction reduces power without blocking the core.
-        for _ in 0..SPIN_COUNT {
+        for _ in 0..SENDER_SPIN_COUNT {
             std::hint::spin_loop();
             if inner.is_rx_closed() {
                 return Err(SendError::Disconnected(value));
@@ -145,7 +143,7 @@ pub fn send_batch_impl<T: Send + 'static, const CAP: usize>(
         return Ok(fast);
     }
 
-    // Buffer full — blocking fallback per item.
+    // Buffer full blocking fallback per item.
     // push_batch left buf in reversed order, restore FIFO.
     buf.reverse();
     let mut sent = fast;
@@ -299,7 +297,7 @@ impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Drop
 
 // Sender (MPMC)
 
-pub struct Sender<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP> = MPMCInner<T, CAP>> {
+pub struct Sender<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP> = SeqInner<T, CAP>> {
     inner: Arc<I>,
     _t: PhantomData<T>,
 }
@@ -307,7 +305,7 @@ pub struct Sender<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP> = MP
 /// Async send future for MPMC channel.
 pub type SenderFuture<'a, T, const CAP: usize, I> = GenericSendFuture<'a, T, CAP, I>;
 
-/// SPSC sender — type alias, no Clone (SPSC invariant: exactly 1 producer).
+/// SPSC sender has exactly one producer, `Clone` is missing at the type level.
 pub type SingleSender<T, const CAP: usize> = Sender<T, CAP, SingleInner<T, CAP>>;
 
 impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
@@ -361,8 +359,16 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
     }
 
     pub async fn send_batch_async(&self, buf: &mut Vec<T>) -> usize {
+        let fast = self.inner.push_batch(buf); // one publication per batch
+        if fast > 0 {
+            self.inner.notify_receivers();
+        }
+        if buf.is_empty() {
+            return fast;
+        } // the entire buffer is gone exit without a loop
+        // channel is full → old element-wise path as fallback
         buf.reverse();
-        let mut sent = 0;
+        let mut sent = fast;
         while let Some(value) = buf.pop() {
             match self.send_async(value).await {
                 Ok(()) => sent += 1,
@@ -384,11 +390,10 @@ impl<T: Send, const CAP: usize> Sender<T, CAP, SingleInner<T, CAP>> {
     }
 }
 
-// Clone only for MPMC Sender — SingleSender (SPSC) must NOT be cloneable.
-// Implement Clone only when I is NOT SingleInner via a negative bound workaround:
-// simplest approach — keep Clone on the generic Sender and rely on the fact
-// that SingleSender is constructed only once via channel() constructor.
-impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Clone for Sender<T, CAP, I> {
+// Clone exists ONLY for multi-producer inners (SeqInner).
+// SingleSender (SPSC) does not implement Clone type level guarantee:
+// a clone of an SPSC sender would mean two producers on a protocol without CAS → UB.
+impl<T: Send, const CAP: usize, I: SenderOps<T, CAP> + MultiProducer> Clone for Sender<T, CAP, I> {
     fn clone(&self) -> Self {
         self.inner.sender_add(Ordering::Relaxed);
         Self {

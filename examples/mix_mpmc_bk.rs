@@ -1,8 +1,12 @@
-use hel::channel::{errors::*, mpmc::shard_key};
+use hel::channel::{
+    errors::*, 
+    nearest_power_of_two,
+    mpmc::shard_key
+};
 use std::thread;
 use tokio::runtime::Builder;
 
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 
 // Sync symbol producers → by-key routing → async consumers per shard.
 // Real world: sync market data feed → async order processing per symbol.

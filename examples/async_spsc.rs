@@ -1,6 +1,10 @@
-use hel::channel::{errors::*, spsc::shard_spsc};
+use hel::channel::{
+    errors::*, 
+    nearest_power_of_two,
+    spsc::shard_spsc
+};
 use tokio::runtime::Builder;
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 
 fn main() {
     let rt = Builder::new_multi_thread()

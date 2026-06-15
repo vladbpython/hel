@@ -1,7 +1,11 @@
-use hel::channel::{errors::*, spsc::shard_spsc};
+use hel::channel::{
+    errors::*, 
+    nearest_power_of_two,
+    spsc::shard_spsc
+};
 use std::thread;
 use tokio::runtime::Builder;
-const CAPACITY: usize = 128;
+const CAPACITY: usize = nearest_power_of_two(128);
 
 // Async producer → SPSC → sync consumer per shard.
 // Real world: async network downloader → sync file writer.

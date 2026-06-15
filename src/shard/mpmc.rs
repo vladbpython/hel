@@ -28,8 +28,8 @@
 use super::errors as shard_error;
 
 use crate::internal_channel::{
-    core::MPMCInner,
-    errors::{AsyncRecvError, AsyncSendError, SendError, TryRecvError, TrySendError},
+    core::SeqInner,
+    errors::{AsyncRecvError, AsyncSendError, TryRecvError},
     mpmc_bounded, nearest_power_of_two,
     receiver::Receiver,
     sender::Sender,
@@ -68,35 +68,6 @@ pub(crate) fn hash_key(key: &str) -> usize {
     }
 }
 
-// Helper trair
-
-trait IntoValue<T> {
-    fn into_value(self) -> T;
-}
-
-impl<T> IntoValue<T> for TrySendError<T> {
-    fn into_value(self) -> T {
-        match self {
-            TrySendError::Full(v) | TrySendError::Disconnected(v) => v,
-        }
-    }
-}
-impl<T> IntoValue<T> for SendError<T> {
-    fn into_value(self) -> T {
-        match self {
-            SendError::Disconnected(v) => v,
-            SendError::TimeOut((v, _)) => v,
-        }
-    }
-}
-impl<T> IntoValue<T> for AsyncSendError<T> {
-    fn into_value(self) -> T {
-        match self {
-            AsyncSendError::Disconnected(v) => v,
-        }
-    }
-}
-
 /// Sharded channel with round robin routing.
 /// Each `push` goes to the next shard in sequence.
 /// No key even load distribution across consumers.
@@ -105,7 +76,7 @@ impl<T> IntoValue<T> for AsyncSendError<T> {
 pub struct ShardRoundRobin<
     T: Send + 'static,
     const CAP: usize,
-    I: InnerChannel<T, CAP> + 'static = MPMCInner<T, CAP>,
+    I: InnerChannel<T, CAP> + 'static = SeqInner<T, CAP>,
 > {
     senders: Arc<[Sender<T, CAP, I>]>,
     cursor: AtomicUsize,
@@ -208,8 +179,15 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardRoundRob
         })
     }
 
-    /// Async batch to the next shard.
-    /// Waits for space → only Disconnected interrupts.
+    /// Async batch send with round-robin retry.
+    /// Fast path: the whole remaining batch goes to the next shard via
+    /// `try_send_batch`. If that shard is full, ONE element is awaited into
+    /// the following shard (back-pressure point), then the fast path retries.
+    /// NOTE: unlike the single-shot `try_send_batch`, retries spread the batch
+    /// across shards — per-batch shard affinity is NOT guaranteed (RR never
+    /// guarantees ordering anyway).
+    /// Only `Disconnected` interrupts; on error the unsent elements (including
+    /// the one being awaited) remain in `buf`.
     pub async fn send_batch_async(
         &self,
         buf: &mut Vec<T>,
@@ -217,25 +195,45 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardRoundRob
         if buf.is_empty() {
             return Ok(0);
         }
-        let shard = self.next_shard();
         let mut total = 0usize;
-        let mut items = Vec::new();
-        for v in buf.drain(..) {
-            match self.senders[shard].send_async(v).await {
-                Ok(()) => total += 1,
-                Err(e) => items.push(e.into_value()),
+        loop {
+            let shard = self.next_shard();
+            match self.senders[shard].try_send_batch(buf) {
+                Ok(sent) => {
+                    total += sent;
+                    return Ok(total);
+                }
+                Err(e) => {
+                    total += e.sent;
+                    if buf.is_empty() {
+                        return Ok(total);
+                    }
+                    // Back-pressure: await one element into the next shard.
+                    // RR gives no ordering guarantees → pop() from the back, O(1).
+                    let value = buf.pop().expect("checked non empty above");
+                    let shard2 = self.next_shard();
+                    match self.senders[shard2].send_async(value).await {
+                        Ok(()) => total += 1,
+                        Err(AsyncSendError::Disconnected(v)) => {
+                            // Return the element: `buf` must contain all unsent items.
+                            buf.push(v);
+                            return Err(shard_error::ShardAsyncBatchSendError {
+                                shard: shard2,
+                                sent: total,
+                            });
+                        }
+                    }
+                }
             }
-        }
-        if items.is_empty() {
-            Ok(total)
-        } else {
-            Err(shard_error::ShardAsyncBatchSendError { shard, sent: total })
         }
     }
 }
 
-impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Clone
-    for ShardRoundRobin<T, CAP, I>
+impl<
+    T: Send + 'static,
+    const CAP: usize,
+    I: InnerChannel<T, CAP> + crate::internal_channel::traits::MultiProducer,
+> Clone for ShardRoundRobin<T, CAP, I>
 {
     fn clone(&self) -> Self {
         let senders: Arc<[Sender<T, CAP, I>]> = self
@@ -244,9 +242,13 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Clone
             .map(Sender::clone)
             .collect::<Vec<_>>()
             .into();
+
+        // fetch_add atomically increments and returns different values
+        // for each clone → different starting shards
+        let offset = self.cursor.fetch_add(1, Ordering::Relaxed);
         Self {
             senders,
-            cursor: AtomicUsize::new(0),
+            cursor: AtomicUsize::new(offset),
             mask: self.mask,
         }
     }
@@ -341,10 +343,29 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
         groups
     }
 
-    /// Non-blocking batch by hash(key_fn).
+    /// Internal helper for error paths of keyed batch methods:
+    /// returns the failed group's remainder AND every not-yet-attempted
+    /// group back into `buf`. Without this, the early `return Err` would
+    /// silently DROP all unprocessed groups (data loss).
+    /// NOTE: after an error `buf` holds elements grouped by shard, not in
+    /// the original insertion order; per-key FIFO order within each group
+    /// is preserved, which is the only ordering ShardKey guarantees.
+    #[inline]
+    fn refill_on_error(
+        buf: &mut Vec<T>,
+        failed_group: Vec<T>,
+        remaining: impl Iterator<Item = (usize, Vec<T>)>,
+    ) {
+        buf.extend(failed_group);
+        for (_, g) in remaining {
+            buf.extend(g);
+        }
+    }
+
+    /// Non blocking batch by hash(key_fn).
     /// Returns `Ok(sent)` if all elements have been sent.
-    /// Returns `Err(sent)` if at least one shard was full or closed
-    /// `buf` contains unsent elements.
+    /// Returns `Err(sent)` if at least one shard was full or closed.
+    /// `buf` contains all unsent elements (grouped by shard; per key order kept).
     pub fn try_send_batch_keyed(
         &self,
         buf: &mut Vec<T>,
@@ -354,7 +375,8 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
             return Ok(0);
         }
         let mut total = 0usize;
-        for (shard, mut group) in self.group_by_shard(buf, &key_fn).into_iter().enumerate() {
+        let mut groups = self.group_by_shard(buf, &key_fn).into_iter().enumerate();
+        while let Some((shard, mut group)) = groups.next() {
             if group.is_empty() {
                 continue;
             }
@@ -366,7 +388,7 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
-                    buf.extend(group);
+                    Self::refill_on_error(buf, group, groups);
                     return Err(shard_error::ShardKeyTryBatchSendError {
                         key: first_key,
                         shard,
@@ -383,7 +405,8 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
     /// Waits until all items have been sent.
     /// After calling `buf` is guaranteed to be empty (unless receiver is closed).
     /// Returns `Ok(sent)` if all elements have been sent.
-    /// Returns `Err(ShardedKeyBatchError)` if receiver is closed.
+    /// Returns `Err(ShardedKeyBatchError)` if receiver is closed;
+    /// `buf` then contains all unsent elements.
     pub fn send_batch(
         &self,
         buf: &mut Vec<T>,
@@ -393,7 +416,8 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
             return Ok(0);
         }
         let mut total = 0usize;
-        for (shard, mut group) in self.group_by_shard(buf, &key_fn).into_iter().enumerate() {
+        let mut groups = self.group_by_shard(buf, &key_fn).into_iter().enumerate();
+        while let Some((shard, mut group)) = groups.next() {
             if group.is_empty() {
                 continue;
             }
@@ -405,7 +429,7 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
-                    buf.extend(group);
+                    Self::refill_on_error(buf, group, groups);
                     return Err(shard_error::ShardKeyBatchSendError {
                         key: first_key,
                         shard,
@@ -419,6 +443,7 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
     }
 
     /// Blocking batch с deadline по hash(key_fn).
+    /// On error (deadline or disconnect) `buf` contains all unsent elements.
     pub fn send_batch_timeout(
         &self,
         buf: &mut Vec<T>,
@@ -429,7 +454,8 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
             return Ok(0);
         }
         let mut total = 0usize;
-        for (shard, mut group) in self.group_by_shard(buf, &key_fn).into_iter().enumerate() {
+        let mut groups = self.group_by_shard(buf, &key_fn).into_iter().enumerate();
+        while let Some((shard, mut group)) = groups.next() {
             if group.is_empty() {
                 continue;
             }
@@ -441,7 +467,7 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
-                    buf.extend(group);
+                    Self::refill_on_error(buf, group, groups);
                     return Err(shard_error::ShardKeyBatchSendError {
                         key: first_key,
                         shard,
@@ -455,8 +481,11 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
     }
 
     /// Async batch by hash(key_fn).
-    /// Waits for space in each shard → only Disconnected interrupts.
-    /// Returns `Ok(sent)` or `Err(ShardedKeyAsyncBatchError)`.
+    /// Fast path: `try_send_batch_keyed` for the whole remaining batch.
+    /// When a shard is full, ONE element (head of the failed group) is
+    /// awaited into its shard the back pressure point then fast path
+    /// retries. Only `Disconnected` interrupts; on error `buf` contains
+    /// all unsent elements (including the one that was being awaited).
     pub async fn send_batch_async(
         &self,
         buf: &mut Vec<T>,
@@ -465,39 +494,40 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let n = self.mask + 1;
-        let mut groups: Vec<(String, Vec<T>)> =
-            (0..n).map(|_| (String::new(), Vec::new())).collect();
-        for item in buf.drain(..) {
-            let key = key_fn(&item);
-            let shard = hash_key(key) & self.mask;
-            if groups[shard].0.is_empty() {
-                groups[shard].0 = key.to_string();
-            }
-            groups[shard].1.push(item);
-        }
         let mut total = 0usize;
-        for (shard, (first_key, group)) in groups.into_iter().enumerate() {
-            if group.is_empty() {
-                continue;
-            }
-            let mut iter = group.into_iter();
-            for v in &mut iter {
-                match self.senders[shard].send_async(v).await {
-                    Ok(()) => total += 1,
-                    Err(e) => {
-                        buf.push(e.into_inner());
-                        buf.extend(iter);
-                        return Err(shard_error::ShardKeyAsyncBatchSendError {
-                            key: first_key,
-                            shard,
-                            sent: total,
-                        });
+        loop {
+            match self.try_send_batch_keyed(buf, &key_fn) {
+                Ok(sent) => {
+                    total += sent;
+                    return Ok(total);
+                }
+                Err(e) => {
+                    total += e.sent;
+                    if buf.is_empty() {
+                        return Ok(total);
+                    }
+                    // buf[0] is the head of the failed (full) shard's group
+                    // awaiting it waits for space in exactly that shard.
+                    // remove(0) is O(n) but this is the slow path; taking from
+                    // the FRONT preserves per key FIFO (pop() would break it).
+                    let first = buf.remove(0);
+                    let shard = hash_key(key_fn(&first)) & self.mask;
+                    match self.senders[shard].send_async(first).await {
+                        Ok(()) => total += 1,
+                        Err(AsyncSendError::Disconnected(v)) => {
+                            let key = key_fn(&v).to_string();
+                            // Return the element: `buf` must contain all unsent.
+                            buf.insert(0, v);
+                            return Err(shard_error::ShardKeyAsyncBatchSendError {
+                                key,
+                                shard,
+                                sent: total,
+                            });
+                        }
                     }
                 }
             }
         }
-        Ok(total)
     }
 }
 
@@ -516,11 +546,11 @@ impl<T: Send + 'static, const CAP: usize> Clone for ShardKey<T, CAP> {
     }
 }
 
-/// Sharded receiver common for `Sharded` and `ShardedKey`.
+/// Sharded receiver common for `ShardRoundRobin` and `ShardedKey`.
 pub struct ShardReceiver<
     T: Send + 'static,
     const CAP: usize,
-    I: InnerChannel<T, CAP> + 'static = MPMCInner<T, CAP>,
+    I: InnerChannel<T, CAP> + 'static = SeqInner<T, CAP>,
 > {
     pub(crate) receivers: Vec<Receiver<T, CAP, I>>,
     cursor: usize,
@@ -785,6 +815,19 @@ mod tests {
         thread,
     };
 
+    /// Deterministically finds two keys mapping to DIFFERENT shards.
+    fn two_keys_in_different_shards<T: Send + 'static, const CAP: usize>(
+        tx: &ShardKey<T, CAP>,
+    ) -> (&'static str, &'static str) {
+        const KEYS: [&str; 8] = ["K0", "K1", "K2", "K3", "K4", "K5", "K6", "K7"];
+        let ka = KEYS[0];
+        let kb = KEYS
+            .iter()
+            .find(|k| tx.shard_for(k) != tx.shard_for(ka))
+            .expect("among 8 keys at least one maps to another shard");
+        (ka, kb)
+    }
+
     // Sharded (RoundRobin)
 
     #[test]
@@ -855,6 +898,22 @@ mod tests {
         let (tx, rx) = round_robin::<u64, 8>(4);
         drop(rx);
         assert!(tx.try_send(1).is_err()); // Sharded try send error::disconnected
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn rr_batch_async_disconnect_no_loss() {
+        let (tx, rx) = round_robin::<u64, 4>(2);
+        drop(rx);
+        let mut batch: Vec<u64> = (0..6).collect();
+        let before = batch.len();
+        let r = tx.send_batch_async(&mut batch).await;
+        let sent = r.unwrap_err().sent;
+        assert_eq!(
+            sent + batch.len(),
+            before,
+            "RR async batch: ни один элемент не потерян при Disconnected"
+        );
     }
 
     // ShardedKey (ByKey)
@@ -941,6 +1000,72 @@ mod tests {
         let (tx, rx) = shard_key::<u64, 8>(4);
         drop(rx);
         assert!(tx.try_send("AAPL", 1).is_err()); // Sharded key try send error::disconnected
+    }
+
+    // Regression: keyed batch error paths must NOT drop unprocessed groups.
+    #[test]
+    fn key_batch_err_returns_all_unsent() {
+        let (tx, _rx) = shard_key::<u64, 2>(2); // CAP=2 — переполняется мгновенно
+        let (ka, kb) = two_keys_in_different_shards(&tx);
+        let mut batch: Vec<u64> = vec![1, 2, 3, 10, 20, 30]; // 3 на шард при CAP=2
+        let before = batch.len();
+        let r = tx.try_send_batch_keyed(&mut batch, |v| if *v < 10 { ka } else { kb });
+        let sent = r.unwrap_err().sent;
+        assert_eq!(sent + batch.len(), before, "ни один элемент не потерян");
+        // Per-key FIFO preserved inside the returned remainder.
+        let small: Vec<u64> = batch.iter().copied().filter(|v| *v < 10).collect();
+        let big: Vec<u64> = batch.iter().copied().filter(|v| *v >= 10).collect();
+        assert!(small.windows(2).all(|w| w[0] < w[1]));
+        assert!(big.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn key_batch_err_identity_of_unsent() {
+        // Не только количество, но и СОСТАВ: sent + returned == исходный набор.
+        let (tx, rx) = shard_key::<u64, 2>(2);
+        let (ka, kb) = two_keys_in_different_shards(&tx);
+        let original: Vec<u64> = vec![1, 2, 3, 10, 20, 30];
+        let mut batch = original.clone();
+        let _ = tx.try_send_batch_keyed(&mut batch, |v| if *v < 10 { ka } else { kb });
+        // Дренируем оба шарда и складываем с остатком.
+        let mut all: Vec<u64> = batch.clone();
+        let receivers = rx.into_receivers();
+        for r in &receivers {
+            while let Ok(v) = r.try_recv() {
+                all.push(v);
+            }
+        }
+        all.sort_unstable();
+        let mut expected = original;
+        expected.sort_unstable();
+        assert_eq!(all, expected, "ни потерь, ни дублей");
+    }
+
+    #[test]
+    fn key_blocking_batch_disconnect_returns_all_unsent() {
+        let (tx, rx) = shard_key::<u64, 8>(2);
+        drop(rx);
+        let mut batch: Vec<u64> = (0..6).collect();
+        let before = batch.len();
+        let r = tx.send_batch(&mut batch, |_| "K");
+        let sent = r.unwrap_err().sent;
+        assert_eq!(sent + batch.len(), before);
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn key_batch_async_disconnect_no_loss() {
+        let (tx, rx) = shard_key::<u64, 2>(2);
+        drop(rx);
+        let mut batch: Vec<u64> = (0..6).collect();
+        let before = batch.len();
+        let r = tx.send_batch_async(&mut batch, |_| "K").await;
+        let sent = r.unwrap_err().sent;
+        assert_eq!(
+            sent + batch.len(),
+            before,
+            "keyed async batch: ни один элемент не потерян при Disconnected"
+        );
     }
 
     // General: ShardedReceiver
@@ -1137,9 +1262,11 @@ mod tests {
         let (tx, rx) = shard_key::<String, 8>(2);
         drop(rx); // receiver will be dropped before sending
         let mut batch = vec!["hello".to_string(), "world".to_string()];
+        let before = batch.len();
         let result = tx.try_send_batch_keyed(&mut batch, |s| s.as_str());
-        // Error -receiver is closed, elements are returned to batch
+        // Error -receiver is closed, all elements are returned to batch
         assert!(result.is_err());
+        assert_eq!(batch.len(), before, "all elements returned, none dropped");
         drop(tx);
     }
 

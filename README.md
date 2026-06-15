@@ -16,46 +16,73 @@ Most channel libraries make you choose: sync **or** async. hel gives you both on
 
 hel is also sharded. Instead of one ring buffer shared by all producers, hel creates N independent ring buffers. Producers route messages by key or round-robin. This eliminates the main bottleneck of classic MPMC channels: contention on a single tail pointer.
 
+### Version
+
+- Current version is - `1.1.0`
+- Changes are documented in `change_log/v{version}.md`
+
 ## Benchmark results — X86 (MACOS)
 
-> Benchmarks use 1 000 000 messages per run. Higher is better.
+> Benchmarks use 1 000 000 messages per run; payload is a Binance trade tick (Copy struct, &'static str fields, ~80 B). Higher is better.
 
 ### sync_mpmc
 
-![intel_sync_mpmc](images/intel_sync_mpmc.png)
+![intel_mac_sync_mpmc](images/intel_mac_sync_mpmc.png)
 
 ### async_sharded
 
-![intel_async_sharded](images/intel_async_sharded.png)
+![intel_mac_async_mpmc](images/intel_mac_async_mpmc.png)
 
 ### scaling
 
-![intel_async_spsc_scaling](images/intel_async_spsc_scaling.png)
+![intel_mac_async_spsc_scaling](images/intel_mac_async_spsc_scaling.png)
 
 ### batch
 
-![intel_async_batch_send](images/intel_async_batch_send.png)
+![intel_mac_async_batch](images/intel_mac_async_batch.png)
+
+
+## Benchmark results — X86 (Ubuntu 26.04)
+
+> Benchmarks use 1 000 000 messages per run; payload is a Binance trade tick (Copy struct, &'static str fields, ~80 B). Higher is better.
+
+### sync_mpmc
+
+![intel_linux_sync_mpmc](images/intel_linux_sync_mpmc.png)
+
+### async_sharded
+
+![intel_linux_async_mpmc](images/intel_linux_async_mpmc.png)
+
+### scaling
+
+![intel_linux_async_spsc_scaling](images/intel_linux_async_spsc_scaling.png)
+
+### batch
+
+![intel_linux_async_batch](images/intel_linux_async_batch.png)
+
 
 
 ## Benchmark results — ARM (MACOS)
 
-> Benchmarks use 1 000 000 messages per run. Higher is better.
+> Benchmarks use 1 000 000 messages per run; payload is a Binance trade tick (Copy struct, &'static str fields, ~80 B). Higher is better.
 
 ### sync_mpmc
 
-![arm_sync_mpmc](images/arm_sync_mpmc.png)
+![arm_mac_sync_mpmc](images/arm_mac_sync_mpmc.png)
 
 ### async_sharded
 
-![arm_async_sharded](images/arm_async_sharded.png)
+![arm_mac_async_mpmc](images/arm_mac_async_mpmc.png)
 
 ### scaling
 
-![arm_async_spsc_scaling](images/arm_async_spsc_scaling.png)
+![arm_mac_async_spsc_scaling](images/arm_mac_async_spsc_scaling.png)
 
 ### batch
 
-![arm_async_batch_send](images/arm_async_batch_send.png)
+![arm_mac_async_batch](images/arm_mac_async_batch.png)
 
 ## Channel types
 

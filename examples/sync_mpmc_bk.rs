@@ -1,11 +1,15 @@
-use hel::channel::{errors::*, mpmc::shard_key};
+use hel::channel::{
+    errors::*, 
+    nearest_power_of_two,
+    mpmc::shard_key
+};
 use std::thread;
 
 // N producers → hash(key) → S shards → S consumers.
 // Guarantees ordering per key same key always goes to same shard.
 // Optimal for symbol routing: trading, actors, sessions.
 
-const CAPACITY: usize = 256;
+const CAPACITY: usize = nearest_power_of_two(256);
 
 fn main() {
     let (tx, rx) = shard_key::<u64, CAPACITY>(8);

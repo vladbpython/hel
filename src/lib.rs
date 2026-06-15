@@ -1,5 +1,6 @@
 pub(crate) mod cache;
 pub(crate) mod internal_channel;
+pub mod helper;
 pub mod macros;
 pub(crate) mod shard;
 
