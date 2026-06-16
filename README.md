@@ -18,7 +18,7 @@ hel is also sharded. Instead of one ring buffer shared by all producers, hel cre
 
 ### Version
 
-- Current version is - `1.1.0`
+- Current version is - `1.1.1`
 - Changes are documented in `change_log/v{version}.md`
 
 ## Benchmark results — X86 (MACOS)

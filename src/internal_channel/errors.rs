@@ -1,6 +1,13 @@
-use std::time::Duration;
+use std::{
+    fmt::{
+        Debug,
+        Formatter,
+        Result,
+    },
+    time::Duration
+};
 
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub enum TrySendError<T> {
     Full(T),
     Disconnected(T),
@@ -20,7 +27,17 @@ impl<T> TrySendError<T> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+impl<T> Debug for TrySendError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        match self {
+            Self::Full(_) => f.write_str("Full"),
+            Self::Disconnected(_) => f.write_str("Disconnected"),
+        }
+    }
+}
+
+
+#[derive(PartialEq)]
 pub enum SendError<T> {
     TimeOut((T, Duration)),
     Disconnected(T),
@@ -40,7 +57,17 @@ impl<T> SendError<T> {
     }
 }
 
-#[derive(Debug, PartialEq)]
+impl<T> Debug for SendError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        match self {
+            Self::TimeOut((_, d)) => write!(f, "TimeOut({d:?})"),
+            Self::Disconnected(_) => f.write_str("Disconnected"),
+        }
+    }
+}
+
+
+#[derive(PartialEq)]
 #[repr(u8)]
 pub enum AsyncSendError<T> {
     Disconnected(T),
@@ -53,6 +80,13 @@ impl<T> AsyncSendError<T> {
         }
     }
 }
+
+impl<T> Debug for AsyncSendError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        f.write_str("Disconnected")
+    }
+}
+
 
 #[derive(Debug, PartialEq)]
 pub enum TryRecvError {

@@ -4,7 +4,6 @@ use super::{
 };
 use crate::cache::Padding;
 use std::{
-    array::from_fn,
     hint,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     thread,
@@ -65,7 +64,7 @@ fn pop_batch_impl<T>(
 // SeqInner (X86/ARM aarch64)
 
 pub struct SeqInner<T, const CAP: usize> {
-    slots: [Slot<T>; CAP],
+    slots: Box<[Slot<T>; CAP]>,
     tail: Padding<AtomicUsize>,
     head: Padding<AtomicUsize>,
     send_waiters: SyncList,
@@ -79,8 +78,9 @@ pub struct SeqInner<T, const CAP: usize> {
 impl<T, const CAP: usize> SeqInner<T, CAP> {
     pub fn new() -> Self {
         assert!(CAP.is_power_of_two(), "CAP must be a power of two");
+        let boxed = (0..CAP).map(|n| Slot::new(n)).collect::<Box<[Slot<T>]>>();
         Self {
-            slots: from_fn(|n| Slot::new(n)),
+            slots: boxed.try_into().unwrap_or_else(|_| unreachable!()),
             tail: Padding(AtomicUsize::new(0)),
             head: Padding(AtomicUsize::new(0)),
             send_waiters: SyncList::new(),
@@ -122,49 +122,49 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
         }
     }
 
-        #[inline]
-        pub fn push_fetch_add(&self, value: T) -> Result<(), T> {
+    #[inline]
+    pub fn push_fetch_add(&self, value: T) -> Result<(), T> {
+        if self.rx_closed.load(Ordering::Acquire) {
+            return Err(value);
+        }
+        let pos = self.tail.fetch_add(1, Ordering::Relaxed);
+        let slot = &self.slots[pos & (CAP - 1)];
+        let mut waits = 0u32;
+        loop {
+            let seq = slot.sequence.load(Ordering::Acquire);
+            if seq == pos { break; }
             if self.rx_closed.load(Ordering::Acquire) {
+                //WITHOUT seal and WITHOUT waiting. The old seal was waiting for seq==pos
+                //i.e. freeing the slot by the consumer, who, when
+                //rx_closed no longer exists: send() on full channel
+                //+ drop receiver froze forever. Hole in seq chain
+                //after closing it is harmless: there are no consumers, the rest
+                //producers leave using their rx_closed checks, and Drop
+                //distinguishes states by seq (see impl Drop below) slot
+                //saves with unconsumed predecessor data
+                //its label p_old+1 and will be dropped correctly.
                 return Err(value);
             }
-            let pos = self.tail.fetch_add(1, Ordering::Relaxed);
-            let slot = &self.slots[pos & (CAP - 1)];
-            let mut waits = 0u32;
-            loop {
-                let seq = slot.sequence.load(Ordering::Acquire);
-                if seq == pos { break; }
-                if self.rx_closed.load(Ordering::Acquire) {
-                    //WITHOUT seal and WITHOUT waiting. The old seal was waiting for seq==pos
-                    //i.e. freeing the slot by the consumer, who, when
-                    //rx_closed no longer exists: send() on full channel
-                    //+ drop receiver froze forever. Hole in seq chain
-                    //after closing it is harmless: there are no consumers, the rest
-                    //producers leave using their rx_closed checks, and Drop
-                    //distinguishes states by seq (see impl Drop below) slot
-                    //saves with unconsumed predecessor data
-                    //its label p_old+1 and will be dropped correctly.
-                    return Err(value);
-                }
-                //Escalate: spin(hotpath, wait=ns) → yield
-                //(short silence) → sleep (long silence of the consumer:
-                //do not burn the core, which it itself needs otherwise everything will
-                //blocked producers eat up the CPU of the one they are waiting for).
-                //Park is not possible: notify_senders wakes up ONE arbitrary
-                //waiting, and we are waiting for our specific position woke up
-                //if it weren't for the owner, the owner would continue to sleep.
-                waits += 1;
-                if waits < SENDER_SPIN_COUNT {
-                    hint::spin_loop();
-                } else if waits < YIELD_UNTIL {
-                    thread::yield_now();
-                } else {
-                    thread::sleep(SLEEP);
-                }
+            //Escalate: spin(hotpath, wait=ns) → yield
+            //(short silence) → sleep (long silence of the consumer:
+            //do not burn the core, which it itself needs otherwise everything will
+            //blocked producers eat up the CPU of the one they are waiting for).
+            //Park is not possible: notify_senders wakes up ONE arbitrary
+            //waiting, and we are waiting for our specific position woke up
+            //if it weren't for the owner, the owner would continue to sleep.
+            waits += 1;
+            if waits < SENDER_SPIN_COUNT {
+                hint::spin_loop();
+            } else if waits < YIELD_UNTIL {
+                thread::yield_now();
+            } else {
+                thread::sleep(SLEEP);
             }
-            unsafe { (*slot.data.get()).write(value) };
-            slot.sequence.store(pos + 1, Ordering::Release);
-            Ok(())
         }
+        unsafe { (*slot.data.get()).write(value) };
+        slot.sequence.store(pos + 1, Ordering::Release);
+        Ok(())
+    }
 
     #[inline]
     fn pop_inner(&self) -> Option<T> {
@@ -205,14 +205,7 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
     }
     #[inline]
     fn push_blocking(&self, v: T) -> Result<(), T> {
-        #[cfg(target_os = "macos")]
-        {
             self.push_fetch_add(v)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            self.push_fetch_add(v)
-        }
     }
     #[inline]
     fn pop(&self) -> Option<T> {
@@ -273,6 +266,7 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
         }
         k
     }
+
     fn pop_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         pop_batch_impl(
             || self.pop_inner(),
@@ -373,7 +367,7 @@ unsafe impl<T: Send, const CAP: usize> Sync for SeqInner<T, CAP> {}
 // SingleInner (SPSC, lock free)
 
 pub struct SingleInner<T, const CAP: usize> {
-    slots: [Slot<T>; CAP],
+    slots: Box<[Slot<T>; CAP]>,
     tail: Padding<AtomicUsize>,
     head: Padding<AtomicUsize>,
     send_waiters: SyncList,
@@ -385,8 +379,9 @@ pub struct SingleInner<T, const CAP: usize> {
 impl<T, const CAP: usize> SingleInner<T, CAP> {
     pub fn new() -> Self {
         assert!(CAP.is_power_of_two(), "CAP must be a power of two");
+        let boxed = (0..CAP).map(|n| Slot::new(n)).collect::<Box<[Slot<T>]>>();
         Self {
-            slots: from_fn(|n| Slot::new(n)),
+            slots: boxed.try_into().unwrap_or_else(|_| unreachable!()),
             tail: Padding(AtomicUsize::new(0)),
             head: Padding(AtomicUsize::new(0)),
             send_waiters: SyncList::new(),
@@ -602,8 +597,8 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SingleInner<T
     fn rx_close(&self) {
         SingleInner::rx_close(self);
     }
-    
-    #[cfg(target_os = "linux")]
+
+    #[cfg(target_os = "macos")]
     #[inline]
     fn yield_before_park(&self) -> bool {
         false
