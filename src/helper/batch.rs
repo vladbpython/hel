@@ -260,7 +260,8 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, (0..200u64).collect::<Vec<_>>(), "contents != original");
     }
-
+    
+    #[cfg(not(miri))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_drain_batch_keeps_last() {
         // SPSC
@@ -310,6 +311,7 @@ mod tests {
 
     /// drain_batch_async_sink: the entire batch goes into the sink, elements are not lost,
     /// number of sink calls = number of non empty batches (not number of elements).
+    #[cfg(not(miri))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_sink_sends_whole_batch() {
         use crate::channel::spsc::shard_spsc;
