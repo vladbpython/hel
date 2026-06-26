@@ -34,4 +34,7 @@ path = "benches/trade_bench.rs"
 [lib]
 name = "hel"
 
+exclude = [
+    "**/.DS_Store",
+]
 
