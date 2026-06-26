@@ -57,7 +57,7 @@ fn make_trade(i: u64, producer: u64) -> Trade {
         p: price,
         q: qty,
         trade_time: 1672515782136 + i,
-        m: i % 2 == 0,
+        m: i.is_multiple_of(2),
         _m: true,
     }
 }
@@ -719,7 +719,6 @@ fn run_flume_key(rt: &Runtime, pools: &Pools, num_shards: usize, cap: usize) -> 
 // losses/duplicates (history: try_send_batch_keyed lost groups before fix).
 
 const BATCH: usize = 64;
-
 
 fn run_hel_key_batch<const CAP: usize>(rt: &Runtime, pools: &Pools, num_shards: usize) -> Duration {
     let data = pools.data.clone();

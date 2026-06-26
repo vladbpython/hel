@@ -1,8 +1,4 @@
-use hel::channel::{
-    errors::*, 
-    nearest_power_of_two,
-    mpmc::round_robin
-};
+use hel::channel::{errors::*, mpmc::round_robin, nearest_power_of_two};
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;

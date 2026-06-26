@@ -1,5 +1,4 @@
 use hel::channel::{
-    errors::*,
     mpmc::{ShardGroupCase, shard_group},
     nearest_power_of_two,
 };
@@ -29,11 +28,8 @@ fn main() {
             .map(|(id, r)| {
                 tokio::spawn(async move {
                     let mut total = 0u64;
-                    loop {
-                        match r.recv_async().await {
-                            Ok(v) => total += v,
-                            Err(AsyncRecvError::Disconnected) => break,
-                        }
+                    while let Ok(v) = r.recv_async().await {
+                        total += v;
                     }
                     println!("[group shard {id}] total = {total}");
                 })

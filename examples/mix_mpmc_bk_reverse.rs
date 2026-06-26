@@ -1,9 +1,4 @@
-use hel::channel::{
-    errors::*, 
-    nearest_power_of_two,
-    mpmc::shard_key,
-    
-};
+use hel::channel::{errors::*, mpmc::shard_key, nearest_power_of_two};
 use std::thread;
 use tokio::runtime::Builder;
 

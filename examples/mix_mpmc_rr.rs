@@ -1,8 +1,4 @@
-use hel::channel::{
-    errors::*, 
-    mpmc::round_robin,
-    nearest_power_of_two
-};
+use hel::channel::{mpmc::round_robin, nearest_power_of_two};
 use std::thread;
 use tokio::runtime::Builder;
 
@@ -29,11 +25,8 @@ fn main() {
         .map(|(id, r)| {
             rt.spawn(async move {
                 let mut total = 0u64;
-                loop {
-                    match r.recv_async().await {
-                        Ok(v) => total += v,
-                        Err(AsyncRecvError::Disconnected) => break,
-                    }
+                while let Ok(v) = r.recv_async().await {
+                    total += v;
                 }
                 println!("[async consumer shard {id}] total = {total}");
             })

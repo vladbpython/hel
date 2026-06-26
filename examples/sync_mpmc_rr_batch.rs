@@ -1,7 +1,4 @@
-use hel::channel::{
-    mpmc::round_robin,
-    nearest_power_of_two,
-};
+use hel::channel::{mpmc::round_robin, nearest_power_of_two};
 use std::thread;
 
 // Batch send: groups messages per shard one lock per shard.

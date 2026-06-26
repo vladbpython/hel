@@ -308,7 +308,7 @@ mod tests {
         while next < N {
             let mut buf: Vec<u64> = (next..N.min(next + 3)).collect();
             let want = buf.len();
-            let sent = tx.try_send_batch(&mut buf).map_or_else(|e| e.sent, |s| s);
+            let sent = tx.try_send_batch(&mut buf).unwrap_or_else(|e| e.sent);
             next += sent as u64;
             let _ = want;
             std::thread::yield_now();

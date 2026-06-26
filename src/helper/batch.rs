@@ -1,5 +1,4 @@
 /// BATCH DRAIN: Safe stop all 6 sync/async × shard_key/round_robin/spsc combinations.
-
 use std::mem;
 
 /// SYNC batch drain for all 3 channels.
@@ -260,7 +259,7 @@ mod tests {
         got.sort_unstable();
         assert_eq!(got, (0..200u64).collect::<Vec<_>>(), "contents != original");
     }
-    
+
     #[cfg(not(miri))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_drain_batch_keeps_last() {

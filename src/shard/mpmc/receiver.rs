@@ -25,12 +25,12 @@
 //! tx.try_send("AAPL", 150).unwrap();
 //! ```
 
-use super::hash::hash_key;
 use super::super::errors as shard_error;
+use super::hash::hash_key;
 
 use crate::internal_channel::{
     core::SeqInner,
-    errors::{AsyncRecvError,TryRecvError},
+    errors::{AsyncRecvError, TryRecvError},
     receiver::Receiver,
     sync::{AsyncSlot, SyncList},
     traits::InnerChannel,
@@ -98,12 +98,9 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardReceiver
         let n = self.receivers.len();
         for i in 0..n {
             let idx = (self.cursor + i) % n;
-            match self.receivers[idx].try_recv() {
-                Ok(v) => {
-                    self.cursor = (idx + 1) % n;
-                    return Some((idx, v));
-                }
-                _ => {}
+            if let Ok(v) = self.receivers[idx].try_recv() {
+                self.cursor = (idx + 1) % n;
+                return Some((idx, v));
             }
         }
         None
@@ -230,15 +227,12 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Future
 
         for i in 0..n {
             let idx = (start + i) % n;
-            match this.rx.receivers[idx].try_recv() {
-                Ok(v) => {
-                    this.rx.cursor = (idx + 1) % n;
-                    for slot in this.slots.iter_mut().flatten() {
-                        SyncList::cancel_async_slot(slot);
-                    }
-                    return Poll::Ready(Ok((idx, v)));
+            if let Ok(v) = this.rx.receivers[idx].try_recv() {
+                this.rx.cursor = (idx + 1) % n;
+                for slot in this.slots.iter_mut().flatten() {
+                    SyncList::cancel_async_slot(slot);
                 }
-                _ => {}
+                return Poll::Ready(Ok((idx, v)));
             }
         }
 

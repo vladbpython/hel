@@ -23,7 +23,7 @@
 //! //ByKey: with a key, the order is guaranteed
 //! let (tx, rx) = shard_key::<u64, 128>(4);
 //! tx.try_send("AAPL", 150).unwrap();
-//! 
+//!
 //! // ByGroup: explicit grouping, many keys → few shards
 //! let (tx, rx) = shard_group::<u64, 128>(ShardGroupCase::Groups {
 //!     groups: &[
@@ -35,9 +35,8 @@
 //! tx.try_send(h, 150).unwrap(); // send by handle on the hot path
 //! ```
 
-
 mod hash;
-pub mod sender_key;
-pub mod sender_group;
-pub mod sender_round_robin;
 pub mod receiver;
+pub mod sender_group;
+pub mod sender_key;
+pub mod sender_round_robin;

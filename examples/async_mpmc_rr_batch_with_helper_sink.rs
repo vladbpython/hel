@@ -3,11 +3,8 @@
 //receives the entire array of batch ownership and sends it with one call
 //like socket.write_all(&serialize(&batch)) on a real system.
 use hel::{
-    channel::{
-        mpmc::round_robin,
-        nearest_power_of_two,
-    }, 
-    helper::batch::drain_batch_async_sink
+    channel::{mpmc::round_robin, nearest_power_of_two},
+    helper::batch::drain_batch_async_sink,
 };
 use std::sync::{
     Arc,
@@ -16,7 +13,7 @@ use std::sync::{
 use tokio::runtime::Builder;
 
 const BATCH: usize = 64;
-const CAPACITY: usize =  nearest_power_of_two(1024);
+const CAPACITY: usize = nearest_power_of_two(1024);
 const PER_PRODUCER: u64 = 100_000;
 
 // Simulation of a network receiver (TcpStream /WebSocket).

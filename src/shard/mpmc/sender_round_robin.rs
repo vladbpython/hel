@@ -29,10 +29,7 @@ use super::super::errors as shard_error;
 use super::receiver::ShardReceiver;
 
 use crate::internal_channel::{
-    core::SeqInner,
-    errors::AsyncSendError,
-    mpmc_bounded, nearest_power_of_two,
-    sender::Sender,
+    core::SeqInner, errors::AsyncSendError, mpmc_bounded, nearest_power_of_two, sender::Sender,
     traits::InnerChannel,
 };
 use std::{

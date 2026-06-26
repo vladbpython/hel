@@ -34,11 +34,16 @@
 //! ```
 
 use super::errors as shard_error;
-use crate::internal_channel::{core::SingleInner, receiver::SingleReceiver, sender::SingleSender};
+use crate::internal_channel::{
+    core::SingleInner,
+    receiver::SingleReceiver,
+    sender::{Sender, SingleSender},
+};
 use std::sync::Arc;
 
-// Spsc sharded channel
+type ShardPair<T, const CAP: usize> = (Sender<T, CAP, SingleInner<T, CAP>>, SingleReceiver<T, CAP>);
 
+// Spsc sharded channel
 /// Builder for sharded SPSC channel.
 /// Stores all `(SingleSender, SingleReceiver)` pairs before distribution.
 /// Use `into_pairs()` or `take_pair(i)` to get pairs.
@@ -53,12 +58,7 @@ impl<T: Send + 'static, const CAP: usize> SpscShard<T, CAP> {
     pub fn new(num_shards: usize) -> Self {
         assert!(num_shards > 0, "num_shards must be > 0");
         assert!(CAP.is_power_of_two(), "CAP must be a power of two");
-        let pairs: Vec<
-            Option<(
-                crate::internal_channel::sender::Sender<T, CAP, SingleInner<T, CAP>>,
-                SingleReceiver<T, CAP>,
-            )>,
-        > = (0..num_shards)
+        let pairs: Vec<Option<ShardPair<T, CAP>>> = (0..num_shards)
             .map(|_| {
                 let inner = Arc::new(SingleInner::new());
                 let tx = SingleSender::new(inner.clone());

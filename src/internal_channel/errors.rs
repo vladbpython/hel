@@ -1,10 +1,6 @@
 use std::{
-    fmt::{
-        Debug,
-        Formatter,
-        Result,
-    },
-    time::Duration
+    fmt::{Debug, Formatter, Result},
+    time::Duration,
 };
 
 #[derive(PartialEq)]
@@ -36,7 +32,6 @@ impl<T> Debug for TrySendError<T> {
     }
 }
 
-
 #[derive(PartialEq)]
 pub enum SendError<T> {
     TimeOut((T, Duration)),
@@ -66,7 +61,6 @@ impl<T> Debug for SendError<T> {
     }
 }
 
-
 #[derive(PartialEq)]
 #[repr(u8)]
 pub enum AsyncSendError<T> {
@@ -86,7 +80,6 @@ impl<T> Debug for AsyncSendError<T> {
         f.write_str("Disconnected")
     }
 }
-
 
 #[derive(Debug, PartialEq)]
 pub enum TryRecvError {

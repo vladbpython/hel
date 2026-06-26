@@ -1,8 +1,4 @@
-use hel::channel::{
-    errors::*, 
-    mpmc::shard_key,
-    nearest_power_of_two,
-};
+use hel::channel::{mpmc::shard_key, nearest_power_of_two};
 use tokio::runtime::Builder;
 const CAPACITY: usize = nearest_power_of_two(256);
 
@@ -26,11 +22,8 @@ fn main() {
             .map(|(id, r)| {
                 tokio::spawn(async move {
                     let mut count = 0u64;
-                    loop {
-                        match r.recv_async().await {
-                            Ok(_) => count += 1,
-                            Err(AsyncRecvError::Disconnected) => break,
-                        }
+                    while r.recv_async().await.is_ok() {
+                        count += 1;
                     }
                     println!("[key shard {id}] messages = {count}");
                 })

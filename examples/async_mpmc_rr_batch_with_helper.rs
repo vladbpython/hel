@@ -1,9 +1,6 @@
 use hel::{
-    channel::{
-        mpmc::round_robin,
-        nearest_power_of_two
-    },
-    helper::batch::drain_batch_async
+    channel::{mpmc::round_robin, nearest_power_of_two},
+    helper::batch::drain_batch_async,
 };
 use tokio::runtime::Builder;
 const BATCH: usize = 64;

@@ -1,8 +1,4 @@
-use hel::channel::{
-    errors::*, 
-    nearest_power_of_two,
-    spsc::shard_spsc
-};
+use hel::channel::{nearest_power_of_two, spsc::shard_spsc};
 use std::thread;
 use tokio::runtime::Builder;
 const CAPACITY: usize = nearest_power_of_two(256);
@@ -26,14 +22,9 @@ fn main() {
             let consumer = rt.spawn(async move {
                 let mut sum = 0.0f64;
                 let mut count = 0u64;
-                loop {
-                    match rx.recv_async().await {
-                        Ok(v) => {
-                            sum += v;
-                            count += 1;
-                        }
-                        Err(AsyncRecvError::Disconnected) => break,
-                    }
+                while let Ok(v) = rx.recv_async().await {
+                    sum += v;
+                    count += 1;
                 }
                 println!("[async spsc {shard_id}] avg = {:.4}", sum / count as f64);
             });

@@ -1,8 +1,4 @@
-use hel::channel::{
-    errors::*, 
-    nearest_power_of_two,
-    spsc::shard_spsc
-};
+use hel::channel::{errors::*, nearest_power_of_two, spsc::shard_spsc};
 use std::thread;
 
 const CAPACITY: usize = nearest_power_of_two(256);

@@ -1,8 +1,4 @@
-use hel::channel::{
-    errors::*, 
-    nearest_power_of_two,
-    spsc::shard_spsc
-};
+use hel::channel::{nearest_power_of_two, spsc::shard_spsc};
 use tokio::runtime::Builder;
 const CAPACITY: usize = nearest_power_of_two(256);
 
@@ -19,11 +15,8 @@ fn main() {
             .map(|(shard_id, tx, rx)| {
                 let consumer = tokio::spawn(async move {
                     let mut total = 0u64;
-                    loop {
-                        match rx.recv_async().await {
-                            Ok(v) => total += v,
-                            Err(AsyncRecvError::Disconnected) => break,
-                        }
+                    while let Ok(v) = rx.recv_async().await {
+                        total += v;
                     }
                     println!("[spsc shard {shard_id}] total = {total}");
                 });

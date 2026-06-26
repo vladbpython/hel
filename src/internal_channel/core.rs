@@ -6,8 +6,7 @@ use crate::cache::Padding;
 use std::{
     hint,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    thread,
-    time,
+    thread, time,
 };
 
 /// Waiting phases push_fetch_add (escalation spin → yield → sleep)
@@ -22,7 +21,6 @@ const YIELD_UNTIL: u32 = 256;
 /// needed by the consumer himself. Price up to 20 µs of excess latency per
 /// waking up after an already long period of inactivity.
 const SLEEP: std::time::Duration = time::Duration::from_micros(20);
-
 
 #[inline]
 fn notify_one_waiter(list: &SyncList) {
@@ -132,7 +130,9 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
         let mut waits = 0u32;
         loop {
             let seq = slot.sequence.load(Ordering::Acquire);
-            if seq == pos { break; }
+            if seq == pos {
+                break;
+            }
             if self.rx_closed.load(Ordering::Acquire) {
                 //WITHOUT seal and WITHOUT waiting. The old seal was waiting for seq==pos
                 //i.e. freeing the slot by the consumer, who, when
@@ -205,7 +205,7 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
     }
     #[inline]
     fn push_blocking(&self, v: T) -> Result<(), T> {
-            self.push_fetch_add(v)
+        self.push_fetch_add(v)
     }
     #[inline]
     fn pop(&self) -> Option<T> {

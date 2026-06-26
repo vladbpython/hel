@@ -208,11 +208,11 @@ impl SyncList {
     /// Avoids redundant Acquire loads inside.
     #[inline]
     pub fn notify_one_if(&self, async_hint: usize, blocking_hint: usize) {
-        if async_hint > 0 {
-            if let Some(w) = self.pop_async() {
-                w.wake();
-                return;
-            }
+        if async_hint > 0
+            && let Some(w) = self.pop_async()
+        {
+            w.wake();
+            return;
         }
         if blocking_hint > 0 {
             let kind = {
@@ -280,10 +280,10 @@ impl SyncList {
             while let Some(slot) = q.pop_front() {
                 slot.in_queue.store(false, Ordering::Release);
                 self.async_count.fetch_sub(1, Ordering::Relaxed);
-                if !slot.cancelled.load(Ordering::Acquire) {
-                    if let Some(w) = slot.waker.take() {
-                        wakers.push(w);
-                    }
+                if !slot.cancelled.load(Ordering::Acquire)
+                    && let Some(w) = slot.waker.take()
+                {
+                    wakers.push(w);
                 }
             }
         }

@@ -1,8 +1,4 @@
-use hel::channel::{
-    errors::*, 
-    mpmc::round_robin,
-    nearest_power_of_two,
-};
+use hel::channel::{errors::*, mpmc::round_robin, nearest_power_of_two};
 use std::thread;
 use tokio::runtime::Builder;
 

@@ -1,8 +1,4 @@
-use hel::channel::{
-    errors::*, 
-    nearest_power_of_two,
-    spsc::shard_spsc
-};
+use hel::channel::{errors::*, nearest_power_of_two, spsc::shard_spsc};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Duration;

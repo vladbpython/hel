@@ -1,8 +1,4 @@
-use hel::channel::{
-    errors::*, 
-    nearest_power_of_two,
-    mpmc::shard_key
-};
+use hel::channel::{mpmc::shard_key, nearest_power_of_two};
 use std::thread;
 use tokio::runtime::Builder;
 
@@ -32,11 +28,8 @@ fn main() {
         .map(|(id, r)| {
             rt.spawn(async move {
                 let mut count = 0u64;
-                loop {
-                    match r.recv_async().await {
-                        Ok(_) => count += 1,
-                        Err(AsyncRecvError::Disconnected) => break,
-                    }
+                while r.recv_async().await.is_ok() {
+                    count += 1;
                 }
                 println!("[async key shard {id}] messages = {count}");
             })

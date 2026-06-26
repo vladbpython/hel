@@ -3,11 +3,8 @@
 // batch as an array and calculates from it at once the sum of the slice in one pass
 // (the compiler can vectorize) rather than calling handler on each element.
 use hel::{
-    channel::{
-        mpmc::round_robin,
-        nearest_power_of_two,
-    }, 
-    helper::batch::drain_batch_sink
+    channel::{mpmc::round_robin, nearest_power_of_two},
+    helper::batch::drain_batch_sink,
 };
 use std::thread;
 

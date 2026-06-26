@@ -1,7 +1,4 @@
-use hel::channel::{
-    mpmc::round_robin,
-    nearest_power_of_two,
-};
+use hel::channel::{mpmc::round_robin, nearest_power_of_two};
 use tokio::runtime::Builder;
 const BATCH: usize = 64;
 const CAPACITY: usize = nearest_power_of_two(1024);

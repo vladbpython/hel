@@ -569,8 +569,7 @@ mod tests {
         let mut batch: Vec<u64> = vec![10, 20, 30, 40];
         // We deliberately overflow the buffer to get an error and check extend
         // CAP=8 is enough, everyone must pass
-        let result =
-            tx.try_send_batch(&mut batch, |v| if *v <= 20 { "AAPL" } else { "MSFT" });
+        let result = tx.try_send_batch(&mut batch, |v| if *v <= 20 { "AAPL" } else { "MSFT" });
         assert!(result.is_ok());
         assert!(batch.is_empty());
         drop(tx);

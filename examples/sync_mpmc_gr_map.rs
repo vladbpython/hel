@@ -23,7 +23,7 @@ fn sector_of(sym: &str) -> Option<usize> {
         "TSLA" | "UBER" | "LYFT" => Some(1),                                    // auto/mobility
         "BTC" | "ETH" => Some(2),                                               // crypto
         "META" | "SNAP" | "NFLX" | "AMZN" => Some(3),                           // media/consumer
-        _ => None, // unknown ignore
+        _ => None,                                                              // unknown ignore
     }
 }
 

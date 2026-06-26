@@ -1,7 +1,4 @@
-use hel::channel::{
-    nearest_power_of_two,
-    spsc::shard_spsc
-};
+use hel::channel::{nearest_power_of_two, spsc::shard_spsc};
 use std::thread;
 
 const BATCH: usize = 64;

@@ -2,11 +2,8 @@
 //Consumer uses drain_batch (drain→check rule is hardwired), producer
 //sends in batches. Order: join producer → drop tx → join consumers.
 use hel::{
-    channel::{
-        mpmc::round_robin,
-        nearest_power_of_two,
-    }, 
-    helper::batch::drain_batch
+    channel::{mpmc::round_robin, nearest_power_of_two},
+    helper::batch::drain_batch,
 };
 use std::thread;
 

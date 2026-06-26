@@ -11,7 +11,7 @@ use std::{
     pin::Pin,
     sync::{Arc, atomic::Ordering},
     task::{Context, Poll},
-    thread::{park, park_timeout,yield_now},
+    thread::{park, park_timeout, yield_now},
     time::{Duration, Instant},
 };
 
@@ -44,15 +44,14 @@ pub fn recv_impl<T, const CAP: usize>(
             }
             None => {}
         }
-        if let Some(dl) = deadline {
-            if dl
+        if let Some(dl) = deadline
+            && dl
                 .checked_duration_since(Instant::now())
-                .map_or(true, |d| d == Duration::ZERO)
-            {
-                return Err(RecvError::TimeOut(dl.elapsed()));
-            }
+                .is_none_or(|d| d == Duration::ZERO)
+        {
+            return Err(RecvError::TimeOut(dl.elapsed()));
         }
- 
+
         if inner.yield_before_park() {
             // Adaptive spin before parking symmetry to SPIN_COUNT on
             // sender's side. Without it, consumer in the streaming pattern
@@ -61,12 +60,9 @@ pub fn recv_impl<T, const CAP: usize>(
             // Spin holds the consumer hot while the producer adds the next element.
             for _ in 0..SPIN_COUNT {
                 spin_loop();
-                match inner.pop() {
-                    Some(v) => {
-                        inner.notify_senders();
-                        return Ok(v);
-                    }
-                    None => {}
+                if let Some(v) = inner.pop() {
+                    inner.notify_senders();
+                    return Ok(v);
                 }
             }
             yield_now();
@@ -213,7 +209,6 @@ impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Drop
 }
 
 /// Generic Stream Receiver
-
 pub struct GenericRecvStream<'a, T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> {
     inner: &'a Arc<I>,
     slot: Option<Arc<AsyncSlot>>,
@@ -388,7 +383,6 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Drop for Rece
 }
 
 /// MPMC Iterators
-
 pub struct Iter<'a, T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + 'static> {
     r: &'a Receiver<T, CAP, I>,
 }
@@ -444,7 +438,7 @@ pub type SingleRecvFuture<'a, T, const CAP: usize> =
     GenericRecvFuture<'a, T, CAP, SingleInner<T, CAP>>;
 
 pub type SignleRecvStream<'a, T, const CAP: usize> =
-    GenericRecvStream<'a, T, CAP, SingleInner<T, CAP>>;    
+    GenericRecvStream<'a, T, CAP, SingleInner<T, CAP>>;
 
 impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
     pub fn new(inner: Arc<SingleInner<T, CAP>>) -> Self {
