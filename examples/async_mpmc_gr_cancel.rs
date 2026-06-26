@@ -1,17 +1,12 @@
 use hel::channel::{
-    errors::*, 
+    errors::*,
+    mpmc::{ShardGroupCase, shard_group},
     nearest_power_of_two,
-    mpmc::round_robin
 };
 use std::time::Duration;
 use tokio::runtime::Builder;
 use tokio_util::sync::CancellationToken;
-
 const CAPACITY: usize = nearest_power_of_two(256);
-
-// Graceful shutdown: CancellationToken signals all tasks to stop.
-// Producers drop tx → consumers get Disconnected.
-// select! on the consumer side it allows recv_async to be interrupted before Disconnected.
 
 fn main() {
     let rt = Builder::new_multi_thread()
@@ -19,11 +14,18 @@ fn main() {
         .enable_all()
         .build()
         .unwrap();
-    rt.block_on(async {
-        let (tx, rx) = round_robin::<u64, CAPACITY>(4);
-        let token = CancellationToken::new();
 
-        // Consumers: recv_async or cancellation, whichever comes first
+    rt.block_on(async {
+        let (tx, rx) = shard_group::<u64, CAPACITY>(ShardGroupCase::Groups {
+            groups: &[
+                &["AAPL", "MSFT", "GOOG", "ORCL", "INTC", "AMD", "NVDA"], // 0: tech
+                &["TSLA", "UBER", "LYFT"],                                // 1: auto
+                &["BTC", "ETH"],                                          // 2: crypto
+                &["META", "SNAP", "NFLX", "AMZN"],                        // 3: media
+            ],
+        });
+
+        let token = CancellationToken::new();
         let consumers: Vec<_> = rx
             .into_receivers()
             .into_iter()
@@ -34,16 +36,15 @@ fn main() {
                     let mut total = 0u64;
                     loop {
                         tokio::select! {
-                            // Cancellation has priority
                             _ = token.cancelled() => {
-                                println!("[rr shard {id}] cancelled, total = {total}");
+                                println!("[group shard {id}] cancelled, total = {total}");
                                 break;
                             }
                             result = r.recv_async() => {
                                 match result {
                                     Ok(v) => total += v,
                                     Err(AsyncRecvError::Disconnected) => {
-                                        println!("[rr shard {id}] disconnected, total = {total}");
+                                        println!("[group shard {id}] disconnected, total = {total}");
                                         break;
                                     }
                                 }
@@ -54,17 +55,21 @@ fn main() {
             })
             .collect();
 
-        // Producers: send or cancellation
-        let producers: Vec<_> = (0..8)
-            .map(|p| {
+        let sectors = ["AAPL", "TSLA", "BTC", "META"];
+
+        let producers: Vec<_> = sectors
+            .iter()
+            .enumerate()
+            .map(|(p, &sym)| {
                 let tx = tx.clone();
                 let token = token.clone();
                 tokio::spawn(async move {
+                    let h = tx.handle(sym).expect("symbol must be registered");
                     for i in 0..10_000u64 {
                         tokio::select! {
                             biased; // safe ordering, no random!
                             _ = token.cancelled() => break,
-                            r = tx.send_async(p * 10_000 + i) => {
+                            r = tx.send_async(h, (p as u64) * 10_000 + i) => {
                                 if r.is_err() { break; } // Disconnected
                             }
                         }
@@ -73,11 +78,10 @@ fn main() {
             })
             .collect();
 
-        // Cancel after 50ms — simulates external shutdown signal
         tokio::time::sleep(Duration::from_millis(50)).await;
         token.cancel();
-
         drop(tx);
+
         for h in producers {
             h.await.unwrap();
         }

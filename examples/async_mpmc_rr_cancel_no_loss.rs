@@ -1,7 +1,3 @@
-// SPSC + graceful shutdown via CancellationToken.
-// SPSC specifics: pairs are independent, tx lives INSIDE the producer task (move),
-// therefore it closes automatically when it is completed a separate drop(tx)
-// not needed (unlike mpmc, where tx is cloned externally).
 use hel::channel::{
     errors::*, 
     nearest_power_of_two,

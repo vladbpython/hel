@@ -18,7 +18,7 @@ hel is also sharded. Instead of one ring buffer shared by all producers, hel cre
 
 ### Version
 
-- Current version is - `1.1.1`
+- Current version is - `1.2.0`
 - Changes are documented in `change_log/v{version}.md`
 
 ## Benchmark results — X86 (MACOS)
@@ -106,6 +106,22 @@ tx.send("AAPL", value)?;
 Routes by `hash(key) % num_shards`. The same key always reaches the same consumer.
 
 **Use when:** order per entity matters — trading symbols, user sessions, actor systems.
+
+### `shard_group` — explicit grouping (many keys → few shards)
+```rust
+let (tx, rx) = shard_group::<u64, 256>(ShardGroupCase::Groups {
+    groups: &[
+        &["BTCUSDT", "ETHUSDT"],   // group 0 → shard 0
+        &["BTC-PERP", "ETH-PERP"], // group 1 → shard 1
+    ],
+});
+let h = tx.handle("BTCUSDT").unwrap(); // resolve once
+tx.send(h, value)?;                     // send by handle
+```
+Routes by an explicit user defined map: you decide which key goes to which shard,
+not a hash. Resolve a key → shard handle once at subscription; Build from groups (`ShardGroupCase::Groups`) or from a classifier map (`ShardGroupCase::Map`).
+
+**Use when:** many keys but few shards, with meaningful grouping; one consumer thread per group.
 
 ### `shard_spsc` — sharded SPSC
 
@@ -394,6 +410,8 @@ num_shards = num_producers → optimal, each producer owns a shard
 | Physics / AI / audio in game engine   | `SpscShard`     | Dedicated core per system |
 | Event routing by type                 | `shard_key`     | Type as routing key |
 | Fan-out to N notification workers     | `round_robin`   | Stateless, even distribution |
+| Many symbols grouped by type          | `shard_group`   | Explicit map, meaningful grouping |
+| One consumer thread per sector/shard  | `shard_group`   | Many keys → few shards, you control routing |
 | Sync thread → async task pipeline     | any hel channel | Mix freely |
 | Async task → sync worker pipeline     | any hel channel | Mix freely |
 
@@ -402,6 +420,10 @@ num_shards = num_producers → optimal, each producer owns a shard
 **`num_shards` must be a power of two.** The ring buffer uses bitmasking for slot indexing.
 
 **`shard_key` does not guarantee even load.** Distribution depends on `hash(key) % num_shards`. With few unique keys, some shards may be empty. Use `round_robin` when even distribution matters more than ordering.
+
+**`shard_group` does not balance load automatically either.** Distribution
+follows your map exactly: a group with more keys (or hot keys) gets a heavier
+shard.
 
 **Bounded only.** No unbounded channel. Capacity is a compile-time constant. This is intentional — bounded channels make backpressure visible.
 
