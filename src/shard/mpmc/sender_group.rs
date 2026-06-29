@@ -1,5 +1,8 @@
 use super::super::errors as shard_error;
-use super::receiver::ShardReceiver;
+use super::{
+    buf::refill_on_error,
+    receiver::ShardReceiver
+};
 use crate::internal_channel::{
     core::SeqInner, errors::AsyncSendError, mpmc_bounded, nearest_power_of_two, sender::Sender,
     traits::InnerChannel,
@@ -176,77 +179,211 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
             .map_err(|err| shard_error::ShardAsyncSendError { shard: idx, err })
     }
 
-    /// Non-blocking batch in the handle shard. All elements → one shard.
+
+    /// Lays out buf among shards according to the map. key_fn extracts the character.
+    /// Returns groups by shards AND unused (unregistered keys)
+    /// as a separate vector the caller decides where to put them.
     #[inline]
+    fn group_by_route(
+        &self,
+        buf: &mut Vec<T>,
+        key_fn: impl for<'k> Fn(&'k T) -> &'k str,
+    ) -> (Vec<Vec<T>>, Vec<T>) {
+        let n = self.mask + 1;
+        let mut groups: Vec<Vec<T>> = (0..n).map(|_| Vec::new()).collect();
+        let mut unused: Vec<T> = Vec::new();
+        for item in buf.drain(..) {
+            match self.route.get(key_fn(&item)) {
+                Some(&shard) => groups[shard].push(item),
+                None => unused.push(item),
+            }
+        }
+        (groups, unused)
+    }
+
+    /// Non blocking batch: a pack of different instruments → by group.
+    /// Returns `Ok(sent)` if all (except unused) have been sent.
+    /// Returns `Err(ShardKeyTryBatchSendError)` if the shard is full or closed
+    /// (stop on the first error.
+    /// The output of `buf` contains ALL the raw data: unused (not in the map) and
+    /// unsent (remainder of the fallen group + untouched groups) no losses.
     pub fn try_send_batch(
         &self,
-        h: SymbolHandle,
         buf: &mut Vec<T>,
-    ) -> Result<usize, shard_error::ShardTryBatchSendError> {
-        let idx = h.shard & self.mask;
-        self.senders[idx]
-            .try_send_batch(buf)
-            .map_err(|e| shard_error::ShardTryBatchSendError {
-                shard: idx,
-                sent: e.sent,
-                reason: e.err,
-            })
+        key_fn: impl for<'k> Fn(&'k T) -> &'k str,
+    ) -> Result<usize, shard_error::ShardKeyTryBatchSendError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let (groups, mut unused) = self.group_by_route(buf, &key_fn);
+        let mut total = 0usize;
+        let mut groups = groups.into_iter().enumerate();
+        while let Some((shard, mut group)) = groups.next() {
+            if group.is_empty() {
+                continue;
+            }
+            match self.senders[shard].try_send_batch(&mut group) {
+                Ok(sent) => total += sent,
+                Err(e) => {
+                    total += e.sent;
+                    let first_key = group
+                        .first()
+                        .map(|item| key_fn(item).to_string())
+                        .unwrap_or_default();
+                    // return the remainder of the fallen group + untouched groups
+                    refill_on_error(buf, group, groups);
+                    buf.append(&mut unused); // сирот тоже в buf
+                    return Err(shard_error::ShardKeyTryBatchSendError {
+                        key: first_key,
+                        shard,
+                        sent: total,
+                        reason: e.err,
+                    });
+                }
+            }
+        }
+        buf.append(&mut unused);
+        Ok(total)
     }
 
-    /// Blocking batch in the handle shard.
-    #[inline]
+    /// Blocking batch: a pack of different instruments → by group.
+    /// Blocked until the entire pack goes to its shards (waiting for space).
+    /// After calling `buf` contains unused (the key is not in the map) and when closed
+    /// receiver unsent elements. Stores the FIFO within the group.
+    /// Returns `Ok(sent)` if everything has been sent (except unused).
+    /// Returns `Err(ShardKeyBatchSendError)` if the receiver is closed.
     pub fn send_batch(
         &self,
-        h: SymbolHandle,
         buf: &mut Vec<T>,
-    ) -> Result<usize, shard_error::ShardBatchSendError> {
-        let idx = h.shard & self.mask;
-        self.senders[idx]
-            .send_batch(buf)
-            .map_err(|e| shard_error::ShardBatchSendError {
-                shard: idx,
-                sent: e.sent,
-                reason: e.err,
-            })
+        key_fn: impl for<'k> Fn(&'k T) -> &'k str,
+    ) -> Result<usize, shard_error::ShardKeyBatchSendError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let (groups, mut unused) = self.group_by_route(buf, &key_fn);
+        let mut total = 0usize;
+        let mut groups = groups.into_iter().enumerate();
+        while let Some((shard, mut group)) = groups.next() {
+            if group.is_empty() {
+                continue;
+            }
+            match self.senders[shard].send_batch(&mut group) {
+                Ok(sent) => total += sent,
+                Err(e) => {
+                    total += e.sent;
+                    let first_key = group
+                        .first()
+                        .map(|item| key_fn(item).to_string())
+                        .unwrap_or_default();
+                    refill_on_error(buf, group, groups);
+                    buf.append(&mut unused);
+                    return Err(shard_error::ShardKeyBatchSendError {
+                        key: first_key,
+                        shard,
+                        sent: total,
+                        reason: e.err,
+                    });
+                }
+            }
+        }
+        buf.append(&mut unused);
+        Ok(total)
     }
 
-    /// Async batch in the handle shard. Fast path the whole pack into a shard; when filling
-    /// await one element (FIFO, from the beginning), then repeat.
+    /// Blocking batch with timeout: a pack of different instruments → by groups.
+    /// The `d` timeout is applied to each shard (as in shard_key::send_batch_timeout).
+    /// On error (deadline or disconnect), `buf` contains unsent elements.
+    /// Unused (the key is not in the map) are also placed in `buf`. Stores the FIFO within the group.
+    /// Returns `Ok(sent)` if everything has been sent (except unused).
+    pub fn send_batch_timeout(
+        &self,
+        buf: &mut Vec<T>,
+        d: Duration,
+        key_fn: impl for<'k> Fn(&'k T) -> &'k str,
+    ) -> Result<usize, shard_error::ShardKeyBatchSendError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let (groups, mut unused) = self.group_by_route(buf, &key_fn);
+        let mut total = 0usize;
+        let mut groups = groups.into_iter().enumerate();
+        while let Some((shard, mut group)) = groups.next() {
+            if group.is_empty() {
+                continue;
+            }
+            match self.senders[shard].send_batch_timeout(&mut group, d) {
+                Ok(sent) => total += sent,
+                Err(e) => {
+                    total += e.sent;
+                    let first_key = group
+                        .first()
+                        .map(|item| key_fn(item).to_string())
+                        .unwrap_or_default();
+                    refill_on_error(buf, group, groups);
+                    buf.append(&mut unused);
+                    return Err(shard_error::ShardKeyBatchSendError {
+                        key: first_key,
+                        shard,
+                        sent: total,
+                        reason: e.err,
+                    });
+                }
+            }
+        }
+        buf.append(&mut unused);
+        Ok(total)
+    }
+
+
+    /// Async batch with back-pressure. One puts the pack into groups
+    /// once, sends to shards; when the shard is full awaiting the head of the group (FIFO),
+    /// then continues. Unused (the key is not in the card) in buf at the end.
+    /// The output of `buf` contains unused and (if Disconnected) unsent.
+    /// Unlike shard_key (fast path retry via try_send_batch): here
+    /// layout ONCE, because unused cannot be driven through hash to retry
+    /// Strict routing control requires one time grouping by map.
     pub async fn send_batch_async(
         &self,
-        h: SymbolHandle,
         buf: &mut Vec<T>,
+        key_fn: impl for<'k> Fn(&'k T) -> &'k str,
     ) -> Result<usize, shard_error::ShardAsyncBatchSendError> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let idx = h.shard & self.mask;
+        let (groups, mut unused) = self.group_by_route(buf, &key_fn);
         let mut total = 0usize;
-        loop {
-            match self.senders[idx].try_send_batch(buf) {
-                Ok(sent) => {
-                    total += sent;
-                    return Ok(total);
-                }
-                Err(e) => {
-                    total += e.sent;
-                    if buf.is_empty() {
-                        return Ok(total);
+        for (shard, mut group) in groups.into_iter().enumerate() {
+            loop {
+                match self.senders[shard].try_send_batch(&mut group) {
+                    Ok(sent) => {
+                        total += sent;
+                        break;
                     }
-                    let first = buf.remove(0); // FIFO
-                    match self.senders[idx].send_async(first).await {
-                        Ok(()) => total += 1,
-                        Err(AsyncSendError::Disconnected(v)) => {
-                            buf.insert(0, v);
-                            return Err(shard_error::ShardAsyncBatchSendError {
-                                shard: idx,
-                                sent: total,
-                            });
+                    Err(e) => {
+                        total += e.sent;
+                        if group.is_empty() {
+                            break;
+                        }
+                        // back-pressure: await head (FIFO), then retry batch
+                        let first = group.remove(0);
+                        match self.senders[shard].send_async(first).await {
+                            Ok(()) => total += 1,
+                            Err(AsyncSendError::Disconnected(v)) => {
+                                group.insert(0, v);
+                                buf.append(&mut group);
+                                buf.append(&mut unused);
+                                return Err(shard_error::ShardAsyncBatchSendError {
+                                    shard,
+                                    sent: total,
+                                });
+                            }
                         }
                     }
                 }
             }
         }
+        buf.append(&mut unused);
+        Ok(total)
     }
 }
 
@@ -347,39 +484,77 @@ mod tests {
 
     #[test]
     fn batch_single_instrument_fast() {
-        let (tx, rx) = shard_group::<u64, 64>(ShardGroupCase::Groups {
+        let (tx, rx) = shard_group::<(String, u64), 64>(ShardGroupCase::Groups {
             groups: &[&["AAA"], &["BBB"]],
         });
         let a = tx.handle("AAA").unwrap();
-        let mut buf = vec![1u64, 2, 3, 4];
-        let sent = tx.try_send_batch(a, &mut buf).unwrap();
+        let mut buf = vec![
+            ("AAA".to_string(), 1),
+            ("AAA".to_string(), 2),
+            ("AAA".to_string(), 3),
+            ("AAA".to_string(), 4),
+        ];
+        let sent = tx.try_send_batch(&mut buf, |(s, _)| s.as_str()).unwrap();
         assert_eq!(sent, 4);
+        assert!(buf.is_empty());
         let mut out = Vec::new();
         rx.receiver(a.shard()).recv_batch(&mut out, 8);
-        assert_eq!(out, vec![1, 2, 3, 4]); // FIFO сохранён
+        assert_eq!(
+            out,
+            vec![
+                ("AAA".to_string(), 1),
+                ("AAA".to_string(), 2),
+                ("AAA".to_string(), 3),
+                ("AAA".to_string(), 4),
+            ]
+        );
     }
 
     #[test]
     fn batch_two_shards_via_into_receivers() {
-        let (tx, rx) = shard_group::<u64, 64>(ShardGroupCase::Groups {
+        let (tx, rx) = shard_group::<(String, u64), 64>(ShardGroupCase::Groups {
             groups: &[&["AAA"], &["BBB"]],
         });
         let a = tx.handle("AAA").unwrap();
         let b = tx.handle("BBB").unwrap();
         assert_ne!(a.shard(), b.shard());
-        let mut buf_a = vec![1u64, 2, 3, 4];
-        let mut buf_b = vec![10u64, 20, 30];
-        assert_eq!(tx.try_send_batch(a, &mut buf_a).unwrap(), 4);
-        assert_eq!(tx.try_send_batch(b, &mut buf_b).unwrap(), 3);
+        let mut buf = vec![
+            ("AAA".to_string(), 1),
+            ("BBB".to_string(), 10),
+            ("AAA".to_string(), 2),
+            ("BBB".to_string(), 20),
+            ("AAA".to_string(), 3),
+            ("BBB".to_string(), 30),
+            ("AAA".to_string(), 4),
+        ];
+        let sent = tx.try_send_batch(&mut buf, |(s, _)| s.as_str()).unwrap();
+        assert_eq!(sent, 7);
+        assert!(buf.is_empty());
         let receivers = rx.into_receivers();
         let mut out_a = Vec::new();
         receivers[a.shard()].recv_batch(&mut out_a, 8);
-        assert_eq!(out_a, vec![1, 2, 3, 4]);
+        assert_eq!(
+            out_a,
+            vec![
+                ("AAA".to_string(), 1),
+                ("AAA".to_string(), 2),
+                ("AAA".to_string(), 3),
+                ("AAA".to_string(), 4),
+            ]
+        );
         let mut out_b = Vec::new();
         receivers[b.shard()].recv_batch(&mut out_b, 8);
-        assert_eq!(out_b, vec![10, 20, 30]);
-        assert!(out_a.iter().all(|&v| v < 10));
-        assert!(out_b.iter().all(|&v| v >= 10));
+        assert_eq!(
+            out_b,
+            vec![
+                ("BBB".to_string(), 10),
+                ("BBB".to_string(), 20),
+                ("BBB".to_string(), 30),
+            ]
+        );
+        // изоляция по группам
+        assert!(out_a.iter().all(|(s, _)| s == "AAA"));
+        assert!(out_b.iter().all(|(s, _)| s == "BBB"));
     }
 
     #[test]

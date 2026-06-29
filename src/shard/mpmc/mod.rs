@@ -35,6 +35,7 @@
 //! tx.try_send(h, 150).unwrap(); // send by handle on the hot path
 //! ```
 
+mod buf;
 mod hash;
 pub mod receiver;
 pub mod sender_group;

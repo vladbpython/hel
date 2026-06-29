@@ -1,7 +1,9 @@
-// ShardGroup + batch: sending the ENTIRE batch via drain_batch_async_sink.
-// EXPLICIT grouping (by sector). Consumer receives the entire batch array in
-// own and send it with one call (like socket.write_all(&serialize(&batch))
-// in a real system). The producer for the sector sends packs to his shard using the handle.
+// ShardGroup + keyed batch: sending the ENTIRE batch via drain_batch_async_sink.
+// EXPLICIT grouping (by sector). Each element carries a character  keyed method
+// orts into groups via key_fn. Consumer receives the entire batch and sends
+// in one call (like socket.write_all). The sector producer sends packs of his
+// symbol using the keyed method (all elements of one key → one shard).
+// T = (String, u64).
 use hel::{
     channel::{
         mpmc::{ShardGroupCase, shard_group},
@@ -19,8 +21,10 @@ const BATCH: usize = 64;
 const CAPACITY: usize = nearest_power_of_two(1024);
 const PER_PRODUCER: u64 = 100_000;
 
-// Simulate a network receiver (TcpStream /WebSocket).
-async fn send_over_network(batch: &[u64], writes: &AtomicU64, bytes: &AtomicU64) {
+// channel element: (symbol, payload).
+type Tick = (String, u64);
+
+async fn send_over_network(batch: &[Tick], writes: &AtomicU64, bytes: &AtomicU64) {
     tokio::task::yield_now().await;
     bytes.fetch_add(batch.len() as u64 * 8, Relaxed);
     writes.fetch_add(1, Relaxed);
@@ -33,13 +37,12 @@ fn main() {
         .unwrap();
 
     rt.block_on(async {
-        // explicit grouping by sectors: group i → shard i
-        let (tx, rx) = shard_group::<u64, CAPACITY>(ShardGroupCase::Groups {
+        let (tx, rx) = shard_group::<Tick, CAPACITY>(ShardGroupCase::Groups {
             groups: &[
-                &["AAPL", "MSFT", "GOOG", "ORCL", "INTC", "AMD", "NVDA"], // 0: tech
-                &["TSLA", "UBER", "LYFT"],                                // 1: auto
-                &["BTC", "ETH"],                                          // 2: crypto
-                &["META", "SNAP", "NFLX", "AMZN"],                        // 3: media
+                &["AAPL", "MSFT", "GOOG", "ORCL", "INTC", "AMD", "NVDA"],
+                &["TSLA", "UBER", "LYFT"],
+                &["BTC", "ETH"],
+                &["META", "SNAP", "NFLX", "AMZN"],
             ],
         });
 
@@ -47,7 +50,6 @@ fn main() {
         let bytes = Arc::new(AtomicU64::new(0));
         let items = Arc::new(AtomicU64::new(0));
 
-        // consumer for each shard (= sector): batch drainage + "network" sending.
         let consumers: Vec<_> = rx
             .into_receivers()
             .into_iter()
@@ -64,18 +66,18 @@ fn main() {
                             let (n, dc) = rx.recv_batch_async(&mut buf, max).await;
                             (rx, buf, n, dc)
                         },
-                        |batch: Vec<u64>, mut acc: u64| {
+                        |batch: Vec<Tick>, mut acc: u64| {
                             let writes = writes.clone();
                             let bytes = bytes.clone();
                             async move {
-                                send_over_network(&batch, &writes, &bytes).await; // ENTIRE batch
+                                send_over_network(&batch, &writes, &bytes).await;
                                 acc += batch.len() as u64;
                                 let mut b = batch;
-                                b.clear(); // return allocation
-                                (b, acc) // (Vec, acc)
+                                b.clear();
+                                (b, acc)
                             }
                         },
-                        0u64, // init
+                        0u64,
                     )
                     .await;
                     println!("[network group shard {id}] sent {total} items");
@@ -91,16 +93,20 @@ fn main() {
             .map(|&sym| {
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    let h = tx.handle(sym).expect("symbol must be registered");
-                    let mut buf: Vec<u64> = Vec::with_capacity(BATCH);
+                    debug_assert!(tx.shard_for(sym).is_some(), "symbol must be registered");
+                    let mut buf: Vec<Tick> = Vec::with_capacity(BATCH);
                     for i in 0..PER_PRODUCER {
-                        buf.push(i);
+                        buf.push((sym.to_string(), i));
                         if buf.len() == BATCH {
-                            tx.send_batch_async(h, &mut buf).await.unwrap();
+                            tx.send_batch_async(&mut buf, |(s, _)| s.as_str())
+                                .await
+                                .unwrap();
                         }
                     }
                     if !buf.is_empty() {
-                        tx.send_batch_async(h, &mut buf).await.unwrap();
+                        tx.send_batch_async(&mut buf, |(s, _)| s.as_str())
+                            .await
+                            .unwrap();
                     }
                 })
             })

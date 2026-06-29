@@ -1,5 +1,8 @@
 use super::super::errors as shard_error;
-use super::{hash::hash_key, receiver::ShardReceiver};
+use super::{
+    buf::refill_on_error,
+    hash::hash_key, receiver::ShardReceiver
+};
 use crate::internal_channel::{
     errors::AsyncSendError, mpmc_bounded, nearest_power_of_two, sender::Sender,
 };
@@ -94,25 +97,6 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
         groups
     }
 
-    /// Internal helper for error paths of keyed batch methods:
-    /// returns the failed group's remainder AND every not-yet-attempted
-    /// group back into `buf`. Without this, the early `return Err` would
-    /// silently DROP all unprocessed groups (data loss).
-    /// NOTE: after an error `buf` holds elements grouped by shard, not in
-    /// the original insertion order; per-key FIFO order within each group
-    /// is preserved, which is the only ordering ShardKey guarantees.
-    #[inline]
-    fn refill_on_error(
-        buf: &mut Vec<T>,
-        failed_group: Vec<T>,
-        remaining: impl Iterator<Item = (usize, Vec<T>)>,
-    ) {
-        buf.extend(failed_group);
-        for (_, g) in remaining {
-            buf.extend(g);
-        }
-    }
-
     /// Non blocking batch by hash(key_fn).
     /// Returns `Ok(sent)` if all elements have been sent.
     /// Returns `Err(sent)` if at least one shard was full or closed.
@@ -139,7 +123,7 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
-                    Self::refill_on_error(buf, group, groups);
+                    refill_on_error(buf, group, groups);
                     return Err(shard_error::ShardKeyTryBatchSendError {
                         key: first_key,
                         shard,
@@ -180,7 +164,7 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
-                    Self::refill_on_error(buf, group, groups);
+                    refill_on_error(buf, group, groups);
                     return Err(shard_error::ShardKeyBatchSendError {
                         key: first_key,
                         shard,
@@ -218,7 +202,7 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
-                    Self::refill_on_error(buf, group, groups);
+                    refill_on_error(buf, group, groups);
                     return Err(shard_error::ShardKeyBatchSendError {
                         key: first_key,
                         shard,
