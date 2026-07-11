@@ -39,7 +39,6 @@ use crate::internal_channel::{
     receiver::SingleReceiver,
     sender::{Sender, SingleSender},
 };
-use std::sync::Arc;
 
 type ShardPair<T, const CAP: usize> = (Sender<T, CAP, SingleInner<T, CAP>>, SingleReceiver<T, CAP>);
 
@@ -60,7 +59,7 @@ impl<T: Send + 'static, const CAP: usize> SpscShard<T, CAP> {
         assert!(CAP.is_power_of_two(), "CAP must be a power of two");
         let pairs: Vec<Option<ShardPair<T, CAP>>> = (0..num_shards)
             .map(|_| {
-                let inner = Arc::new(SingleInner::new());
+                let inner = SingleInner::new();
                 let tx = SingleSender::new(inner.clone());
                 let rx = SingleReceiver::new(inner);
                 Some((tx, rx))

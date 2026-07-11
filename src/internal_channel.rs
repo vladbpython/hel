@@ -5,12 +5,10 @@ pub mod sender;
 pub mod sync;
 pub mod traits;
 
-use std::sync::Arc;
-
 // Lock free CAS ring buffer.
 pub fn mpmc_bounded<T: Send, const CAP: usize>()
 -> (sender::Sender<T, CAP>, receiver::Receiver<T, CAP>) {
-    let inner = Arc::new(core::SeqInner::new());
+    let inner = core::SeqInner::new();
     (
         sender::Sender::new(inner.clone()),
         receiver::Receiver::new(inner),
@@ -22,7 +20,7 @@ pub fn scsp_bounded<T: Send, const CAP: usize>() -> (
     sender::SingleSender<T, CAP>,
     receiver::SingleReceiver<T, CAP>,
 ) {
-    let inner = Arc::new(core::SingleInner::new());
+    let inner = core::SingleInner::new();
     (
         sender::SingleSender::new(inner.clone()),
         receiver::SingleReceiver::new(inner),
@@ -425,7 +423,7 @@ mod tests {
     // uninitialized memory = UB, Miri will catch instantly).
     #[test]
     fn miri_fetch_add_abort_seal_then_drop() {
-        let inner: Arc<SeqInner<String, 2>> = Arc::new(SeqInner::new());
+        let inner: Arc<SeqInner<String, 2>> = SeqInner::new();
         inner.push_fetch_add("a".to_string()).unwrap();
         inner.push_fetch_add("b".to_string()).unwrap();
         // The third push waits for seq (channel is full).

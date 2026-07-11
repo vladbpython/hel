@@ -1,6 +1,6 @@
 [package]
 name = "hel-rs"
-version = "1.2.2"
+version = "1.3.0"
 edition = "2024"
 authors = ["Bieliaiev Vladyslav <vladbpython@gmail.com>"]
 description = "High-performance lock-free sharded sync+async MPMC/SPSC channels with keyed routing"
@@ -33,7 +33,94 @@ name = "trade_bench"
 harness = false
 path = "benches/trade_bench.rs"
 
+[[bench]]
+name = "pool_scaling"
+harness = false
+path = "benches/pool_scaling.rs"
+required-features = ["pool"]
+
 
 [lib]
 name = "hel"
+
+[features]
+default = []
+pool = []
+
+[[example]]
+name = "pool_async_mpmc_bk_batch"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_async_mpmc_bk"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_async_mpmc_gr_batch"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_async_mpmc_gr"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_async_mpmc_rr_batch"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_async_mpmc_rr_cancel_no_loss"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_async_mpmc_rr_cancel"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_async_mpmc_rr"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_elasticity"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_sync_mpmc_bk_batch"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_sync_mpmc_bk"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_sync_mpmc_gr_batch"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_sync_mpmc_gr"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_sync_mpmc_rr_batch"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_sync_mpmc_rr"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_sync_custom_handler_batch"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_sync_custom_handler_per_item"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_async_custom_handler_batch"
+required-features = ["pool"]
+
+[[example]]
+name = "pool_async_custom_handler_per_item"
+required-features = ["pool"]
+
 

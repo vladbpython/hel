@@ -322,6 +322,20 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
         recv_impl(self.inner.as_ref(), Some(Instant::now() + d))
     }
 
+    #[inline]
+    pub fn try_recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
+        if max == 0 {
+            return (0, false);
+        }
+        let (n, dc) = self.inner.pop_batch(buf, max);
+        if n > 0 {
+            self.inner.notify_senders();
+            (n, false)
+        } else {
+            (0, dc)
+        }
+    }
+
     pub fn recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         recv_batch(self.inner.as_ref(), buf, max, None)
     }
@@ -360,6 +374,26 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
             slot: None,
             _t: PhantomData,
         }
+    }
+
+    /// Approximate number of items currently in this shard's queue (tail − head).
+    /// A concurrent snapshot may be off by a few under active producers/consumers.
+    /// Cheap (two relaxed atomic loads).
+    #[inline]
+    pub fn queued(&self) -> usize {
+        self.inner.queued()
+    }
+
+    /// Whether the queue appears empty right now (approximate see `queued`).
+    #[inline]
+    pub fn is_queued_empty(&self) -> bool {
+        self.queued() == 0
+    }
+
+    /// Fixed capacity of this shard.
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        CAP
     }
 }
 

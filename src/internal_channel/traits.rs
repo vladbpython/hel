@@ -28,6 +28,7 @@ pub trait InnerChannel<T: Send + 'static, const CAP: usize>: Send + Sync {
     fn yield_before_park(&self) -> bool {
         true
     }
+    fn queued(&self) -> usize;
 }
 
 // Minimal trait over inner state needed by sender logic.

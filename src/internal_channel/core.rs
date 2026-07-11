@@ -5,7 +5,12 @@ use super::{
 use crate::cache::Padding;
 use std::{
     hint,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    mem::MaybeUninit,
+    ptr::addr_of_mut,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     thread, time,
 };
 
@@ -62,7 +67,7 @@ fn pop_batch_impl<T>(
 // SeqInner (X86/ARM aarch64)
 
 pub struct SeqInner<T, const CAP: usize> {
-    slots: Box<[Slot<T>; CAP]>,
+    slots: [Slot<T>; CAP],
     tail: Padding<AtomicUsize>,
     head: Padding<AtomicUsize>,
     send_waiters: SyncList,
@@ -74,19 +79,30 @@ pub struct SeqInner<T, const CAP: usize> {
 }
 
 impl<T, const CAP: usize> SeqInner<T, CAP> {
-    pub fn new() -> Self {
+   pub fn new() -> Arc<Self> {
         assert!(CAP.is_power_of_two(), "CAP must be a power of two");
-        let boxed = (0..CAP).map(|n| Slot::new(n)).collect::<Box<[Slot<T>]>>();
-        Self {
-            slots: boxed.try_into().unwrap_or_else(|_| unreachable!()),
-            tail: Padding(AtomicUsize::new(0)),
-            head: Padding(AtomicUsize::new(0)),
-            send_waiters: SyncList::new(),
-            recv_waiters: SyncList::new(),
-            senders: AtomicUsize::new(1),
-            receivers: AtomicUsize::new(1),
-            tx_closed: AtomicBool::new(false),
-            rx_closed: AtomicBool::new(false),
+        let mut uninit: Arc<MaybeUninit<Self>> = Arc::new_uninit();
+        // get_mut gives &mut MaybeUninit<Self> (Arc is unique, just created)
+        let slot_ptr = Arc::get_mut(&mut uninit).unwrap();
+        let ptr = slot_ptr.as_mut_ptr(); // *mut Self в heap
+        unsafe {
+            // initialize the fields DIRECTLY in the heap
+            // slots one at a time, placement in a heap array
+            let slots_ptr = std::ptr::addr_of_mut!((*ptr).slots) as *mut Slot<T>;
+            for i in 0..CAP {
+                slots_ptr.add(i).write(Slot::new(i));
+            }
+            // adding fields
+            addr_of_mut!((*ptr).tail).write(Padding(AtomicUsize::new(0)));
+            addr_of_mut!((*ptr).head).write(Padding(AtomicUsize::new(0)));
+            addr_of_mut!((*ptr).send_waiters).write(SyncList::new());
+            addr_of_mut!((*ptr).recv_waiters).write(SyncList::new());
+            addr_of_mut!((*ptr).senders).write(AtomicUsize::new(1));
+            addr_of_mut!((*ptr).receivers).write(AtomicUsize::new(1));
+            addr_of_mut!((*ptr).tx_closed).write(AtomicBool::new(false));
+            addr_of_mut!((*ptr).rx_closed).write(AtomicBool::new(false));
+            // everything is initialized → assume_init
+            uninit.assume_init()
         }
     }
 
@@ -195,6 +211,13 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
                 head = self.head.load(Ordering::Acquire);
             }
         }
+    }
+
+    #[inline]
+    pub fn queued(&self) -> usize {
+        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Acquire);
+        tail.saturating_sub(head)
     }
 }
 
@@ -339,6 +362,10 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
     fn rx_close(&self) {
         self.rx_closed.store(true, Ordering::Release);
     }
+    #[inline]
+    fn queued(&self) -> usize {
+        self.queued()
+    }
 }
 
 impl<T, const CAP: usize> Drop for SeqInner<T, CAP> {
@@ -367,7 +394,7 @@ unsafe impl<T: Send, const CAP: usize> Sync for SeqInner<T, CAP> {}
 // SingleInner (SPSC, lock free)
 
 pub struct SingleInner<T, const CAP: usize> {
-    slots: Box<[Slot<T>; CAP]>,
+    slots: [Slot<T>; CAP],
     tail: Padding<AtomicUsize>,
     head: Padding<AtomicUsize>,
     send_waiters: SyncList,
@@ -377,17 +404,22 @@ pub struct SingleInner<T, const CAP: usize> {
 }
 
 impl<T, const CAP: usize> SingleInner<T, CAP> {
-    pub fn new() -> Self {
+    pub fn new() -> Arc<Self> {
         assert!(CAP.is_power_of_two(), "CAP must be a power of two");
-        let boxed = (0..CAP).map(|n| Slot::new(n)).collect::<Box<[Slot<T>]>>();
-        Self {
-            slots: boxed.try_into().unwrap_or_else(|_| unreachable!()),
-            tail: Padding(AtomicUsize::new(0)),
-            head: Padding(AtomicUsize::new(0)),
-            send_waiters: SyncList::new(),
-            recv_waiters: SyncList::new(),
-            tx_closed: AtomicBool::new(false),
-            rx_closed: AtomicBool::new(false),
+        let mut uninit: Arc<MaybeUninit<Self>> = Arc::new_uninit();
+        let ptr = Arc::get_mut(&mut uninit).unwrap().as_mut_ptr();
+        unsafe {
+            let slots_ptr = addr_of_mut!((*ptr).slots) as *mut Slot<T>;
+            for i in 0..CAP {
+                slots_ptr.add(i).write(Slot::new(i));
+            }
+            addr_of_mut!((*ptr).tail).write(Padding(AtomicUsize::new(0)));
+            addr_of_mut!((*ptr).head).write(Padding(AtomicUsize::new(0)));
+            addr_of_mut!((*ptr).send_waiters).write(SyncList::new());
+            addr_of_mut!((*ptr).recv_waiters).write(SyncList::new());
+            addr_of_mut!((*ptr).tx_closed).write(AtomicBool::new(false));
+            addr_of_mut!((*ptr).rx_closed).write(AtomicBool::new(false));
+            uninit.assume_init()
         }
     }
 
@@ -509,6 +541,13 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
     pub fn rx_close(&self) {
         self.rx_closed.store(true, Ordering::Release);
     }
+
+    #[inline]
+    pub fn queued(&self) -> usize {
+        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Acquire);
+        tail.saturating_sub(head)
+    }
 }
 
 impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SingleInner<T, CAP> {
@@ -603,6 +642,10 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SingleInner<T
     fn yield_before_park(&self) -> bool {
         false
     }
+    #[inline]
+    fn queued(&self) -> usize {
+        self.queued()
+    }
 }
 
 impl<T, const CAP: usize> Drop for SingleInner<T, CAP> {
@@ -621,3 +664,155 @@ impl<T, const CAP: usize> Drop for SingleInner<T, CAP> {
 
 unsafe impl<T: Send, const CAP: usize> Send for SingleInner<T, CAP> {}
 unsafe impl<T: Send, const CAP: usize> Sync for SingleInner<T, CAP> {}
+
+#[cfg(test)]
+mod core_init_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    // Basic: fields are correct
+    #[test]
+    fn seq_basic() {
+        let inner: Arc<SeqInner<u64, 16>> = SeqInner::new();
+        assert_eq!(inner.tail.load(Ordering::Relaxed), 0);
+        assert_eq!(inner.head.load(Ordering::Relaxed), 0);
+        assert_eq!(inner.senders.load(Ordering::Relaxed), 1);
+        assert_eq!(inner.receivers.load(Ordering::Relaxed), 1);
+        assert!(!inner.tx_closed.load(Ordering::Relaxed));
+        assert!(!inner.rx_closed.load(Ordering::Relaxed));
+    }
+
+    // Slots are initialized: sequence[i] == i
+    #[test]
+    fn seq_slots_initialized() {
+        let inner: Arc<SeqInner<u64, 16>> = SeqInner::new();
+        for i in 0..16 {
+            assert_eq!(
+                inner.slots[i].sequence.load(Ordering::Relaxed),
+                i,
+                "slot {i} sequence is incorrect, placement is broken"
+            );
+        }
+    }
+
+    // Functional: push/pop
+    #[test]
+    fn seq_push_pop() {
+        let inner: Arc<SeqInner<u64, 16>> = SeqInner::new();
+        assert!(inner.push(42).is_ok());
+        assert!(inner.push(43).is_ok());
+        assert_eq!(inner.pop(), Some(42));
+        assert_eq!(inner.pop(), Some(43));
+        assert_eq!(inner.pop(), None);
+    }
+
+    // Drop with unread string, Miri will check for release
+    #[test]
+    fn seq_drop_string() {
+        let inner: Arc<SeqInner<String, 8>> = SeqInner::new();
+        let _ = inner.push("hello".to_string());
+        let _ = inner.push("world".to_string());
+        assert_eq!(inner.pop(), Some("hello".to_string()));
+        // "world" remains → Drop must drop, otherwise Miri: leak
+        drop(inner);
+    }
+
+    // Average CAP under Miri still approx (256)
+    #[test]
+    fn seq_larger_cap() {
+        let inner: Arc<SeqInner<u64, 256>> = SeqInner::new();
+        assert_eq!(inner.slots[255].sequence.load(Ordering::Relaxed), 255);
+    }
+
+    // HUGE CAP, check NO stack overflow (heap).
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn seq_huge_cap() {
+        let inner: Arc<SeqInner<u64, 2_097_152>> = SeqInner::new();
+        assert_eq!(inner.slots[0].sequence.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            inner.slots[2_097_151].sequence.load(Ordering::Relaxed),
+            2_097_151
+        );
+        assert!(inner.push(42).is_ok());
+        assert_eq!(inner.pop(), Some(42));
+    }
+
+    #[test]
+    fn single_basic() {
+        let inner: Arc<SingleInner<u64, 16>> = SingleInner::new();
+        assert_eq!(inner.tail.load(Ordering::Relaxed), 0);
+        assert_eq!(inner.head.load(Ordering::Relaxed), 0);
+        assert!(!inner.is_tx_closed());
+        assert!(!inner.is_rx_closed());
+    }
+
+    #[test]
+    fn single_slots_initialized() {
+        let inner: Arc<SingleInner<u64, 16>> = SingleInner::new();
+        for i in 0..16 {
+            assert_eq!(
+                inner.slots[i].sequence.load(Ordering::Relaxed),
+                i,
+                "slot {i} sequence is incorrect, placement is broken"
+            );
+        }
+    }
+
+    #[test]
+    fn single_push_pop() {
+        let inner: Arc<SingleInner<u64, 16>> = SingleInner::new();
+        assert!(inner.push(42).is_ok());
+        assert!(inner.push(43).is_ok());
+        assert_eq!(inner.pop(), Some(42));
+        assert_eq!(inner.pop(), Some(43));
+        assert_eq!(inner.pop(), None);
+    }
+
+    #[test]
+    fn single_push_full() {
+        // CAP=2: fill, push should return Err when full
+        let inner: Arc<SingleInner<u64, 2>> = SingleInner::new();
+        assert!(inner.push(1).is_ok());
+        assert!(inner.push(2).is_ok());
+        // channel is full (CAP=2) → push will return Err
+        assert_eq!(inner.push(3), Err(3));
+        // release and push again
+        assert_eq!(inner.pop(), Some(1));
+        assert!(inner.push(3).is_ok());
+    }
+
+    #[test]
+    fn single_drop_string() {
+        // String in slots, Miri will check that Drop drops unread
+        let inner: Arc<SingleInner<String, 8>> = SingleInner::new();
+        let _ = inner.push("hello".to_string());
+        let _ = inner.push("world".to_string());
+        // pop one, the second REMAINS in the channel → Drop should drop it
+        assert_eq!(inner.pop(), Some("hello".to_string()));
+        drop(inner); // Miri: "world" (unread) dropped? Otherwise leaked
+    }
+
+    #[test]
+    fn single_larger_cap() {
+        let inner: Arc<SingleInner<u64, 256>> = SingleInner::new();
+        assert_eq!(inner.slots[255].sequence.load(Ordering::Relaxed), 255);
+        // функционально
+        assert!(inner.push(100).is_ok());
+        assert_eq!(inner.pop(), Some(100));
+    }
+
+    #[test]
+    fn single_batch() {
+        let inner: Arc<SingleInner<u64, 16>> = SingleInner::new();
+        let mut buf = vec![1u64, 2, 3, 4];
+        let pushed = inner.push_batch(&mut buf);
+        assert_eq!(pushed, 4);
+        assert!(buf.is_empty());
+
+        let mut out = Vec::new();
+        let (n, _closed) = inner.pop_batch(&mut out, 10);
+        assert_eq!(n, 4);
+        assert_eq!(out, vec![1, 2, 3, 4]); // FIFO order
+    }
+}
