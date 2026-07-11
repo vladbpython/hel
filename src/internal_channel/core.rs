@@ -79,7 +79,7 @@ pub struct SeqInner<T, const CAP: usize> {
 }
 
 impl<T, const CAP: usize> SeqInner<T, CAP> {
-   pub fn new() -> Arc<Self> {
+    pub fn new() -> Arc<Self> {
         assert!(CAP.is_power_of_two(), "CAP must be a power of two");
         let mut uninit: Arc<MaybeUninit<Self>> = Arc::new_uninit();
         // get_mut gives &mut MaybeUninit<Self> (Arc is unique, just created)

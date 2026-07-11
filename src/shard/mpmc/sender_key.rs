@@ -1,8 +1,5 @@
 use super::super::errors as shard_error;
-use super::{
-    buf::refill_on_error,
-    hash::hash_key, receiver::ShardReceiver
-};
+use super::{buf::refill_on_error, hash::hash_key, receiver::ShardReceiver};
 use crate::internal_channel::{
     errors::AsyncSendError, mpmc_bounded, nearest_power_of_two, sender::Sender,
 };

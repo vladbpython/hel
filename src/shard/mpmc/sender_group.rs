@@ -1,8 +1,5 @@
 use super::super::errors as shard_error;
-use super::{
-    buf::refill_on_error,
-    receiver::ShardReceiver
-};
+use super::{buf::refill_on_error, receiver::ShardReceiver};
 use crate::internal_channel::{
     core::SeqInner, errors::AsyncSendError, mpmc_bounded, nearest_power_of_two, sender::Sender,
     traits::InnerChannel,
@@ -179,7 +176,6 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
             .map_err(|err| shard_error::ShardAsyncSendError { shard: idx, err })
     }
 
-
     /// Lays out buf among shards according to the map. key_fn extracts the character.
     /// Returns groups by shards AND unused (unregistered keys)
     /// as a separate vector the caller decides where to put them.
@@ -333,7 +329,6 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         buf.append(&mut unused);
         Ok(total)
     }
-
 
     /// Async batch with back-pressure. One puts the pack into groups
     /// once, sends to shards; when the shard is full awaiting the head of the group (FIFO),
