@@ -2,13 +2,12 @@ use crate::internal_channel::errors;
 use std::fmt::{Debug, Display, Formatter, Result};
 
 /// `try_send` error in `Shard` (RoundRobin) Full or Disconnected.
-#[derive(Debug)]
 pub struct ShardTrySendError<T> {
     pub shard: usize,
     pub err: errors::TrySendError<T>,
 }
 
-impl<T: Debug> Display for ShardTrySendError<T> {
+impl<T> Display for ShardTrySendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
@@ -18,14 +17,22 @@ impl<T: Debug> Display for ShardTrySendError<T> {
     }
 }
 
+impl<T> Debug for ShardTrySendError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        f.debug_struct("ShardTrySendError")
+            .field("shard", &self.shard)
+            .field("err", &self.err)
+            .finish()
+    }
+}
+
 /// Error `send` /`send_timeout` in `Shard` (RoundRobin) Disconnected or TimeOut.
-#[derive(Debug)]
 pub struct ShardSendError<T> {
     pub shard: usize,
     pub err: errors::SendError<T>,
 }
 
-impl<T: Debug> Display for ShardSendError<T> {
+impl<T> Display for ShardSendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
@@ -35,15 +42,23 @@ impl<T: Debug> Display for ShardSendError<T> {
     }
 }
 
+impl<T> Debug for ShardSendError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        f.debug_struct("ShardSendError")
+            .field("shard", &self.shard)
+            .field("err", &self.err)
+            .finish()
+    }
+}
+
 /// `try_send` error in `ShardKey` (ByKey) Full or Disconnected.
-#[derive(Debug)]
 pub struct ShardKeyTrySendError<T> {
     pub key: String,
     pub shard: usize,
     pub err: errors::TrySendError<T>,
 }
 
-impl<T: Debug> Display for ShardKeyTrySendError<T> {
+impl<T> Display for ShardKeyTrySendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
@@ -53,15 +68,24 @@ impl<T: Debug> Display for ShardKeyTrySendError<T> {
     }
 }
 
+impl<T> Debug for ShardKeyTrySendError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        f.debug_struct("ShardKeyTrySendError")
+            .field("key", &self.key)
+            .field("shard", &self.shard)
+            .field("err", &self.err)
+            .finish()
+    }
+}
+
 /// `send` /`send_timeout` error in `ShardKey` (ByKey) Disconnected or TimeOut.
-#[derive(Debug)]
 pub struct ShardKeySendError<T> {
     pub key: String,
     pub shard: usize,
     pub err: errors::SendError<T>,
 }
 
-impl<T: Debug> Display for ShardKeySendError<T> {
+impl<T> Display for ShardKeySendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
@@ -71,15 +95,25 @@ impl<T: Debug> Display for ShardKeySendError<T> {
     }
 }
 
+impl<T> Debug for ShardKeySendError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        f.debug_struct("ShardKeySendError")
+            .field("key", &self.key)
+            .field("shard", &self.shard)
+            .field("err", &self.err)
+            .finish()
+    }
+}
+
 /// Error sending async to `Shard` (RoundRobin).
 /// Only `Disconnected` async cannot return `Full`.
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct ShardAsyncSendError<T> {
     pub shard: usize,
     pub err: errors::AsyncSendError<T>,
 }
 
-impl<T: Debug> Display for ShardAsyncSendError<T> {
+impl<T> Display for ShardAsyncSendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
@@ -89,21 +123,40 @@ impl<T: Debug> Display for ShardAsyncSendError<T> {
     }
 }
 
+impl<T> Debug for ShardAsyncSendError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        f.debug_struct("ShardAsyncSendError")
+            .field("shard", &self.shard)
+            .field("err", &self.err)
+            .finish()
+    }
+}
+
 /// Error sending async to `ShardKey` (ByKey).
-#[derive(Debug, PartialEq)]
+#[derive(PartialEq)]
 pub struct ShardKeyAsyncSendError<T> {
     pub key: String,
     pub shard: usize,
     pub err: errors::AsyncSendError<T>,
 }
 
-impl<T: Debug> Display for ShardKeyAsyncSendError<T> {
+impl<T> Display for ShardKeyAsyncSendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
             "ShardKeyAsyncSendError {{ key: {}, shard: {}, err: {:?} }}",
             self.key, self.shard, self.err
         )
+    }
+}
+
+impl<T> Debug for ShardKeyAsyncSendError<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        f.debug_struct("ShardKeyAsyncSendError")
+            .field("key", &self.key)
+            .field("shard", &self.shard)
+            .field("err", &self.err)
+            .finish()
     }
 }
 
