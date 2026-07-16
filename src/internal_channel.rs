@@ -478,4 +478,67 @@ mod tests {
         assert_eq!(count2, 0);
         assert!(dc);
     }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn batch_async_cancel_keeps_fifo_and_loses_nothing() {
+        const CAP: usize = 4;
+        let (tx, _rx) = mpmc_bounded::<u64, CAP>();
+        // Clog the entire channel: the next shipment must park.
+        for i in 0..CAP as u64 {
+            tx.try_send(i).unwrap();
+        }
+
+        let mut buf: Vec<u64> = vec![100, 101, 102, 103];
+        let before = buf.clone();
+        // Duration::ZERO: timeout polls the future EXACTLY ONE time, gets Pending,
+        // then it works and drops it, we end up exactly in the cancellation path.
+        let r = tokio::time::timeout(Duration::ZERO, tx.send_batch_async(&mut buf)).await;
+        assert!(
+            r.is_err(),
+            "the channel is full, send_batch_async must wait"
+        );
+        assert_eq!(
+            buf, before,
+            "cancellation: buf should remain in FIFO order and lossless"
+        );
+    }
+
+    // Cancellation AFTER partial dispatch: what was left is gone, the rest is intact and in FIFO.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn batch_async_cancel_after_partial_send() {
+        const CAP: usize = 4;
+        let (tx, rx) = mpmc_bounded::<u64, CAP>();
+        // Leave space for exactly 2 elements.
+        for i in 0..(CAP as u64 - 2) {
+            tx.try_send(i).unwrap();
+        }
+        let mut buf: Vec<u64> = vec![100, 101, 102, 103, 104];
+        let before = buf.len();
+        let r = tokio::time::timeout(Duration::ZERO, tx.send_batch_async(&mut buf)).await;
+        assert!(r.is_err(), "места на весь батч не хватает — обязан ждать");
+        // push_batch took 2 (100, 101), the rest remained in buf in the FIFO.
+        assert_eq!(buf, vec![102, 103, 104], "balance in FIFO, nothing lost");
+        assert_eq!(buf.len() + 2, before, "sent + remainder == original size");
+        // Those who left came in the right order.
+        let mut got = Vec::new();
+        rx.recv_batch(&mut got, 8);
+        assert_eq!(&got[got.len() - 2..], &[100, 101]);
+    }
+
+    // Disconnected: `buf` remains in the FIFO with everything unsent.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn batch_async_disconnect_keeps_fifo() {
+        let (tx, rx) = mpmc_bounded::<u64, 4>();
+        drop(rx);
+
+        let mut buf: Vec<u64> = (0..6).collect();
+        let before = buf.clone();
+
+        let sent = tx.send_batch_async(&mut buf).await;
+        assert_eq!(sent, 0, "the receiver is closed, nothing could escape");
+        assert_eq!(buf, before, "Disconnected: buf in FIFO, nothing lost");
+    }
 }

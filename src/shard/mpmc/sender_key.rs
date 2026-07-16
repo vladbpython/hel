@@ -1,8 +1,10 @@
 use super::super::errors as shard_error;
-use super::{buf::refill_on_error, hash::hash_key, receiver::ShardReceiver};
-use crate::internal_channel::{
-    errors::AsyncSendError, mpmc_bounded, nearest_power_of_two, sender::Sender,
+use super::{
+    buf::{RestoreGroups, refill_on_error},
+    hash::hash_key,
+    receiver::ShardReceiver,
 };
+use crate::internal_channel::{mpmc_bounded, nearest_power_of_two, sender::Sender};
 use std::{sync::Arc, time::Duration};
 
 // ShardedKey (ByKey)
@@ -226,40 +228,45 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
         if buf.is_empty() {
             return Ok(0);
         }
+        // ОТЛИЧИЕ: у key раскладка называется group_by_shard и сирот не бывает —
+        // hash_key отображает ЛЮБОЙ ключ на шард. Если она возвращает только
+        // Vec<Vec<T>>, передай пустой unused.
+        let groups = self.group_by_shard(buf, &key_fn);
+        let mut g = RestoreGroups::new(buf, groups, Vec::new());
         let mut total = 0usize;
-        loop {
-            match self.try_send_batch(buf, &key_fn) {
-                Ok(sent) => {
-                    total += sent;
-                    return Ok(total);
-                }
-                Err(e) => {
-                    total += e.sent;
-                    if buf.is_empty() {
-                        return Ok(total);
+
+        for shard in 0..g.num_groups() {
+            loop {
+                match self.senders[shard].try_send_batch(g.group_mut(shard)) {
+                    Ok(sent) => {
+                        total += sent;
+                        break;
                     }
-                    // buf[0] is the head of the failed (full) shard's group
-                    // awaiting it waits for space in exactly that shard.
-                    // remove(0) is O(n) but this is the slow path; taking from
-                    // the FRONT preserves per key FIFO (pop() would break it).
-                    let first = buf.remove(0);
-                    let shard = hash_key(key_fn(&first)) & self.mask;
-                    match self.senders[shard].send_async(first).await {
-                        Ok(()) => total += 1,
-                        Err(AsyncSendError::Disconnected(v)) => {
-                            let key = key_fn(&v).to_string();
-                            // Return the element: `buf` must contain all unsent.
-                            buf.insert(0, v);
+                    Err(e) => {
+                        total += e.sent;
+                        if g.group_mut(shard).is_empty() {
+                            break;
+                        }
+                        // ОТЛИЧИЕ: в ошибку идёт key — снимаем его с головы
+                        // группы ДО того, как элемент уедет в pending.
+                        let key = key_fn(&g.group_mut(shard)[0]).to_string();
+                        let disconnected = self.senders[shard]
+                            .send_async_from(g.take_head(shard))
+                            .await
+                            .is_err();
+                        if disconnected {
                             return Err(shard_error::ShardKeyAsyncBatchSendError {
                                 key,
                                 shard,
                                 sent: total,
                             });
                         }
+                        total += 1;
                     }
                 }
             }
         }
+        Ok(total)
     }
 }
 
@@ -300,7 +307,7 @@ pub fn shard_key<T: Send + 'static, const CAP: usize>(
 mod tests {
     use super::*;
     use crate::internal_channel::errors::RecvError;
-    use std::thread;
+    use std::{thread, time::Duration};
 
     /// Deterministically finds two keys mapping to DIFFERENT shards.
     fn two_keys_in_different_shards<T: Send + 'static, const CAP: usize>(
@@ -598,5 +605,95 @@ mod tests {
             }
         }
         assert_eq!(buf, (0..N).collect::<Vec<_>>());
+    }
+
+    // Select a key for each shard: the hash is opaque, so we select the keys
+    // through shard_for, rather than guessing.
+    #[cfg(not(miri))]
+    fn keys_covering_all_shards<T: Send + 'static, const CAP: usize>(
+        tx: &ShardKey<T, CAP>,
+        shards: usize,
+    ) -> Vec<&'static str> {
+        const CANDIDATES: &[&str] = &[
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P",
+        ];
+        let mut by_shard: Vec<Option<&'static str>> = vec![None; shards];
+        for &k in CANDIDATES {
+            let s = tx.shard_for(k);
+            if by_shard[s].is_none() {
+                by_shard[s] = Some(k);
+            }
+        }
+        by_shard
+            .into_iter()
+            .map(|o| o.expect("For each shard there must be a candidate key"))
+            .collect()
+    }
+
+    // Cancellation must not take anything: `send_async_from` keeps the in flight
+    // item inside the guard, whose `Drop` returns it to `buf`.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn key_batch_async_cancel_keeps_batch() {
+        const CAP: usize = 2;
+        const SHARDS: usize = 2;
+        let (tx, _rx) = shard_key::<(String, u64), CAP>(SHARDS);
+
+        // Fill EVERY shard: only then is `sent == 0` guaranteed and
+        // `before - batch.len()` honestly means "lost". With a single shard
+        // filled, part of the batch would go into the free ones and the
+        // difference would stop being a loss.
+        let keys = keys_covering_all_shards(&tx, SHARDS);
+        for &k in &keys {
+            for i in 0..CAP as u64 {
+                tx.try_send(k, (k.to_string(), i)).unwrap();
+            }
+        }
+        let expected: Vec<(String, u64)> = vec![
+            (keys[0].to_string(), 10),
+            (keys[1].to_string(), 20),
+            (keys[1].to_string(), 21),
+        ];
+        let mut batch = expected.clone();
+        let r = tokio::time::timeout(
+            Duration::ZERO,
+            tx.send_batch_async(&mut batch, |(s, _)| s.as_str()),
+        )
+        .await;
+        // Proves the cancellation path was actually hit: the future returned
+        // Pending and was dropped mid `.await`.
+        assert!(r.is_err(), "all shards are full, must wait");
+        assert_eq!(
+            batch, expected,
+            "cancellation must lose nothing and reorder nothing"
+        );
+    }
+
+    // The FIFO inside the key survives the cancellation.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn key_batch_async_cancel_keeps_per_key_fifo() {
+        const CAP: usize = 2;
+        const SHARDS: usize = 2;
+        let (tx, _rx) = shard_key::<(String, u64), CAP>(SHARDS);
+        let keys = keys_covering_all_shards(&tx, SHARDS);
+        for &k in &keys {
+            for i in 0..CAP as u64 {
+                tx.try_send(k, (k.to_string(), i)).unwrap();
+            }
+        }
+        // One key, increasing values.
+        let expected: Vec<(String, u64)> = (10..15).map(|i| (keys[0].to_string(), i)).collect();
+        let mut batch = expected.clone();
+        let r = tokio::time::timeout(
+            Duration::ZERO,
+            tx.send_batch_async(&mut batch, |(s, _)| s.as_str()),
+        )
+        .await;
+        assert!(r.is_err(), "all shards are full, must wait");
+        assert_eq!(
+            batch, expected,
+            "cancellation must lose nothing and keep per key FIFO"
+        );
     }
 }

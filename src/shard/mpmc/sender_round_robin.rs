@@ -26,11 +26,10 @@
 //! ```
 
 use super::super::errors as shard_error;
-use super::receiver::ShardReceiver;
+use super::{buf::RestoreOne, receiver::ShardReceiver};
 
 use crate::internal_channel::{
-    core::SeqInner, errors::AsyncSendError, mpmc_bounded, nearest_power_of_two, sender::Sender,
-    traits::InnerChannel,
+    core::SeqInner, mpmc_bounded, nearest_power_of_two, sender::Sender, traits::InnerChannel,
 };
 use std::{
     sync::{Arc, atomic::AtomicUsize, atomic::Ordering},
@@ -174,24 +173,28 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardRoundRob
                 }
                 Err(e) => {
                     total += e.sent;
-                    if buf.is_empty() {
-                        return Ok(total);
-                    }
                     // Back-pressure: await one element into the next shard.
                     // RR gives no ordering guarantees → pop() from the back, O(1).
-                    let value = buf.pop().expect("checked non empty above");
+                    let Some(value) = buf.pop() else {
+                        return Ok(total); // buf empty: everything went out
+                    };
                     let shard2 = self.next_shard();
-                    match self.senders[shard2].send_async(value).await {
-                        Ok(()) => total += 1,
-                        Err(AsyncSendError::Disconnected(v)) => {
-                            // Return the element: `buf` must contain all unsent items.
-                            buf.push(v);
-                            return Err(shard_error::ShardAsyncBatchSendError {
-                                shard: shard2,
-                                sent: total,
-                            });
-                        }
+                    // The item is out of `buf` now and only the guard holds it.
+                    // Cancellation at the `.await` never reaches the lines below,
+                    // but `Drop` puts the item back into `buf`.
+                    let mut g = RestoreOne::back(&mut *buf, value);
+                    let disconnected = self.senders[shard2]
+                        .send_async_from(g.slot())
+                        .await
+                        .is_err();
+                    drop(g);
+                    if disconnected {
+                        return Err(shard_error::ShardAsyncBatchSendError {
+                            shard: shard2,
+                            sent: total,
+                        });
                     }
+                    total += 1;
                 }
             }
         }
@@ -252,6 +255,7 @@ mod tests {
             atomic::{AtomicU64, Ordering::Relaxed},
         },
         thread,
+        time::Duration,
     };
 
     #[test]
@@ -473,5 +477,33 @@ mod tests {
         let got = r0.try_recv().ok().or_else(|| r1.try_recv().ok());
         assert!(got.is_some());
         drop((rx, r0, r1, tx));
+    }
+
+    // Cancellation must not take anything: `send_async_from` keeps the in flight
+    // item inside the guard, whose `Drop` returns it to `buf`.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn rr_batch_async_cancel_keeps_batch() {
+        const CAP: usize = 2;
+        const SHARDS: usize = 2;
+        let (tx, _rx) = round_robin::<u64, CAP>(SHARDS);
+        // Fill ALL shards: only then is `sent == 0` guaranteed and any difference
+        // from `expected` is an honest loss. try_send moves the cursor in a
+        // circle, so CAP * SHARDS sends lay out exactly CAP per shard.
+        for i in 0..(CAP * SHARDS) as u64 {
+            tx.try_send(i).unwrap();
+        }
+        let expected: Vec<u64> = vec![100, 101, 102, 103];
+        let mut batch = expected.clone();
+        let r = tokio::time::timeout(Duration::ZERO, tx.send_batch_async(&mut batch)).await;
+        // Proves the cancellation path was actually hit: the future returned
+        // Pending and was dropped mid `.await`.
+        assert!(
+            r.is_err(),
+            "all shards are full, send_batch_async must wait"
+        );
+        // The item is taken with pop() from the back and `RestoreOne::back` puts
+        // it back there, so `buf` comes out untouched.
+        assert_eq!(batch, expected, "cancellation must lose nothing");
     }
 }

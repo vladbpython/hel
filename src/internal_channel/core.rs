@@ -464,35 +464,60 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
         )
     }
 
-    pub fn push_batch(&self, buf: &mut Vec<T>) -> usize {
-        if buf.is_empty() {
+    fn push_batch(&self, buf: &mut Vec<T>) -> usize {
+        if buf.is_empty() || self.rx_closed.load(Ordering::Acquire) {
             return 0;
         }
         let mask = CAP - 1;
-        let tail = self.tail.load(Ordering::Relaxed);
-        // The readiness of the slot is determined ONLY by the seq protocol: Acquire load
-        // seq==p pairs with the consumer's Release store in pop and gives
-        // happens before it reads data. head is unusable here:
-        // pop publishes head via Relaxed Acquire load of Relaxed store
-        // does not provide synchronization (data race, caught by Miri).
-        let mut k = 0usize;
-        while k < buf.len() && k < CAP {
-            let p = tail + k;
-            if self.slots[p & mask].sequence.load(Ordering::Acquire) != p {
-                break; // the slot is not free yet, we truncate the batch
+        let mut tail = self.tail.load(Ordering::Relaxed);
+        let (pos, k) = loop {
+            let head = self.head.load(Ordering::Acquire);
+            // Two distinct cases yield used >= CAP, and they need opposite handling:
+            // 1. Stale snapshot: another producer moved tail, the consumer moved
+            // head PAST our snapshot -> head > tail -> wrapping_sub wraps to a huge usize. Re reading tail fixes it.
+            // 2. Over reservation: push_fetch_add does an unconditional fetch_add, so N senders blocked on a full channel
+            // push tail up to head + CAP + N. Here tail > head and rereading tail does NOT help,
+            // it stays large until consumers advance head.
+            // Spinning would turn try_send_batch into a hot loop; return instead.
+            if head > tail {
+                tail = self.tail.load(Ordering::Relaxed);
+                continue;
             }
-            k += 1;
-        }
-        if k == 0 {
-            return 0;
+            let used = tail.wrapping_sub(head);
+            if used >= CAP {
+                return 0;
+            }
+            let k = buf.len().min(CAP - used);
+            match self.tail.compare_exchange_weak(
+                tail,
+                tail + k,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break (tail, k),
+                Err(t) => tail = t,
+            }
+        };
+        for i in 0..k {
+            let p = pos + i;
+            let slot = &self.slots[p & mask];
+            while slot.sequence.load(Ordering::Acquire) != p {
+                if self.rx_closed.load(Ordering::Acquire) {
+                    // Action B has not started no slots are written, buf is not touched.
+                    // Without seal (see push_fetch_add).
+                    return 0;
+                }
+                // Window CAS head -> seq.store for the consumer. yield_now, as in
+                // push_fetch_add: gives the scheduler a switch point.
+                thread::yield_now();
+            }
         }
         for (i, value) in buf.drain(..k).enumerate() {
-            let p = tail + i;
+            let p = pos + i;
             let slot = &self.slots[p & mask];
             unsafe { (*slot.data.get()).write(value) };
             slot.sequence.store(p + 1, Ordering::Release);
         }
-        self.tail.store(tail + k, Ordering::Relaxed); // one publication per batch
         k
     }
 

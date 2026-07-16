@@ -1,8 +1,10 @@
 use super::super::errors as shard_error;
-use super::{buf::refill_on_error, receiver::ShardReceiver};
+use super::{
+    buf::{RestoreGroups, refill_on_error},
+    receiver::ShardReceiver,
+};
 use crate::internal_channel::{
-    core::SeqInner, errors::AsyncSendError, mpmc_bounded, nearest_power_of_two, sender::Sender,
-    traits::InnerChannel,
+    core::SeqInner, mpmc_bounded, nearest_power_of_two, sender::Sender, traits::InnerChannel,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -345,39 +347,43 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let (groups, mut unused) = self.group_by_route(buf, &key_fn);
+        // Route ONCE. From here `buf` is empty and everything lives in the guard.
+        let (groups, unused) = self.group_by_route(buf, &key_fn);
+        let mut g = RestoreGroups::new(buf, groups, unused);
         let mut total = 0usize;
-        for (shard, mut group) in groups.into_iter().enumerate() {
+
+        for shard in 0..g.num_groups() {
             loop {
-                match self.senders[shard].try_send_batch(&mut group) {
+                match self.senders[shard].try_send_batch(g.group_mut(shard)) {
                     Ok(sent) => {
                         total += sent;
-                        break;
+                        break; // group is gone
                     }
                     Err(e) => {
                         total += e.sent;
-                        if group.is_empty() {
+                        if g.group_mut(shard).is_empty() {
                             break;
                         }
-                        // back-pressure: await head (FIFO), then retry batch
-                        let first = group.remove(0);
-                        match self.senders[shard].send_async(first).await {
-                            Ok(()) => total += 1,
-                            Err(AsyncSendError::Disconnected(v)) => {
-                                group.insert(0, v);
-                                buf.append(&mut group);
-                                buf.append(&mut unused);
-                                return Err(shard_error::ShardAsyncBatchSendError {
-                                    shard,
-                                    sent: total,
-                                });
-                            }
+                        // Backpressure: await the head (FIFO), then retry the
+                        // batch. No rerouting, the group is already laid out.
+                        let disconnected = self.senders[shard]
+                            .send_async_from(g.take_head(shard))
+                            .await
+                            .is_err();
+                        if disconnected {
+                            // `g` drops here: groups, orphans and the pending
+                            // item all go back into `buf`.
+                            return Err(shard_error::ShardAsyncBatchSendError {
+                                shard,
+                                sent: total,
+                            });
                         }
+                        total += 1;
                     }
                 }
             }
         }
-        buf.append(&mut unused);
+        // `g` drops on the way out: groups are empty by now, orphans go to `buf`.
         Ok(total)
     }
 }
@@ -425,6 +431,7 @@ impl<T: Send + 'static, const CAP: usize> Clone for ShardGroup<T, CAP> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn groups_route_deterministically() {
@@ -601,5 +608,112 @@ mod tests {
         let a = tx.handle("AAA").unwrap();
         tx.send_async(a, 7).await.unwrap();
         assert_eq!(rx.receiver(a.shard()).recv_async().await.unwrap(), 7);
+    }
+
+    // Disconnected should NOT lose groups that the loop has not reached.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn group_batch_async_disconnect_no_loss() {
+        let (tx, rx) = shard_group::<(String, u64), 4>(ShardGroupCase::Groups {
+            groups: &[&["A"], &["B"], &["C"]],
+        });
+        drop(rx);
+
+        let mut batch: Vec<(String, u64)> = vec![
+            ("A".into(), 1),
+            ("A".into(), 2),
+            ("B".into(), 3),
+            ("B".into(), 4),
+            ("C".into(), 5),
+            ("ZZZ".into(), 6), // unused
+        ];
+        let before = batch.len();
+
+        let r = tx.send_batch_async(&mut batch, |(s, _)| s.as_str()).await;
+        let sent = r.expect_err("receiver is closed").sent;
+
+        assert_eq!(
+            sent + batch.len(),
+            before,
+            "group async batch: Disconnected should not lose intact groups"
+        );
+    }
+
+    // Cancellation should not take away the entire batch.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn group_batch_async_cancel_keeps_batch() {
+        const CAP: usize = 2;
+        let (tx, _rx) = shard_group::<(String, u64), CAP>(ShardGroupCase::Groups {
+            groups: &[&["A"], &["B"]],
+        });
+
+        // Fill the shard of group A to capacity.
+        let ha = tx.handle("A").unwrap();
+        for i in 0..CAP as u64 {
+            tx.try_send(ha, ("A".into(), i)).unwrap();
+        }
+
+        let mut batch: Vec<(String, u64)> = vec![
+            ("A".into(), 10), // will run into a clogged shard
+            ("B".into(), 20), // shard free
+            ("B".into(), 21),
+            ("ZZZ".into(), 30), // unused
+        ];
+        let before = batch.len();
+
+        let r = tokio::time::timeout(
+            Duration::ZERO,
+            tx.send_batch_async(&mut batch, |(s, _)| s.as_str()),
+        )
+        .await;
+        assert!(r.is_err(), "шард A полон — обязан ждать");
+
+        // Cancellation has the right to take away a maximum of ONE element, the one that was in flight
+        // inside send_async. Everything else must be in buf.
+        let lost = before - batch.len();
+        assert!(
+            lost <= 1,
+            "cancellation took away {lost} elements instead of at most one (buf.len() = {})",
+            batch.len()
+        );
+        assert!(
+            !batch.is_empty(),
+            "buf is empty: the layout has leaked into local variables"
+        );
+    }
+
+    // A FIFO inside a key survives cancellation: elements of the same character are returned to buf in their original order.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn group_batch_async_cancel_keeps_per_key_fifo() {
+        const CAP: usize = 2;
+        let (tx, _rx) = shard_group::<(String, u64), CAP>(ShardGroupCase::Groups {
+            groups: &[&["A"], &["B"]],
+        });
+
+        let ha = tx.handle("A").unwrap();
+        for i in 0..CAP as u64 {
+            tx.try_send(ha, ("A".into(), i)).unwrap();
+        }
+
+        let mut batch: Vec<(String, u64)> = (10..15).map(|i| ("A".to_string(), i)).collect();
+        let before = batch.len();
+
+        let _ = tokio::time::timeout(
+            Duration::ZERO,
+            tx.send_batch_async(&mut batch, |(s, _)| s.as_str()),
+        )
+        .await;
+        assert_eq!(
+            batch.len(),
+            before,
+            "shard A is full, send_batch_async must wait"
+        );
+        // What is returned should be in ascending order: the FIFO of the key is not broken.
+        let vals: Vec<u64> = batch.iter().map(|(_, v)| *v).collect();
+        let mut sorted = vals.clone();
+        sorted.sort_unstable();
+        assert_eq!(vals, sorted, "cancellation must neither lose nor rearrange");
     }
 }

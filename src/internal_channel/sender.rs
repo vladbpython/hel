@@ -196,6 +196,98 @@ pub fn try_send_batch<T: Send + 'static, const CAP: usize>(
     }
 }
 
+/// Removes the slot from the wait queue. The only place that does `slot.take()`.
+#[inline]
+fn cancel_slot(slot: &mut Option<Arc<AsyncSlot>>) {
+    if let Some(s) = slot.take() {
+        SyncList::cancel_async_slot(&s);
+    }
+}
+
+// `Ready(Ok(()))` the item is in the channel. `value` is now `None`.
+// `Ready(Err(v))` the receiver is closed. `value` is now `None`; take the item from the return.
+// `Pending` no room yet. The item is back in `value`, waiting for the next poll.         
+// That last line is the whole point. On `Pending` the item lives in the caller's `Option`,
+// not inside the future, so dropping the future does not take it along.
+// That is how `send_batch_async` survives cancellation, and it is why `send_async`,
+// which owns its item, cannot.
+#[inline]
+fn poll_send<T, I, const CAP: usize>(
+    inner: &Arc<I>,
+    value: &mut Option<T>,
+    slot: &mut Option<Arc<AsyncSlot>>,
+    cx: &mut Context<'_>,
+) -> Poll<Result<(), T>>
+where
+    T: Send + 'static,
+    I: SenderOps<T, CAP>,
+{
+    let mut v = match value.take() {
+        Some(v) => v,
+        None => {
+            // Polled after Ready — the caller broke the contract. Answer
+            // idempotently instead of parking forever with no waker.
+            cancel_slot(slot);
+            return Poll::Ready(Ok(()));
+        }
+    };
+
+    // Fast path
+    if inner.is_rx_closed() {
+        cancel_slot(slot);
+        return Poll::Ready(Err(v));
+    }
+    match inner.push(v) {
+        Ok(()) => {
+            cancel_slot(slot);
+            inner.notify_receivers();
+            return Poll::Ready(Ok(()));
+        }
+        Err(back) => v = back,
+    }
+
+    // Register or update waker
+    match slot {
+        None => *slot = Some(inner.sender_waiters().push_async_slot(cx.waker().clone())),
+        Some(s) if s.in_queue.load(Ordering::Acquire) => s.waker.register(cx.waker()),
+        Some(_) => *slot = Some(inner.sender_waiters().push_async_slot(cx.waker().clone())),
+    }
+
+    // Double check after registering waker
+    if inner.is_rx_closed() {
+        cancel_slot(slot);
+        return Poll::Ready(Err(v));
+    }
+    match inner.push(v) {
+        Ok(()) => {
+            cancel_slot(slot);
+            inner.notify_receivers();
+            Poll::Ready(Ok(()))
+        }
+        Err(back) => {
+            *value = Some(back); // back to the owner, not into the future
+            Poll::Pending
+        }
+    }
+}
+
+// Shared drop tail: release the slot and, if we are leaving without having sent,
+// hand to the next waiting sender.
+fn drop_send_state<T, I, const CAP: usize>(
+    inner: &Arc<I>,
+    value: &Option<T>,
+    slot: &mut Option<Arc<AsyncSlot>>,
+) where
+    T: Send + 'static,
+    I: SenderOps<T, CAP>,
+{
+    let had_slot = slot.is_some();
+    cancel_slot(slot);
+    if had_slot && value.is_some() {
+        inner.sender_waiters().notify_one();
+    }
+}
+
 pub struct GenericSendFuture<'a, T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> {
     inner: &'a Arc<I>,
     value: Option<T>,
@@ -215,68 +307,10 @@ impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Future
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = unsafe { self.as_mut().get_unchecked_mut() };
-        let inner = this.inner;
-
-        let mut value = match this.value.take() {
-            Some(v) => v,
-            None => {
-                if let Some(s) = this.slot.take() {
-                    SyncList::cancel_async_slot(&s);
-                }
-                return Poll::Pending;
-            }
-        };
-
-        // Fast path
-        if inner.is_rx_closed() {
-            if let Some(s) = this.slot.take() {
-                SyncList::cancel_async_slot(&s);
-            }
-            return Poll::Ready(Err(AsyncSendError::Disconnected(value)));
-        }
-        match inner.push(value) {
-            Ok(()) => {
-                if let Some(s) = this.slot.take() {
-                    SyncList::cancel_async_slot(&s);
-                }
-                inner.notify_receivers();
-                return Poll::Ready(Ok(()));
-            }
-            Err(v) => value = v,
-        }
-
-        // Register or update waker
-        match &this.slot {
-            None => {
-                this.slot = Some(inner.sender_waiters().push_async_slot(cx.waker().clone()));
-            }
-            Some(s) if s.in_queue.load(Ordering::Acquire) => {
-                s.waker.register(cx.waker());
-            }
-            Some(_) => {
-                this.slot = Some(inner.sender_waiters().push_async_slot(cx.waker().clone()));
-            }
-        }
-
-        // Double check after registering waker
-        if inner.is_rx_closed() {
-            if let Some(s) = this.slot.take() {
-                SyncList::cancel_async_slot(&s);
-            }
-            return Poll::Ready(Err(AsyncSendError::Disconnected(value)));
-        }
-        match inner.push(value) {
-            Ok(()) => {
-                if let Some(s) = this.slot.take() {
-                    SyncList::cancel_async_slot(&s);
-                }
-                inner.notify_receivers();
-                Poll::Ready(Ok(()))
-            }
-            Err(v) => {
-                this.value = Some(v);
-                Poll::Pending
-            }
+        match poll_send::<T, I, CAP>(this.inner, &mut this.value, &mut this.slot, cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(v)) => Poll::Ready(Err(AsyncSendError::Disconnected(v))),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -285,13 +319,76 @@ impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Drop
     for GenericSendFuture<'_, T, CAP, I>
 {
     fn drop(&mut self) {
-        if let Some(slot) = self.slot.take() {
-            SyncList::cancel_async_slot(&slot);
-            // Pass the baton to the next waiting sender
-            if self.value.is_some() {
-                self.inner.sender_waiters().notify_one();
+        drop_send_state::<T, I, CAP>(self.inner, &self.value, &mut self.slot);
+    }
+}
+
+// SendPending like GenericSendFuture, but the value is borrowed from the
+// caller's frame, so cancellation cannot swallow it. Private: the only user is `send_batch_async`.
+struct SendPending<'a, T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> {
+    inner: &'a Arc<I>,
+    value: &'a mut Option<T>,
+    slot: Option<Arc<AsyncSlot>>,
+}
+
+// Same reason as GenericSendFuture: SenderOps does not require Sync, which
+// `&Arc<I>: Send` would otherwise want.
+unsafe impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Send
+    for SendPending<'_, T, CAP, I>
+{
+}
+
+impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Future
+    for SendPending<'_, T, CAP, I>
+{
+    /// `Ok(())` -> sent, `*value == None`.
+    /// `Err(())` -> disconnected, `*value == Some(v)`.
+    type Output = Result<(), ()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = unsafe { self.as_mut().get_unchecked_mut() };
+        match poll_send::<T, I, CAP>(this.inner, this.value, &mut this.slot, cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(v)) => {
+                // Put it back for the caller: `Restore::drop` returns it to `buf`.
+                *this.value = Some(v);
+                Poll::Ready(Err(()))
             }
+            Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Drop
+    for SendPending<'_, T, CAP, I>
+{
+    fn drop(&mut self) {
+        drop_send_state::<T, I, CAP>(self.inner, self.value, &mut self.slot);
+    }
+}
+
+// Keeps `buf` reversed while alive, so `pop()` yields the FIFO head in O(1).
+// `Drop` restores the original order and puts back the item that was in flight.
+// Runs on every exit: success, disconnect, panic, and cancellation at `.await`.
+struct Restore<'a, T> {
+    buf: &'a mut Vec<T>,
+    pending: Option<T>,
+}
+
+impl<'a, T> Restore<'a, T> {
+    // Reverses `buf` and takes it under guard for the guard's lifetime.
+    fn new(buf: &'a mut Vec<T>) -> Self {
+        buf.reverse();
+        Self { buf, pending: None }
+    }
+}
+
+impl<T> Drop for Restore<'_, T> {
+    fn drop(&mut self) {
+        if let Some(v) = self.pending.take() {
+            self.buf.push(v); // into the reversed vec = FIFO head
+        }
+        self.buf.reverse();
     }
 }
 
@@ -358,6 +455,17 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
         }
     }
 
+    // batch methods of ShardKey / ShardGroup / ShardRoundRobin need it to be cancel safe.
+    // Not part of the public surface.
+    pub(crate) async fn send_async_from(&self, value: &mut Option<T>) -> Result<(), ()> {
+        SendPending {
+            inner: &self.inner,
+            value,
+            slot: None,
+        }
+        .await
+    }
+
     pub async fn send_batch_async(&self, buf: &mut Vec<T>) -> usize {
         let fast = self.inner.push_batch(buf); // one publication per batch
         if fast > 0 {
@@ -366,17 +474,24 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
         if buf.is_empty() {
             return fast;
         } // the entire buffer is gone exit without a loop
-        // channel is full → old element-wise path as fallback
-        buf.reverse();
+        // channel is full -> old element wise path as fallback
+        let mut g = Restore::new(buf); // reverses inside
         let mut sent = fast;
-        while let Some(value) = buf.pop() {
-            match self.send_async(value).await {
-                Ok(()) => sent += 1,
-                Err(AsyncSendError::Disconnected(v)) => {
-                    buf.push(v);
-                    buf.reverse();
-                    return sent;
-                }
+
+        while let Some(value) = g.buf.pop() {
+            g.pending = Some(value);
+            let done = SendPending {
+                inner: &self.inner,
+                value: &mut g.pending,
+                slot: None,
+            }
+            .await;
+            // The future is dropped here. On cancellation we never reach this
+            // point, but `g.pending` already holds the value, so `Restore::drop`
+            // puts it back into `buf`.
+            match done {
+                Ok(()) => sent += 1, // pending == None
+                Err(()) => break,    // disconnected; the value is in pending
             }
         }
         sent
