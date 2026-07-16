@@ -17,7 +17,6 @@ pub fn refill_on_error<T>(
     }
 }
 
-
 // Holds the single item that is "in flight" inside `send_async_from`.
 // Why a guard is needed at all: `send_batch_async` is itself an async fn,
 // so its locals live in ITS future's frame and die when that future is dropped.
@@ -32,19 +31,21 @@ pub struct RestoreOne<'a, T> {
     front: bool,
 }
 
- 
 impl<'a, T> RestoreOne<'a, T> {
- 
     // Taken from the back (`buf.pop()`, round robin has no ordering guarantee) -> put back to the back.
     pub fn back(buf: &'a mut Vec<T>, value: T) -> Self {
-        Self { buf, pending: Some(value), front: false }
+        Self {
+            buf,
+            pending: Some(value),
+            front: false,
+        }
     }
 
     pub fn slot(&mut self) -> &mut Option<T> {
         &mut self.pending
     }
 }
- 
+
 impl<T> Drop for RestoreOne<'_, T> {
     fn drop(&mut self) {
         if let Some(v) = self.pending.take() {
@@ -56,7 +57,6 @@ impl<T> Drop for RestoreOne<'_, T> {
         }
     }
 }
-
 
 // Owns the whole routed batch while it is being sent.
 // Everything lives here instead of in the async fn's locals, because locals die
@@ -73,7 +73,7 @@ pub struct RestoreGroups<'a, T> {
     // Which group `pending` was taken from.
     pending_shard: usize,
 }
- 
+
 impl<'a, T> RestoreGroups<'a, T> {
     pub fn new(buf: &'a mut Vec<T>, groups: Vec<Vec<T>>, unused: Vec<T>) -> Self {
         Self {
@@ -84,15 +84,15 @@ impl<'a, T> RestoreGroups<'a, T> {
             pending_shard: 0,
         }
     }
- 
+
     pub fn num_groups(&self) -> usize {
         self.groups.len()
     }
- 
+
     pub fn group_mut(&mut self, shard: usize) -> &mut Vec<T> {
         &mut self.groups[shard]
     }
- 
+
     // Moves the FIFO head of `shard` into the pending slot and hands the slot to `send_async_from`.
     // The item never leaves the guard, so cancellation at the `.await` cannot swallow it.
     // Panics if the group is empty — callers check first.
@@ -103,7 +103,7 @@ impl<'a, T> RestoreGroups<'a, T> {
         &mut self.pending
     }
 }
- 
+
 impl<T> Drop for RestoreGroups<'_, T> {
     fn drop(&mut self) {
         // The in flight item goes back to the head of its own group, so per key FIFO survives.

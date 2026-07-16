@@ -206,7 +206,7 @@ fn cancel_slot(slot: &mut Option<Arc<AsyncSlot>>) {
 
 // `Ready(Ok(()))` the item is in the channel. `value` is now `None`.
 // `Ready(Err(v))` the receiver is closed. `value` is now `None`; take the item from the return.
-// `Pending` no room yet. The item is back in `value`, waiting for the next poll.         
+// `Pending` no room yet. The item is back in `value`, waiting for the next poll.
 // That last line is the whole point. On `Pending` the item lives in the caller's `Option`,
 // not inside the future, so dropping the future does not take it along.
 // That is how `send_batch_async` survives cancellation, and it is why `send_async`,
