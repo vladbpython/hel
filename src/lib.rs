@@ -5,6 +5,7 @@ pub mod macros;
 #[cfg(feature = "pool")]
 pub mod pool;
 pub(crate) mod shard;
+pub(crate) mod shim;
 
 pub mod channel {
     pub use super::internal_channel::{errors, nearest_power_of_two};

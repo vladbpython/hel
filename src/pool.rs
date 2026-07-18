@@ -1,3 +1,4 @@
+pub(crate) mod guard;
 pub mod handler;
 pub mod instance;
 pub mod signal;
@@ -34,6 +35,7 @@ where
         let handler = handler.clone();
         let ar = async_runtime.clone();
         let h = ar.clone().spawn(async move {
+            let _guard = guard::OwnerGuard::new(&state, id);
             let mut buf: Vec<T> = Vec::with_capacity(cfg.batch_size);
             let mut idle_streak: u32 = 0;
             while !state.is_stopped() {
@@ -126,6 +128,7 @@ where
         let receivers = receivers.clone();
         let handler = handler.clone();
         let h = thread::spawn(move || {
+            let _guard = guard::OwnerGuard::new(&state, id);
             let mut buf: Vec<T> = Vec::with_capacity(cfg.batch_size);
             let mut idle_streak: u32 = 0;
             while !state.is_stopped() {

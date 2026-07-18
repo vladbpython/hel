@@ -198,9 +198,9 @@ pub fn try_send_batch<T: Send + 'static, const CAP: usize>(
 
 /// Removes the slot from the wait queue. The only place that does `slot.take()`.
 #[inline]
-fn cancel_slot(slot: &mut Option<Arc<AsyncSlot>>) {
+fn cancel_slot(list: &SyncList, slot: &mut Option<Arc<AsyncSlot>>) {
     if let Some(s) = slot.take() {
-        SyncList::cancel_async_slot(&s);
+        list.cancel_async_slot(&s);
     }
 }
 
@@ -225,21 +225,25 @@ where
     let mut v = match value.take() {
         Some(v) => v,
         None => {
-            // Polled after Ready — the caller broke the contract. Answer
-            // idempotently instead of parking forever with no waker.
-            cancel_slot(slot);
+            // Poll after completion (both Ready arms consume `value`).
+            // This cannot lose data: if the future ended with Ready(Err(v)),
+            // the caller already received the item inside that error, and the
+            // disconnect was already reported. Answering Ok(()) here is a fused,
+            // idempotent "this future is finished" - never Pending,
+            // so no task can park forever on a completed future.
+            cancel_slot(inner.sender_waiters(), slot);
             return Poll::Ready(Ok(()));
         }
     };
 
     // Fast path
     if inner.is_rx_closed() {
-        cancel_slot(slot);
+        cancel_slot(inner.sender_waiters(), slot);
         return Poll::Ready(Err(v));
     }
     match inner.push(v) {
         Ok(()) => {
-            cancel_slot(slot);
+            cancel_slot(inner.sender_waiters(), slot);
             inner.notify_receivers();
             return Poll::Ready(Ok(()));
         }
@@ -255,17 +259,17 @@ where
 
     // Double check after registering waker
     if inner.is_rx_closed() {
-        cancel_slot(slot);
+        cancel_slot(inner.sender_waiters(), slot);
         return Poll::Ready(Err(v));
     }
     match inner.push(v) {
         Ok(()) => {
-            cancel_slot(slot);
+            cancel_slot(inner.sender_waiters(), slot);
             inner.notify_receivers();
             Poll::Ready(Ok(()))
         }
         Err(back) => {
-            *value = Some(back); // back to the owner, not into the future
+            *value = Some(back);
             Poll::Pending
         }
     }
@@ -282,7 +286,7 @@ fn drop_send_state<T, I, const CAP: usize>(
     I: SenderOps<T, CAP>,
 {
     let had_slot = slot.is_some();
-    cancel_slot(slot);
+    cancel_slot(inner.sender_waiters(), slot);
     if had_slot && value.is_some() {
         inner.sender_waiters().notify_one();
     }

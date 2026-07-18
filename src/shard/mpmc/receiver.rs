@@ -32,7 +32,7 @@ use crate::internal_channel::{
     core::SeqInner,
     errors::{AsyncRecvError, TryRecvError},
     receiver::Receiver,
-    sync::{AsyncSlot, SyncList},
+    sync::AsyncSlot,
     traits::InnerChannel,
 };
 use std::{
@@ -177,8 +177,13 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Future
             match this.rx.receivers[idx].try_recv() {
                 Ok(v) => {
                     this.rx.cursor = (idx + 1) % n;
-                    for slot in this.slots.iter_mut().flatten() {
-                        SyncList::cancel_async_slot(slot);
+                    for (i, slot) in this.slots.iter_mut().enumerate() {
+                        if let Some(s) = slot.take() {
+                            this.rx.receivers[i]
+                                .inner_ref()
+                                .receiver_waiters()
+                                .cancel_async_slot(&s);
+                        }
                     }
                     return Poll::Ready(Ok((idx, v)));
                 }
@@ -229,8 +234,13 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Future
             let idx = (start + i) % n;
             if let Ok(v) = this.rx.receivers[idx].try_recv() {
                 this.rx.cursor = (idx + 1) % n;
-                for slot in this.slots.iter_mut().flatten() {
-                    SyncList::cancel_async_slot(slot);
+                for (i, slot) in this.slots.iter_mut().enumerate() {
+                    if let Some(s) = slot.take() {
+                        this.rx.receivers[i]
+                            .inner_ref()
+                            .receiver_waiters()
+                            .cancel_async_slot(&s);
+                    }
                 }
                 return Poll::Ready(Ok((idx, v)));
             }
@@ -246,7 +256,10 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Drop
     fn drop(&mut self) {
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let Some(s) = slot.take() {
-                SyncList::cancel_async_slot(&s);
+                self.rx.receivers[i]
+                    .inner_ref()
+                    .receiver_waiters()
+                    .cancel_async_slot(&s);
                 self.rx.receivers[i]
                     .inner_ref()
                     .receiver_waiters()

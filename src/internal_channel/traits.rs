@@ -167,6 +167,12 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + Send + 'stat
     }
 }
 
+/// Marker: inner protocol allows MORE than ONE consumer (slot release via CAS on head).
+/// `SingleInner` does NOT implement it, so `Clone` for its `Receiver` does not exist at the type level:
+/// two consumers on the SPSC protocol (pop without CAS on head) would be a data race on head and a double
+/// read of the same slot.
+pub trait MultiConsumer {}
+
 /// Marker: inner protocol allows MORE than ONE producer
 /// (slot reservation via CAS/fetch_add on tail).
 /// `SingleInner` does NOT implement it so `Clone` for `SingleSender`

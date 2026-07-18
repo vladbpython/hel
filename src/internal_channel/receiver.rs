@@ -1,8 +1,8 @@
 use super::{
     core::{SeqInner, SingleInner},
     errors::{AsyncRecvError, RecvError, TryRecvError},
-    sync::{AsyncSlot, SyncList, SyncNode},
-    traits::{InnerChannel, ReceiverOps},
+    sync::{AsyncSlot, SyncNode},
+    traits::{InnerChannel, MultiConsumer, ReceiverOps},
 };
 use std::{
     future::Future,
@@ -155,7 +155,7 @@ impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Future
         macro_rules! cancel {
             () => {
                 if let Some(s) = this.slot.take() {
-                    SyncList::cancel_async_slot(&s);
+                    inner.receiver_waiters().cancel_async_slot(&s);
                 }
             };
         }
@@ -202,7 +202,7 @@ impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Drop
 {
     fn drop(&mut self) {
         if let Some(s) = self.slot.take() {
-            SyncList::cancel_async_slot(&s);
+            self.inner.receiver_waiters().cancel_async_slot(&s);
             self.inner.receiver_waiters().notify_one();
         }
     }
@@ -231,7 +231,7 @@ impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> futures::Strea
         macro_rules! cancel {
             () => {
                 if let Some(s) = this.slot.take() {
-                    SyncList::cancel_async_slot(&s);
+                    inner.receiver_waiters().cancel_async_slot(&s);
                 }
             };
         }
@@ -278,7 +278,7 @@ impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Drop
 {
     fn drop(&mut self) {
         if let Some(s) = self.slot.take() {
-            SyncList::cancel_async_slot(&s);
+            self.inner.receiver_waiters().cancel_async_slot(&s);
             self.inner.receiver_waiters().notify_one();
         }
     }
@@ -397,7 +397,9 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
     }
 }
 
-impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Clone for Receiver<T, CAP, I> {
+impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + MultiConsumer> Clone
+    for Receiver<T, CAP, I>
+{
     fn clone(&self) -> Self {
         self.inner.receiver_add(Ordering::Relaxed);
         Self {

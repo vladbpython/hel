@@ -12,7 +12,7 @@ use std::{
 pub const IDLE_SPIN: u32 = 128;
 pub const IDLE_YIELD: u32 = 256;
 pub const IDLE_SLEEP: Duration = Duration::from_micros(50);
-const NONE: usize = usize::MAX;
+pub const NONE: usize = usize::MAX;
 
 /// Pool configuration.
 /// Scaling is driven by channel fill ratio (queue depth), not by guessed
@@ -185,10 +185,10 @@ pub(crate) fn claim_or_release(state: &State, id: usize, shard: usize, active: u
         if cur == id {
             return true;
         } else if cur == NONE {
-            let _ =
-                state
-                    .owner(shard)
-                    .compare_exchange(NONE, id, Ordering::AcqRel, Ordering::Relaxed);
+            return state
+                .owner(shard)
+                .compare_exchange(NONE, id, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok();
         }
     } else if cur == id {
         state.owner(shard).store(NONE, Ordering::Release);

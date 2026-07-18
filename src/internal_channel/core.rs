@@ -1,6 +1,6 @@
 use super::{
     sync::{Slot, SyncList},
-    traits::{InnerChannel, MultiProducer},
+    traits::{InnerChannel, MultiConsumer, MultiProducer},
 };
 use crate::cache::Padding;
 use std::{
@@ -387,6 +387,7 @@ impl<T, const CAP: usize> Drop for SeqInner<T, CAP> {
     }
 }
 
+impl<T, const CAP: usize> MultiConsumer for SeqInner<T, CAP> {}
 impl<T, const CAP: usize> MultiProducer for SeqInner<T, CAP> {}
 unsafe impl<T: Send, const CAP: usize> Send for SeqInner<T, CAP> {}
 unsafe impl<T: Send, const CAP: usize> Sync for SeqInner<T, CAP> {}

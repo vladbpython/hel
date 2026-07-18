@@ -1,13 +1,14 @@
-use atomic_waker::AtomicWaker;
-use parking_lot::Mutex as PLMutex;
+use crate::shim::loom::{
+    AtomicBool, AtomicUsize, AtomicWaker, Lock, Mutex, Ordering, PLMutex, fence,
+};
+
 use std::{
     cell::UnsafeCell,
     collections::VecDeque,
     marker::PhantomPinned,
     mem::MaybeUninit,
     ptr::null_mut,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence},
-    sync::{Arc, Mutex},
+    sync::Arc,
     task::Waker,
     thread::{self, Thread},
 };
@@ -17,7 +18,15 @@ pub struct Slot<T> {
     pub(crate) data: UnsafeCell<MaybeUninit<T>>,
 }
 impl<T> Slot<T> {
+    #[cfg(not(loom))]
     pub const fn new(seq: usize) -> Self {
+        Self {
+            sequence: AtomicUsize::new(seq),
+            data: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+    #[cfg(loom)]
+    pub fn new(seq: usize) -> Self {
         Self {
             sequence: AtomicUsize::new(seq),
             data: UnsafeCell::new(MaybeUninit::uninit()),
@@ -170,7 +179,7 @@ impl SyncList {
 
     pub fn push_blocking(&self, node: *mut SyncNode) {
         {
-            let mut list = self.blocking.lock().unwrap_or_else(|e| e.into_inner());
+            let mut list = self.blocking.lock_();
             list.push_back(node);
             self.blocking_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -178,7 +187,7 @@ impl SyncList {
     }
 
     pub fn remove(&self, node: *mut SyncNode) {
-        let mut list = self.blocking.lock().unwrap_or_else(|e| e.into_inner());
+        let mut list = self.blocking.lock_();
         let was_in = unsafe { (*node).is_in_list() };
         list.remove(node);
         if was_in {
@@ -191,16 +200,28 @@ impl SyncList {
         let slot = AsyncSlot::new(waker);
         let for_queue = Arc::clone(&slot);
         {
-            self.async_waiters.lock().push_back(for_queue);
+            self.async_waiters.lock_().push_back(for_queue);
         }
         self.async_count.fetch_add(1, Ordering::SeqCst);
         slot
     }
 
     #[inline]
-    pub fn cancel_async_slot(slot: &Arc<AsyncSlot>) {
+    pub fn cancel_async_slot(&self, slot: &Arc<AsyncSlot>) {
         slot.cancelled.store(true, Ordering::Release);
         slot.waker.take();
+        // Lazy sweep: pop already cancelled slots from the FRONT only.
+        // O(k) for k dead heads, no mid queue removal, FIFO intact.
+        let mut guard = self.async_waiters.lock_();
+        while let Some(head) = guard.front() {
+            if head.cancelled.load(Ordering::Acquire) {
+                let s = guard.pop_front().unwrap();
+                s.in_queue.store(false, Ordering::Release);
+                self.async_count.fetch_sub(1, Ordering::Relaxed);
+            } else {
+                break;
+            }
+        }
     }
 
     /// Called after SeqCst load in Inner::notify*.
@@ -216,7 +237,7 @@ impl SyncList {
         }
         if blocking_hint > 0 {
             let kind = {
-                let mut list = self.blocking.lock().unwrap_or_else(|e| e.into_inner());
+                let mut list = self.blocking.lock_();
                 let k = list.pop_front();
                 if k.is_some() {
                     self.blocking_count.fetch_sub(1, Ordering::Relaxed);
@@ -249,8 +270,8 @@ impl SyncList {
     fn pop_async(&self) -> Option<Waker> {
         loop {
             let slot = {
-                let mut q = self.async_waiters.lock();
-                let s = q.pop_front()?;
+                let mut guard = self.async_waiters.lock_();
+                let s = guard.pop_front()?;
                 s.in_queue.store(false, Ordering::Release);
                 self.async_count.fetch_sub(1, Ordering::Relaxed);
                 s
@@ -258,14 +279,23 @@ impl SyncList {
             if slot.cancelled.load(Ordering::Acquire) {
                 continue;
             }
-            return slot.waker.take();
+            // The waker can be gone even though `cancelled` read false a moment
+            // ago: `cancel_async_slot` sets the flag and takes the waker, and we
+            // may have read the flag before its store landed. An empty slot means
+            // the same thing as a cancelled one, so skip it and try the next.
+            // Returning None here would strand every waiter still queued behind
+            // this slot: `notify_one_if` treats None as "no async waiters" and
+            // moves on to the blocking list. `wake_all` already does this.
+            if let Some(w) = slot.waker.take() {
+                return Some(w);
+            }
         }
     }
 
     pub fn wake_all(&self) {
         let mut kinds = Vec::new();
         {
-            let mut list = self.blocking.lock().unwrap_or_else(|e| e.into_inner());
+            let mut list = self.blocking.lock_();
             while let Some(k) = list.pop_front() {
                 self.blocking_count.fetch_sub(1, Ordering::Relaxed);
                 kinds.push(k);
@@ -276,7 +306,7 @@ impl SyncList {
         }
         let mut wakers = Vec::new();
         {
-            let mut q = self.async_waiters.lock();
+            let mut q = self.async_waiters.lock_();
             while let Some(slot) = q.pop_front() {
                 slot.in_queue.store(false, Ordering::Release);
                 self.async_count.fetch_sub(1, Ordering::Relaxed);
@@ -294,5 +324,93 @@ impl SyncList {
 
     pub fn wake_one(&self) {
         self.notify_one();
+    }
+}
+
+// Loom models: exhaustive schedule exploration for the cancel/notify pair.
+// Run: RUSTFLAGS="--cfg loom" cargo test --release --lib loom_tests
+#[cfg(all(loom, test))]
+mod loom_tests {
+    use super::*;
+    use std::sync::Arc as StdArc;
+    use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering as O};
+    use std::task::{Wake, Waker};
+
+    // Counts wake() calls; counters are read only after join(), so plain
+    // std atomics are fine - they are not part of the explored synchronization.
+    struct CountingWake(StdAtomicUsize);
+
+    impl Wake for CountingWake {
+        fn wake(self: StdArc<Self>) {
+            self.0.fetch_add(1, O::Relaxed);
+        }
+        fn wake_by_ref(self: &StdArc<Self>) {
+            self.0.fetch_add(1, O::Relaxed);
+        }
+    }
+
+    fn counting() -> (StdArc<CountingWake>, Waker) {
+        let w = StdArc::new(CountingWake(StdAtomicUsize::new(0)));
+        let waker = Waker::from(StdArc::clone(&w));
+        (w, waker)
+    }
+
+    /// Regression for the lost wakeup bug: `notify_one` racing a cancel of
+    /// the OTHER slot must still wake someone — a live waiter (b) is queued
+    /// for the whole schedule. The pre fix `pop_async` (returning
+    /// `slot.waker.take()` directly) has a schedule where the popped dying
+    /// slot reads `cancelled == false` but its waker is already taken:
+    /// pop_async returns None, notify_one_if gives up, zero wakes.
+    #[test]
+    fn notify_never_starves_live_waiter() {
+        loom::model(|| {
+            let list = StdArc::new(SyncList::new());
+            let (wa, waker_a) = counting();
+            let (wb, waker_b) = counting();
+            let a = list.push_async_slot(waker_a);
+            let _b = list.push_async_slot(waker_b);
+
+            let l = StdArc::clone(&list);
+            let t = loom::thread::spawn(move || {
+                l.cancel_async_slot(&a);
+            });
+
+            list.notify_one();
+            t.join().unwrap();
+
+            assert!(
+                wa.0.load(O::Relaxed) + wb.0.load(O::Relaxed) >= 1,
+                "notify was swallowed by a dying slot while a live waiter was queued"
+            );
+        });
+    }
+
+    /// Lazy-sweep bookkeeping: two racing cancels must leave `async_count`
+    /// equal to the actual queue length (every tombstone popped and
+    /// decremented at most once, under the same mutex).
+    #[test]
+    fn concurrent_cancels_keep_count_consistent() {
+        loom::model(|| {
+            let list = StdArc::new(SyncList::new());
+            let (_wa, waker_a) = counting();
+            let (_wb, waker_b) = counting();
+            let a = list.push_async_slot(waker_a);
+            let b = list.push_async_slot(waker_b);
+
+            let l1 = StdArc::clone(&list);
+            let l2 = StdArc::clone(&list);
+            let t1 = loom::thread::spawn(move || l1.cancel_async_slot(&a));
+            let t2 = loom::thread::spawn(move || l2.cancel_async_slot(&b));
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            let count = list.async_count.load(Ordering::SeqCst);
+            let qlen = list.async_waiters.lock_().len();
+            assert_eq!(
+                count, qlen,
+                "async_count drifted from real queue length after racing cancels"
+            );
+            assert!(qlen <= 2, "queue grew beyond the slots ever pushed");
+        });
     }
 }
