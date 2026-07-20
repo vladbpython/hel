@@ -160,6 +160,21 @@ impl<T> Debug for ShardKeyAsyncSendError<T> {
     }
 }
 
+/// Borrow send failed. The value is NOT lost: it remains in the caller's slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShardAsyncSendRefError {
+    pub shard: usize,
+    pub err: errors::AsyncSendRefError,
+}
+
+/// Borrow send by key failed. The value is NOT lost: it remains in the caller's slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardKeyAsyncSendRefError {
+    pub key: String,
+    pub shard: usize,
+    pub err: errors::AsyncSendRefError,
+}
+
 /// `try_recv` error from `ShardReceiver` is Empty or Disconnected.
 #[derive(Debug, PartialEq)]
 pub struct ShardTryRecvError {

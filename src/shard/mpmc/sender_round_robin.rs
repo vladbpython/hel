@@ -98,6 +98,25 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardRoundRob
             .map_err(|err| shard_error::ShardAsyncSendError { shard, err })
     }
 
+    /// Cancel safe async send to the next shard without value loss.
+    /// The shard is selected (rotation tick consumed) before awaiting.
+    /// If the future is cancelled, the value remains in `slot`,
+    /// but the rotation has already advanced: a retry will target the *next* shard,
+    /// not the one originally selected.
+    /// Round robin makes no ordering guarantees across shards, so this is sound,
+    /// but callers that log/track shard placement should be aware.
+    #[inline]
+    pub async fn send_ref_async(
+        &self,
+        slot: &mut Option<T>,
+    ) -> Result<(), shard_error::ShardAsyncSendRefError> {
+        let shard = self.next_shard();
+        self.senders[shard]
+            .send_ref_async(slot)
+            .await
+            .map_err(|err| shard_error::ShardAsyncSendRefError { shard, err })
+    }
+
     /// Number of shards.
     #[inline]
     pub fn shards(&self) -> usize {
@@ -248,7 +267,7 @@ pub fn round_robin<T: Send + 'static, const CAP: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::internal_channel::errors::RecvError;
+    use crate::internal_channel::errors::{AsyncSendRefError, RecvError};
     use std::{
         sync::{
             Arc,
@@ -505,5 +524,87 @@ mod tests {
         // The item is taken with pop() from the back and `RestoreOne::back` puts
         // it back there, so `buf` comes out untouched.
         assert_eq!(batch, expected, "cancellation must lose nothing");
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn rr_send_ref_async_cancel_keeps_value() {
+        const CAP: usize = 2;
+        const SHARDS: usize = 2;
+        let (tx, mut rx) = round_robin::<u64, CAP>(SHARDS);
+        // Fill ALL shards: try_send moves the cursor in a circle, so
+        // CAP * SHARDS sends lay out exactly CAP per shard (same trick as rr_batch_async_cancel_keeps_batch).
+        for i in 0..(CAP * SHARDS) as u64 {
+            tx.try_send(i).unwrap();
+        }
+
+        let mut slot = Some(100u64);
+        let r = tokio::time::timeout(Duration::ZERO, tx.send_ref_async(&mut slot)).await;
+        assert!(
+            r.is_err(),
+            "all shards are full, the future must be pending"
+        );
+        assert_eq!(
+            slot,
+            Some(100),
+            "cancellation must keep the value in the slot"
+        );
+
+        // Drain everything: only the fill items exist, 100 never entered.
+        let mut got = Vec::new();
+        while let Some((_, v)) = rx.try_recv_any() {
+            got.push(v);
+        }
+        got.sort_unstable();
+        assert_eq!(got, (0..(CAP * SHARDS) as u64).collect::<Vec<_>>());
+    }
+
+    // Documented semantics: the rotation tick is consumed before awaiting,
+    // so a retry after cancellation targets the NEXT shard.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn rr_send_ref_async_cancel_consumes_rotation_tick() {
+        const CAP: usize = 2;
+        const SHARDS: usize = 2;
+        let (tx, rx) = round_robin::<u64, CAP>(SHARDS);
+        // Ticks 0..3: the cursor goes in a circle, so shard 0 gets {0, 2},
+        // shard 1 gets {1, 3}; both shards are full, cursor is back on shard 0.
+        for i in 0..(CAP * SHARDS) as u64 {
+            tx.try_send(i).unwrap();
+        }
+
+        // Tick 4 (-> shard 0) is consumed, then the future parks and is cancelled.
+        let mut slot = Some(42u64);
+        let r = tokio::time::timeout(Duration::ZERO, tx.send_ref_async(&mut slot)).await;
+        assert!(
+            r.is_err(),
+            "all shards are full, the future must be pending"
+        );
+        assert_eq!(slot, Some(42));
+
+        // Drain both shards completely: only fill items, no 42 anywhere.
+        for s in 0..SHARDS {
+            while rx.receiver(s).try_recv().is_ok() {}
+        }
+
+        // Retry takes the NEXT tick (5) -> shard 1, not shard 0.
+        tx.send_ref_async(&mut slot).await.unwrap();
+        assert_eq!(slot, None);
+        assert!(
+            rx.receiver(0).try_recv().is_err(),
+            "shard 0 must stay empty: the cancelled send consumed its tick"
+        );
+        assert_eq!(rx.receiver(1).try_recv().unwrap(), 42);
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn rr_send_ref_async_disconnect_keeps_value() {
+        let (tx, rx) = round_robin::<u64, 2>(2);
+        drop(rx);
+        let mut slot = Some(1u64);
+        let err = tx.send_ref_async(&mut slot).await.unwrap_err();
+        assert_eq!(err.err, AsyncSendRefError::Disconnected);
+        assert_eq!(slot, Some(1));
     }
 }

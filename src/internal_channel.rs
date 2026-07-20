@@ -47,12 +47,14 @@ pub const fn nearest_power_of_two(n: usize) -> usize {
 mod tests {
     use super::{
         core::SeqInner,
-        errors::{AsyncRecvError, RecvError, TryRecvError},
+        errors::{AsyncRecvError, AsyncSendRefError, RecvError, TryRecvError},
         mpmc_bounded, scsp_bounded,
         sender::Sender,
         traits::InnerChannel,
     };
+    use futures::poll;
     use std::{sync::Arc, thread, time::Duration};
+    use tokio::time::timeout;
 
     // Try recv
 
@@ -493,7 +495,7 @@ mod tests {
         let before = buf.clone();
         // Duration::ZERO: timeout polls the future EXACTLY ONE time, gets Pending,
         // then it works and drops it, we end up exactly in the cancellation path.
-        let r = tokio::time::timeout(Duration::ZERO, tx.send_batch_async(&mut buf)).await;
+        let r = timeout(Duration::ZERO, tx.send_batch_async(&mut buf)).await;
         assert!(
             r.is_err(),
             "the channel is full, send_batch_async must wait"
@@ -516,7 +518,7 @@ mod tests {
         }
         let mut buf: Vec<u64> = vec![100, 101, 102, 103, 104];
         let before = buf.len();
-        let r = tokio::time::timeout(Duration::ZERO, tx.send_batch_async(&mut buf)).await;
+        let r = timeout(Duration::ZERO, tx.send_batch_async(&mut buf)).await;
         assert!(r.is_err(), "места на весь батч не хватает — обязан ждать");
         // push_batch took 2 (100, 101), the rest remained in buf in the FIFO.
         assert_eq!(buf, vec![102, 103, 104], "balance in FIFO, nothing lost");
@@ -540,5 +542,88 @@ mod tests {
         let sent = tx.send_batch_async(&mut buf).await;
         assert_eq!(sent, 0, "the receiver is closed, nothing could escape");
         assert_eq!(buf, before, "Disconnected: buf in FIFO, nothing lost");
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn cancel_while_full_keeps_value() {
+        // CAP=2: the smallest capacity Vyukov supports soundly.
+        let (tx, _rx) = mpmc_bounded::<u32, 2>();
+        // Fill to actual capacity, whatever it is: no assumptions.
+        while tx.try_send(0).is_ok() {}
+        let mut slot = Some(42);
+        // timeout(ZERO) polls once (-> Pending, sender parks) and drops the future mid-await: the real cancellation path.
+        let r = timeout(Duration::ZERO, tx.send_ref_async(&mut slot)).await;
+        assert!(r.is_err(), "channel is full, the future must be pending");
+        assert_eq!(
+            slot,
+            Some(42),
+            "cancellation must keep the value in the slot"
+        );
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn disconnect_keeps_value() {
+        // CAP=2: the smallest capacity Vyukov supports soundly.
+        let (tx, rx) = mpmc_bounded::<u32, 2>();
+        // Fill to actual capacity, whatever it is: no assumptions.
+        while tx.try_send(0).is_ok() {}
+
+        let mut slot = Some(7);
+        let mut fut = Box::pin(tx.send_ref_async(&mut slot));
+
+        // Park first with the real task waker...
+        assert!(poll!(fut.as_mut()).is_pending());
+        // then disconnect: this must wake the parked sender.
+        drop(rx);
+        // A lost wakeup shows up as a timeout failure instead of a hang.
+        let r = timeout(Duration::from_secs(1), fut)
+            .await
+            .expect("disconnect must wake the parked sender");
+        assert_eq!(r, Err(AsyncSendRefError::Disconnected));
+        assert_eq!(slot, Some(7), "disconnect must keep the value in the slot");
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn success_clears_slot() {
+        let (tx, _rx) = mpmc_bounded::<u32, 4>();
+        let mut slot = Some(1);
+        tx.send_ref_async(&mut slot).await.unwrap();
+        assert_eq!(slot, None, "sent value must leave the slot");
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn cancelled_sender_passes_baton() {
+        // Smallest sound capacity, filled to the brim; two parked senders A and B.
+        let (tx, rx) = mpmc_bounded::<u32, 2>();
+        while tx.try_send(0).is_ok() {}
+
+        let mut sa = Some(1);
+        let mut sb = Some(2);
+
+        // Dropping the Box drops the future itself at exactly this point.
+        let mut fa = Box::pin(tx.send_ref_async(&mut sa));
+        let mut fb = Box::pin(tx.send_ref_async(&mut sb));
+
+        assert!(poll!(fa.as_mut()).is_pending()); // A parks first
+        assert!(poll!(fb.as_mut()).is_pending()); // B parks behind A
+
+        // Cancel A for real: drop_send_state must pass the baton (notify_one) to B.
+        drop(fa);
+        // Free exactly one slot (all fill items are zeros).
+        assert_eq!(rx.try_recv(), Ok(0));
+
+        // B must complete under the real runtime.
+        // If the baton (or the recv side notify) was lost,
+        // this times out instead of hanging the test.
+        let r = timeout(Duration::from_secs(1), fb)
+            .await
+            .expect("lost wakeup: cancelled sender did not pass the baton");
+        assert_eq!(r, Ok(()));
+        assert_eq!(sb, None);
+        assert_eq!(sa, Some(1), "cancelled sender keeps its value");
     }
 }

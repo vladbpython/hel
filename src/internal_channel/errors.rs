@@ -81,6 +81,13 @@ impl<T> Debug for AsyncSendError<T> {
     }
 }
 
+/// Intentionally does NOT carry `T`: the value for any non Ok outcome remains in the caller's slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncSendRefError {
+    /// All recipients are dropped. The value remains in `slot`.
+    Disconnected,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum TryRecvError {
     Empty,

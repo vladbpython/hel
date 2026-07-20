@@ -67,15 +67,22 @@ fn main() {
                 tokio::spawn(async move {
                     let h = tx.handle(sym).expect("symbol must be registered");
                     let mut i = 0u64;
+                    let mut slot: Option<u64> = None;
                     while i < PER_PRODUCER {
+                        if slot.is_none() {
+                            slot = Some(i);
+                        }
                         tokio::select! {
                             biased; // safe ordering, no random!
                             _ = token_p.cancelled() => break,
-                            r = tx.send_async(h, i) => {
+                            r = tx.send_ref_async(h, &mut slot) => {
                                 if r.is_err() { break; } // Disconnected
                                 i += 1;
                             }
                         }
+                    }
+                    if let Some(v) = slot.take() {
+                        println!("recovered unsent value {v} on cancellation");
                     }
                     sent.fetch_add(i, Relaxed);
                 })

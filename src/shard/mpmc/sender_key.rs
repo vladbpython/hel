@@ -67,6 +67,26 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
         })
     }
 
+    /// Cancel safe async send using `hash(key)` without value loss.
+    /// Deterministic routing: a retry after cancellation targets the same shard.
+    /// `key` is cloned into the error only on the disconnect path; cancellation allocates nothing.
+    #[inline]
+    pub async fn send_ref_async(
+        &self,
+        key: &str,
+        slot: &mut Option<T>,
+    ) -> Result<(), shard_error::ShardKeyAsyncSendRefError> {
+        let shard = hash_key(key) & self.mask;
+        self.senders[shard]
+            .send_ref_async(slot)
+            .await
+            .map_err(|err| shard_error::ShardKeyAsyncSendRefError {
+                key: key.to_string(),
+                shard,
+                err,
+            })
+    }
+
     /// The shard index for a given key is deterministic.
     #[inline]
     pub fn shard_for(&self, key: &str) -> usize {
@@ -306,7 +326,7 @@ pub fn shard_key<T: Send + 'static, const CAP: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::internal_channel::errors::RecvError;
+    use crate::internal_channel::errors::{AsyncSendRefError, RecvError};
     use std::{thread, time::Duration};
 
     /// Deterministically finds two keys mapping to DIFFERENT shards.
@@ -695,5 +715,62 @@ mod tests {
             batch, expected,
             "cancellation must lose nothing and keep per key FIFO"
         );
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn key_send_ref_async_success() {
+        let (tx, rx) = shard_key::<u64, 8>(4);
+        let shard = tx.shard_for("AAPL");
+        let mut slot = Some(99u64);
+        tx.send_ref_async("AAPL", &mut slot).await.unwrap();
+        assert_eq!(slot, None);
+        assert_eq!(rx.receiver(shard).recv_async().await.unwrap(), 99);
+    }
+
+    // Cancellation keeps the value; deterministic hash routing means a retry
+    // with the same key targets the same shard.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn key_send_ref_async_cancel_keeps_value() {
+        const CAP: usize = 2;
+        let (tx, rx) = shard_key::<u64, CAP>(2);
+        let shard = tx.shard_for("AAPL");
+        // Fill exactly the target shard through the same key.
+        for i in 0..CAP as u64 {
+            tx.send_async("AAPL", i).await.unwrap();
+        }
+
+        let mut slot = Some(500u64);
+        let r = tokio::time::timeout(Duration::ZERO, tx.send_ref_async("AAPL", &mut slot)).await;
+        assert!(
+            r.is_err(),
+            "target shard is full, the future must be pending"
+        );
+        assert_eq!(
+            slot,
+            Some(500),
+            "cancellation must keep the value in the slot"
+        );
+
+        // Only the fill items are in the shard.
+        for i in 0..CAP as u64 {
+            assert_eq!(rx.receiver(shard).recv_async().await.unwrap(), i);
+        }
+        assert!(rx.receiver(shard).try_recv().is_err());
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn key_send_ref_async_disconnect_reports_key_and_shard() {
+        let (tx, rx) = shard_key::<u64, 4>(4);
+        let shard = tx.shard_for("MSFT");
+        drop(rx);
+        let mut slot = Some(1u64);
+        let err = tx.send_ref_async("MSFT", &mut slot).await.unwrap_err();
+        assert_eq!(err.key, "MSFT");
+        assert_eq!(err.shard, shard);
+        assert_eq!(err.err, AsyncSendRefError::Disconnected);
+        assert_eq!(slot, Some(1));
     }
 }

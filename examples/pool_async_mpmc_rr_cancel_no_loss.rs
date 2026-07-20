@@ -76,15 +76,22 @@ fn main() {
                 let sent = sent.clone();
                 tokio::spawn(async move {
                     let mut i = 0u64;
+                    let mut slot: Option<u64> = None;
                     while i < PER_PRODUCER {
+                        if slot.is_none() {
+                            slot = Some(i);
+                        }
                         tokio::select! {
                             biased; // cancellation takes priority over send
                             _ = token_p.cancelled() => break, // stop sending
-                            r = tx.send_async(i) => {
+                            r = tx.send_ref_async(&mut slot) => {
                                 if r.is_err() { break; } // Disconnected
                                 i += 1; // We count ONLY what is actually sent
                             }
                         }
+                    }
+                    if let Some(v) = slot.take() {
+                        println!("recovered unsent value {v} on cancellation");
                     }
                     sent.fetch_add(i, Relaxed); // how much did THIS producer send?
                 })

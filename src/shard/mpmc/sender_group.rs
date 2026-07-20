@@ -178,6 +178,23 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
             .map_err(|err| shard_error::ShardAsyncSendError { shard: idx, err })
     }
 
+    /// Cancel safe async send by handle without value loss.
+    /// Shard selection is deterministic (`h.shard & mask`),
+    /// so a retry after cancellation targets the same shard,
+    /// per-handle FIFO is preserved as long as the caller retries before issuing new sends.
+    #[inline(always)]
+    pub async fn send_ref_async(
+        &self,
+        h: SymbolHandle,
+        slot: &mut Option<T>,
+    ) -> Result<(), shard_error::ShardAsyncSendRefError> {
+        let idx = h.shard & self.mask;
+        self.senders[idx]
+            .send_ref_async(slot)
+            .await
+            .map_err(|err| shard_error::ShardAsyncSendRefError { shard: idx, err })
+    }
+
     /// Lays out buf among shards according to the map. key_fn extracts the character.
     /// Returns groups by shards AND unused (unregistered keys)
     /// as a separate vector the caller decides where to put them.
@@ -431,6 +448,7 @@ impl<T: Send + 'static, const CAP: usize> Clone for ShardGroup<T, CAP> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::internal_channel::errors::AsyncSendRefError;
     use std::time::Duration;
 
     #[test]
@@ -715,5 +733,67 @@ mod tests {
         let mut sorted = vals.clone();
         sorted.sort_unstable();
         assert_eq!(vals, sorted, "cancellation must neither lose nor rearrange");
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn group_send_ref_async_by_handle() {
+        let (tx, rx) = shard_group::<u64, 4>(ShardGroupCase::Groups {
+            groups: &[&["AAA"], &["BBB"]],
+        });
+        let a = tx.handle("AAA").unwrap();
+        let mut slot = Some(7u64);
+        tx.send_ref_async(a, &mut slot).await.unwrap();
+        assert_eq!(slot, None);
+        assert_eq!(rx.receiver(a.shard()).recv_async().await.unwrap(), 7);
+    }
+
+    // Deterministic routing: cancellation keeps the value, a retry with the
+    // same handle lands on the same shard, per-handle FIFO is preserved.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn group_send_ref_async_cancel_then_retry_same_shard() {
+        const CAP: usize = 2;
+        let (tx, rx) = shard_group::<u64, CAP>(ShardGroupCase::Groups {
+            groups: &[&["AAA"], &["BBB"]],
+        });
+        let a = tx.handle("AAA").unwrap();
+        // Fill the shard of "AAA" to actual capacity: no assumptions about
+        // what CAP means for the ring.
+        while tx.try_send(a, 10).is_ok() {}
+
+        let mut slot = Some(42u64);
+        let r = tokio::time::timeout(Duration::ZERO, tx.send_ref_async(a, &mut slot)).await;
+        assert!(r.is_err(), "shard is full, the future must be pending");
+        assert_eq!(
+            slot,
+            Some(42),
+            "cancellation must keep the value in the slot"
+        );
+
+        // Drain the shard completely: only fill items, 42 never entered.
+        while let Ok(v) = rx.receiver(a.shard()).try_recv() {
+            assert_eq!(v, 10, "only fill items may be in the shard");
+        }
+
+        // Retry: same handle -> same shard, deterministic routing.
+        tx.send_ref_async(a, &mut slot).await.unwrap();
+        assert_eq!(slot, None);
+        assert_eq!(rx.receiver(a.shard()).try_recv().unwrap(), 42);
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn group_send_ref_async_disconnect_keeps_value() {
+        let (tx, rx) = shard_group::<u64, 4>(ShardGroupCase::Groups {
+            groups: &[&["AAA"], &["BBB"]],
+        });
+        let a = tx.handle("AAA").unwrap();
+        drop(rx);
+        let mut slot = Some(3u64);
+        let err = tx.send_ref_async(a, &mut slot).await.unwrap_err();
+        assert_eq!(err.shard, a.shard());
+        assert_eq!(err.err, AsyncSendRefError::Disconnected);
+        assert_eq!(slot, Some(3));
     }
 }

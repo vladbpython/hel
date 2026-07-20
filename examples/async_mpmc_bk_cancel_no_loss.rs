@@ -54,16 +54,23 @@ fn main() {
                 let sent = sent.clone();
                 tokio::spawn(async move {
                     let mut i = 0u64;
+                    let mut slot: Option<u64> = None;
                     loop {
                         let sym = symbols[i as usize % symbols.len()];
+                        if slot.is_none() {
+                            slot = Some(p * 10_000 + i);
+                        }
                         tokio::select! {
                             biased; // safe ordering, no random!
                             _ = token.cancelled() => break,
-                            r = tx.send_async(sym, p * 10_000 + i) => {
+                            r = tx.send_ref_async(sym, &mut slot) => {
                                 if r.is_err() { break; }
                                 i += 1;
                             }
                         }
+                    }
+                    if let Some(v) = slot.take() {
+                        println!("[producer {p}] recovered unsent value {v} on cancellation");
                     }
                     sent.fetch_add(i, Relaxed);
                 })

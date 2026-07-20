@@ -1,7 +1,8 @@
 use super::{
     core::{SENDER_SPIN_COUNT, SeqInner, SingleInner},
     errors::{
-        AsyncSendError, BatchSendError, SendBatchError, SendError, TrySendBatchError, TrySendError,
+        AsyncSendError, AsyncSendRefError, BatchSendError, SendBatchError, SendError,
+        TrySendBatchError, TrySendError,
     },
     sync::{AsyncSlot, SyncList, SyncNode},
     traits::{MultiProducer, SenderOps},
@@ -459,15 +460,53 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
         }
     }
 
-    // batch methods of ShardKey / ShardGroup / ShardRoundRobin need it to be cancel safe.
-    // Not part of the public surface.
-    pub(crate) async fn send_async_from(&self, value: &mut Option<T>) -> Result<(), ()> {
+    /// Asynchronous sending without losing the value when canceled.
+    /// The value lives in a `slot` in the caller's frame; future only borrows it.
+    /// Completely cancel safe **without losing the value**.
+    /// Invariant, after any outcome except `Ok())`, the value lies in `slot`:
+    /// - `Ok(())` -> `*slot == None`, the value is published in the channel;
+    /// - `Err(Disconnected)` -> `*slot == Some(v)`, recipients are closed;
+    /// - cancellation (drop pending) -> `*slot == Some(v)`, there was no sending.
+    ///
+    /// An empty `slot` on input is interpreted as “nothing to send” and
+    /// `Ok(())` ends idempotently (fused semantics).
+    ///
+    /// Future borrows `self` and `slot`, so is not `'static`
+    /// and cannot be passed to `tokio::spawn` this is conscious
+    /// trade off for the sake of zero overhead relative to `send_async`:
+    /// the hot path is compiled into the same `poll_send`.
+    ///
+    /// # Example: `select!` without loss
+    ///
+    /// ```ignore
+    /// let mut slot = Some(order);
+    /// tokio::select! {
+    ///     r = tx.send_ref_async(&mut slot) => match r {
+    ///     Ok(()) => { /*sent, slot == None */}
+    ///     Err(SendRefError::Disconnected) => {
+    ///         let order = slot.take().unwrap(); //value is integer
+    ///         }
+    ///     },
+    ///     _ = shutdown.recv() => {
+    ///         //lost the race: slot is still Some(order)
+    ///    }
+    /// }
+    /// ```
+    ///
+    pub async fn send_ref_async(&self, slot: &mut Option<T>) -> Result<(), AsyncSendRefError> {
         SendPending {
             inner: &self.inner,
-            value,
+            value: slot,
             slot: None,
         }
         .await
+        .map_err(|()| AsyncSendRefError::Disconnected)
+    }
+
+    // batch methods of ShardKey / ShardGroup / ShardRoundRobin need it to be cancel safe.
+    // Not part of the public surface.
+    pub(crate) async fn send_async_from(&self, value: &mut Option<T>) -> Result<(), ()> {
+        self.send_ref_async(value).await.map_err(|_| ())
     }
 
     pub async fn send_batch_async(&self, buf: &mut Vec<T>) -> usize {

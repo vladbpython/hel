@@ -172,6 +172,22 @@ impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
                 err,
             })
     }
+
+    /// Cancel safe async send without value loss.
+    /// On any non `Ok` outcome (cancellation or disconnect) the value remains in `slot`.
+    pub async fn send_ref_async(
+        &self,
+        slot: &mut Option<T>,
+    ) -> Result<(), shard_error::ShardAsyncSendRefError> {
+        self.inner
+            .send_ref_async(slot)
+            .await
+            .map_err(|err| shard_error::ShardAsyncSendRefError {
+                shard: self.shard_id,
+                err,
+            })
+    }
+
     /// Non-blocking batch send: one lock for the entire batch.
     pub fn try_send_batch(
         &self,
@@ -273,12 +289,13 @@ pub fn shard_spsc<T: Send + 'static, const CAP: usize>(num_shards: usize) -> Sps
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::internal_channel::errors::{AsyncRecvError, RecvError};
+    use crate::internal_channel::errors::{AsyncRecvError, AsyncSendRefError, RecvError};
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering::Relaxed},
     };
-    use std::thread;
+    use std::{thread, time::Duration};
+    use tokio::time::timeout;
 
     #[test]
     fn new_creates_correct_shard_count() {
@@ -468,5 +485,85 @@ mod tests {
             c.await.unwrap();
         }
         assert_eq!(total.load(Relaxed), 4 * (0..10u64).sum::<u64>());
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn spsc_send_ref_async_success_clears_slot() {
+        let mut ch = SpscShard::<u64, 4>::new(1);
+        let (tx, rx) = ch.take_pair(0).unwrap();
+        let tx = SpscSender {
+            shard_id: 0,
+            inner: tx,
+        };
+        let rx = SpscReceiver {
+            shard_id: 0,
+            inner: rx,
+        };
+
+        let mut slot = Some(7u64);
+        tx.send_ref_async(&mut slot).await.unwrap();
+        assert_eq!(slot, None, "sent value must leave the slot");
+        assert_eq!(rx.recv_async().await.unwrap(), 7);
+    }
+
+    // Cancellation must not lose the value: it stays in the caller's slot
+    // and nothing enters the channel.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn spsc_send_ref_async_cancel_keeps_value() {
+        const CAP: usize = 2;
+        let mut ch = SpscShard::<u64, CAP>::new(1);
+        let (tx, rx) = ch.take_pair(0).unwrap();
+        let tx = SpscSender {
+            shard_id: 0,
+            inner: tx,
+        };
+        let rx = SpscReceiver {
+            shard_id: 0,
+            inner: rx,
+        };
+
+        // Fill the channel so send_ref_async is guaranteed to park.
+        for i in 0..CAP as u64 {
+            tx.send_async(i).await.unwrap();
+        }
+
+        let mut slot = Some(99u64);
+        let r = timeout(Duration::ZERO, tx.send_ref_async(&mut slot)).await;
+        assert!(r.is_err(), "channel is full, the future must be pending");
+        assert_eq!(
+            slot,
+            Some(99),
+            "cancellation must keep the value in the slot"
+        );
+
+        // Only the fill items are in the channel, 99 never entered it.
+        for i in 0..CAP as u64 {
+            assert_eq!(rx.recv_async().await.unwrap(), i);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    // Disconnect: Err carries the shard id, the value stays in the slot.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn spsc_send_ref_async_disconnect_keeps_value() {
+        let mut ch = SpscShard::<u64, 2>::new(1);
+        let (tx, rx) = ch.take_pair(0).unwrap();
+        let tx = SpscSender {
+            shard_id: 0,
+            inner: tx,
+        };
+        drop(SpscReceiver {
+            shard_id: 0,
+            inner: rx,
+        });
+
+        let mut slot = Some(5u64);
+        let err = tx.send_ref_async(&mut slot).await.unwrap_err();
+        assert_eq!(err.shard, 0);
+        assert_eq!(err.err, AsyncSendRefError::Disconnected);
+        assert_eq!(slot, Some(5), "disconnect must keep the value in the slot");
     }
 }
