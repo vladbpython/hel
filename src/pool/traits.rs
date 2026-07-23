@@ -1,15 +1,20 @@
 use std::time::Duration;
 
-pub trait AsyncHandler<T>: Send + Sync + 'static {
-    /// Processes batch, RETURNS cleared Vec (same allocation) for reuse.
-    /// Contract: return batch.clear() empty (len=0, capacity saved).
-    fn handle(&self, batch: Vec<T>) -> impl Future<Output = Vec<T>> + Send;
+/// Contract:
+///  - panic before `take()`: the item is still in the worker's slot and
+///    is delivered to the dead letter sink, zero loss;
+///  - panic after `take()`: the handler explicitly accepted ownership,
+///    the item's fate is the handler's responsibility (counted, not lost silently by the pool).
+pub trait AsyncSlotHandler<T>: Send + Sync + 'static {
+    fn handle(&self, slot: &mut Option<T>) -> impl Future<Output = ()> + Send;
 }
 
-pub trait SyncHandler<T>: Send + Sync + 'static {
-    fn handle(&self, batch: &mut Vec<T>, n: usize);
+/// The worker owns the item; the handler `take()`s only at its commit point.
+/// Panic before take -> item is dead-lettered (zero loss);
+/// panic after take -> consumed by contract, counted.
+pub trait SyncSlotHandler<T>: Send + Sync + 'static {
+    fn handle(&self, slot: &mut Option<T>);
 }
-
 /// Handle of the spawned task, which can be waited for.
 pub trait AsyncJoinHandle: Send + 'static {
     /// Wait for the task to complete. Completion error (panic/cancel) is ignored
@@ -17,7 +22,7 @@ pub trait AsyncJoinHandle: Send + 'static {
     fn join(self) -> impl Future<Output = ()> + Send;
 }
 
-/// Minimal runtime hook so the async pool stays runtime-agnostic. Implement for tokio / async-std / your executor.
+/// Minimal runtime hook so the async pool stays runtime-agnostic. Implement for tokio / smol / async-std / your executor.
 pub trait AsyncRuntime: Clone + Send + Sync + 'static {
     /// The type of handle returned by spawn. One for each runtime.
     type JoinHandle: AsyncJoinHandle;

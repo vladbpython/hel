@@ -1,6 +1,6 @@
 use hel::channel::mpmc::round_robin;
 use hel::channel::nearest_power_of_two;
-use hel::pool::{handler::PerItem, instance::Config, sync_pool};
+use hel::pool::{handler::PerItem, instance::Config, sync_pool_slot};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -26,13 +26,14 @@ fn measure_rampup(shards: usize, max_consumers: usize, work: u32) {
     let processed = Arc::new(AtomicU64::new(0));
 
     let p = processed.clone();
-    let pool = sync_pool(
+    let pool = sync_pool_slot(
         Config::new(1, max_consumers).batch_size(64), // start from 1, look at acceleration
         rx.into_receivers(),
         PerItem(move |v: &u64| {
             black_box(cpu_work(*v, work));
             p.fetch_add(1, Ordering::Relaxed);
         }),
+        |_poison, _panic_info| {},
     );
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -102,13 +103,14 @@ fn measure_rampdown(shards: usize, max_consumers: usize, work: u32) {
     let processed = Arc::new(AtomicU64::new(0));
 
     let p = processed.clone();
-    let pool = sync_pool(
+    let pool = sync_pool_slot(
         Config::new(1, max_consumers).batch_size(64),
         rx.into_receivers(),
         PerItem(move |v: &u64| {
             black_box(cpu_work(*v, work));
             p.fetch_add(1, Ordering::Relaxed);
         }),
+        |_poison, _panic_info| {},
     );
 
     let stop = Arc::new(AtomicBool::new(false));

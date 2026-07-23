@@ -93,6 +93,7 @@ pub struct State {
     shards: usize,             // shard count (immutable)
     closed: Vec<AtomicBool>,   // closed[shard] = shard empty AND senders dropped
     closed_count: AtomicUsize, // how many shards are closed
+    handler_panics: AtomicU64, // panics caught in worker loops (cold path only)
 }
 
 impl State {
@@ -105,6 +106,7 @@ impl State {
             shards,
             closed: (0..shards).map(|_| AtomicBool::new(false)).collect(),
             closed_count: AtomicUsize::new(0),
+            handler_panics: AtomicU64::new(0),
         })
     }
 
@@ -131,6 +133,16 @@ impl State {
     #[inline]
     pub fn shards(&self) -> usize {
         self.shards
+    }
+
+    #[inline]
+    pub fn handler_panics(&self) -> u64 {
+        self.handler_panics.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn note_handler_panic(&self) -> u64 {
+        self.handler_panics.fetch_add(1, Ordering::Relaxed)
     }
 
     #[inline]

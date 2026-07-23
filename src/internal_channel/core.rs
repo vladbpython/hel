@@ -3,15 +3,19 @@ use super::{
     traits::{InnerChannel, MultiConsumer, MultiProducer},
 };
 use crate::cache::Padding;
+#[cfg(not(loom))]
+use std::hint;
+#[cfg(not(loom))]
+use std::time;
+
 use std::{
-    hint,
     mem::MaybeUninit,
     ptr::addr_of_mut,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    thread, time,
+    thread,
 };
 
 /// Waiting phases push_fetch_add (escalation spin → yield → sleep)
@@ -21,10 +25,12 @@ use std::{
 pub const SENDER_SPIN_COUNT: u32 = 64;
 /// The Yield phase covers a short plug (~tens-hundreds of µs polite
 /// waiting at yield ~0.5-5 µs under load), then the plug is prolonged.
+#[cfg(not(loom))]
 const YIELD_UNTIL: u32 = 256;
 /// Consumer's protracted plug: we sleep in quanta, DO NOT burn the core, which
 /// needed by the consumer himself. Price up to 20 µs of excess latency per
 /// waking up after an already long period of inactivity.
+#[cfg(not(loom))]
 const SLEEP: std::time::Duration = time::Duration::from_micros(20);
 
 #[inline]
@@ -81,6 +87,10 @@ pub struct SeqInner<T, const CAP: usize> {
 impl<T, const CAP: usize> SeqInner<T, CAP> {
     pub fn new() -> Arc<Self> {
         assert!(CAP.is_power_of_two(), "CAP must be a power of two");
+        assert!(
+            CAP >= 2,
+            "sequence ring requires CAP >= 2: at CAP=1 the 'free' (seq == pos) and 'consumed' (seq == pos + CAP) conditions collide, allowing silent overwrite (found by loom algo_ring_1p1c_wraparound_exact)"
+        );
         let mut uninit: Arc<MaybeUninit<Self>> = Arc::new_uninit();
         // get_mut gives &mut MaybeUninit<Self> (Arc is unique, just created)
         let slot_ptr = Arc::get_mut(&mut uninit).unwrap();
@@ -88,7 +98,7 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
         unsafe {
             // initialize the fields DIRECTLY in the heap
             // slots one at a time, placement in a heap array
-            let slots_ptr = std::ptr::addr_of_mut!((*ptr).slots) as *mut Slot<T>;
+            let slots_ptr = addr_of_mut!((*ptr).slots) as *mut Slot<T>;
             for i in 0..CAP {
                 slots_ptr.add(i).write(Slot::new(i));
             }
@@ -169,6 +179,12 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
             //waiting, and we are waiting for our specific position woke up
             //if it weren't for the owner, the owner would continue to sleep.
             waits += 1;
+            #[cfg(loom)]
+            {
+                let _ = waits;
+                crate::shim::loom::yield_now(); // every wait step is a loom branch
+            }
+            #[cfg(not(loom))]
             if waits < SENDER_SPIN_COUNT {
                 hint::spin_loop();
             } else if waits < YIELD_UNTIL {
@@ -407,6 +423,10 @@ pub struct SingleInner<T, const CAP: usize> {
 impl<T, const CAP: usize> SingleInner<T, CAP> {
     pub fn new() -> Arc<Self> {
         assert!(CAP.is_power_of_two(), "CAP must be a power of two");
+        assert!(
+            CAP >= 2,
+            "sequence ring requires CAP >= 2: at CAP=1 the 'free' (seq == pos) and 'consumed' (seq == pos + CAP) conditions collide, allowing silent overwrite (found by loom algo_ring_1p1c_wraparound_exact)"
+        );
         let mut uninit: Arc<MaybeUninit<Self>> = Arc::new_uninit();
         let ptr = Arc::get_mut(&mut uninit).unwrap().as_mut_ptr();
         unsafe {
@@ -510,7 +530,7 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
                 }
                 // Window CAS head -> seq.store for the consumer. yield_now, as in
                 // push_fetch_add: gives the scheduler a switch point.
-                thread::yield_now();
+                crate::shim::loom::yield_now();
             }
         }
         for (i, value) in buf.drain(..k).enumerate() {
@@ -840,5 +860,40 @@ mod core_init_tests {
         let (n, _closed) = inner.pop_batch(&mut out, 10);
         assert_eq!(n, 4);
         assert_eq!(out, vec![1, 2, 3, 4]); // FIFO order
+    }
+
+    #[test]
+    #[should_panic(expected = "CAP >= 2")]
+    fn seq_cap_one_rejected() {
+        let _ = SeqInner::<u64, 1>::new();
+    }
+
+    #[test]
+    #[should_panic(expected = "CAP >= 2")]
+    fn single_cap_one_rejected() {
+        let _ = SingleInner::<u64, 1>::new();
+    }
+
+    #[test]
+    fn miri_two_holes_drop() {
+        let inner: Arc<SeqInner<String, 2>> = SeqInner::new();
+        inner.push_fetch_add("a".to_string()).unwrap();
+        inner.push_fetch_add("b".to_string()).unwrap(); // full
+        let mut blocked = Vec::new();
+        for v in ["c", "d"] {
+            let i = inner.clone();
+            let v = v.to_string();
+            blocked.push(thread::spawn(move || i.push_fetch_add(v)));
+        }
+        thread::yield_now();
+        inner.rx_close();
+        inner.notify_all_on_rx_close();
+        for b in blocked {
+            assert!(
+                b.join().unwrap().is_err(),
+                "rx closed push must return the value"
+            );
+        }
+        drop(inner); // Drop: reclaim a,b; skip both abort holes
     }
 }

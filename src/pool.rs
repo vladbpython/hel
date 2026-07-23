@@ -1,38 +1,51 @@
 pub(crate) mod guard;
 pub mod handler;
 pub mod instance;
+pub(crate) mod loom_tests;
 pub mod signal;
 pub mod sync;
 pub mod traits;
 
-use crate::internal_channel::{receiver::Receiver, traits::InnerChannel};
-use std::{sync::Arc, time::Duration};
+use crate::{
+    helper::panic::PanicReason,
+    internal_channel::{receiver::Receiver, traits::InnerChannel},
+};
+use futures::FutureExt;
+use std::{panic::AssertUnwindSafe, sync::Arc, thread, time::Duration};
 
 const MONITOR_TICK: Duration = Duration::from_millis(10);
 
-pub fn async_pool<AR, T, const CAP: usize, I, H>(
+/// The worker owns each item until the handler commits (`slot.take()`).
+/// On a handler panic:
+/// - item still in slot -> delivered to `dead_letter` (zero loss),
+/// - item already taken -> consumed by contract, counted via `handler_panics` (the handler owned it at the panic point).
+pub fn async_pool_slot<AR, T, const CAP: usize, I, H, D>(
     async_runtime: AR,
     cfg: instance::Config,
     receivers: Vec<Receiver<T, CAP, I>>,
     handler: H,
+    dead_letter: D,
 ) -> sync::AsyncPool<AR>
 where
     AR: traits::AsyncRuntime,
     T: Send + 'static,
     I: InnerChannel<T, CAP> + Send + Sync + 'static,
     Receiver<T, CAP, I>: Send + Sync,
-    H: traits::AsyncHandler<T>,
+    H: traits::AsyncSlotHandler<T>,
+    D: Fn(T, PanicReason) + Send + Sync + 'static,
 {
     let shards = receivers.len();
     let state = instance::State::new(shards, cfg.min_consumers);
     let receivers = Arc::new(receivers);
     let handler = Arc::new(handler);
+    let dead_letter: Arc<D> = Arc::new(dead_letter);
     let mut workers = Vec::with_capacity(cfg.max_consumers + 1);
 
     for id in 0..cfg.max_consumers {
         let state = state.clone();
         let receivers = receivers.clone();
         let handler = handler.clone();
+        let dead_letter = dead_letter.clone();
         let ar = async_runtime.clone();
         let h = ar.clone().spawn(async move {
             let _guard = guard::OwnerGuard::new(&state, id);
@@ -48,11 +61,31 @@ where
                     let (n, dc) = receivers[shard].try_recv_batch(&mut buf, cfg.batch_size);
                     if n > 0 {
                         done = true;
-                        let batch: Vec<T> = buf.drain(..n).collect();
-                        handler.handle(batch).await;
-                        _ = state.processed_add(n as u64);
+                        for item in buf.drain(..n) {
+                            let mut slot = Some(item);
+                            let r = AssertUnwindSafe(handler.handle(&mut slot))
+                                .catch_unwind()
+                                .await;
+                            match r {
+                                Ok(()) => {
+                                    // slot (taken or not) drops here: the item is committed/consumed.
+                                    _ = state.processed_add(1);
+                                }
+                                Err(err) => {
+                                    _ = state.note_handler_panic();
+                                    if let Some(poison) = slot.take() {
+                                        // panic before take(): item is ours, hand it back zero loss.
+                                        // A panicking  sink must not kill the worker.
+                                        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                            dead_letter(poison, PanicReason(err))
+                                        }));
+                                    }
+                                    // panic after take(): handler owned it.
+                                }
+                            }
+                        }
                     } else if dc {
-                        state.mark_closed(shard); // shard empty + closed -> autodrainage
+                        state.mark_closed(shard);
                     }
                 }
                 if done {
@@ -68,15 +101,15 @@ where
         workers.push(h);
     }
 
-    // Interruptible sleep -> wait_stopping waits ≤ MONITOR_TICK.
+    // monitor worker (same as async_pool)
     {
         let state = state.clone();
         let receivers = receivers.clone();
         let ar = async_runtime.clone();
-        let h = ar.clone().spawn(async move {
+        let h = async_runtime.spawn(async move {
             while !state.is_stopped() {
                 if sleep_interruptible_async(&ar, &state, cfg.sample_interval).await {
-                    break; // stopped during sleep -> exit immediately
+                    break;
                 }
                 instance::monitor(&cfg, &state, &receivers);
             }
@@ -105,28 +138,38 @@ async fn sleep_interruptible_async<AR: traits::AsyncRuntime>(
     state.is_stopped()
 }
 
-pub fn sync_pool<T, const CAP: usize, I, H>(
+/// Sync twin of [`async_pool_slot`]: zero loss pool over the slot-based handler contract.
+/// Same failure hierarchy:
+/// - handler panic before `take()` -> item delivered to `dead_letter`,
+/// - handler panic after `take()` -> consumed by contract, counted,
+/// - `dead_letter` panic -> item dropped but counted, worker survives (bottom of the hierarchy: nobody left to hand it to).
+/// Batching is preserved on the receiver side;
+/// items are fed to the handler one at a time through the slot.
+pub fn sync_pool_slot<T, const CAP: usize, I, H, D>(
     cfg: instance::Config,
     receivers: Vec<Receiver<T, CAP, I>>,
     handler: H,
+    dead_letter: D,
 ) -> sync::SyncPool
 where
     T: Send + 'static,
     I: InnerChannel<T, CAP> + Send + Sync + 'static,
     Receiver<T, CAP, I>: Send + Sync,
-    H: traits::SyncHandler<T>,
+    H: traits::SyncSlotHandler<T>,
+    D: Fn(T, PanicReason) + Send + Sync + 'static,
 {
-    use std::thread;
     let shards = receivers.len();
     let state = instance::State::new(shards, cfg.min_consumers);
     let receivers = Arc::new(receivers);
     let handler = Arc::new(handler);
+    let dead_letter = Arc::new(dead_letter);
     let mut workers = Vec::with_capacity(cfg.max_consumers + 1);
 
     for id in 0..cfg.max_consumers {
         let state = state.clone();
         let receivers = receivers.clone();
         let handler = handler.clone();
+        let dead_letter = dead_letter.clone();
         let h = thread::spawn(move || {
             let _guard = guard::OwnerGuard::new(&state, id);
             let mut buf: Vec<T> = Vec::with_capacity(cfg.batch_size);
@@ -141,10 +184,31 @@ where
                     let (n, dc) = receivers[shard].try_recv_batch(&mut buf, cfg.batch_size);
                     if n > 0 {
                         done = true;
-                        handler.handle(&mut buf, n);
-                        _ = state.processed_add(n as u64);
+                        for item in buf.drain(..n) {
+                            let mut slot = Some(item);
+                            let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                handler.handle(&mut slot)
+                            }));
+                            match r {
+                                Ok(()) => {
+                                    // slot (taken or not) drops here: the item is committed/consumed.
+                                    _ = state.processed_add(1);
+                                }
+                                Err(err) => {
+                                    _ = state.note_handler_panic();
+                                    if let Some(poison) = slot.take() {
+                                        // panic before take(): item is ours, hand it back zero loss.
+                                        // A panicking sink must not kill the worker.
+                                        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                            dead_letter(poison, PanicReason(err))
+                                        }));
+                                    }
+                                    // panic after take(): handler owned it.
+                                }
+                            }
+                        }
                     } else if dc {
-                        state.mark_closed(shard); // shard is empty + closed -> autodrainage
+                        state.mark_closed(shard);
                     }
                 }
                 if done {
@@ -160,14 +224,13 @@ where
         workers.push(h);
     }
 
-    // Interruptible sleep -> wait_stopping waits ≤ MONITOR_TICK
     {
         let state = state.clone();
         let receivers = receivers.clone();
         let h = thread::spawn(move || {
             while !state.is_stopped() {
                 if sleep_interruptible_sync(&state, cfg.sample_interval) {
-                    break; // stopped during sleep -> exit immediately
+                    break;
                 }
                 instance::monitor(&cfg, &state, &receivers);
             }
@@ -225,13 +288,14 @@ mod tests {
 
         let c = count.clone();
         let s = sum.clone();
-        let pool = sync_pool(
+        let pool = sync_pool_slot(
             instance::Config::new(1, 2),
             rx.into_receivers(),
             handler::PerItem(move |v: &u64| {
                 c.fetch_add(1, Ordering::Relaxed);
                 s.fetch_add(*v, Ordering::Relaxed);
             }),
+            |_poison, _panic_info| {},
         );
 
         let per = 10 * SCALE;
@@ -276,7 +340,7 @@ mod tests {
         let last_c = last.clone();
         let viol_c = violations.clone();
         let proc_c = processed.clone();
-        let pool = sync_pool(
+        let pool = sync_pool_slot(
             instance::Config::new(1, 4).batch_size(4),
             rx.into_receivers(),
             handler::PerItem(move |(k, seq): &(u64, u64)| {
@@ -286,6 +350,7 @@ mod tests {
                 }
                 proc_c.fetch_add(1, Ordering::Relaxed);
             }),
+            |_poison, _panic_info| {},
         );
 
         let producers: Vec<_> = (0..KEYS)
@@ -339,12 +404,13 @@ mod tests {
         let count = Arc::new(AtomicU64::new(0));
 
         let c = count.clone();
-        let pool = sync_pool(
+        let pool = sync_pool_slot(
             instance::Config::new(1, 2),
             rx.into_receivers(),
             handler::PerItem(move |_: &(String, u64)| {
                 c.fetch_add(1, Ordering::Relaxed);
             }),
+            |_poison, _panic_info| {},
         );
 
         let per = 8 * SCALE;
@@ -395,12 +461,13 @@ mod tests {
         let count = Arc::new(AtomicU64::new(0));
 
         let c = count.clone();
-        let pool = sync_pool(
+        let pool = sync_pool_slot(
             instance::Config::new(1, 2),
             rx.into_receivers(),
             handler::PerItem(move |_: &u64| {
                 c.fetch_add(1, Ordering::Relaxed);
             }),
+            |_poison, _panic_info| {},
         );
 
         // fill the elements (do not drop tx, the pool will NOT end on its own)
@@ -425,16 +492,17 @@ mod tests {
         let count = Arc::new(AtomicU64::new(0));
 
         let c = count.clone();
-        let pool = sync_pool(
+        let pool = sync_pool_slot(
             instance::Config::new(1, 2),
             rx.into_receivers(),
             handler::PerItem(move |_: &u64| {
                 c.fetch_add(1, Ordering::Relaxed);
             }),
+            |_poison, _panic_info| {},
         );
 
         // cancellation signal
-        let stop = pool.get_singal_stop();
+        let stop = pool.get_signal_stop();
 
         for i in 0..(100 * SCALE) {
             let _ = tx.send(i).unwrap();
@@ -465,7 +533,7 @@ mod tests {
 
     // TokioRuntime adapter
 
-    struct TokioJoinHandle(tokio::task::JoinHandle<()>);
+    pub(super) struct TokioJoinHandle(tokio::task::JoinHandle<()>);
     impl traits::AsyncJoinHandle for TokioJoinHandle {
         async fn join(self) {
             let _ = self.0.await; // JoinError (panic/cancel) ignored
@@ -473,7 +541,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy, Default)]
-    struct TokioRuntime;
+    pub(super) struct TokioRuntime;
     impl traits::AsyncRuntime for TokioRuntime {
         type JoinHandle = TokioJoinHandle;
         fn spawn<F>(&self, fut: F) -> TokioJoinHandle
@@ -496,18 +564,20 @@ mod tests {
         let count = Arc::new(AtomicU64::new(0));
         let s = sum.clone();
         let c = count.clone();
-        let pool = async_pool(
+        let pool = async_pool_slot(
             TokioRuntime,
             instance::Config::new(1, 4),
             rx.into_receivers(),
-            handler::PerItem(move |v: u64| {
+            handler::PerItem(move |v: &u64| {
                 let s = s.clone();
                 let c = c.clone();
+                let v = *v;
                 async move {
                     s.fetch_add(v, Ordering::Relaxed);
                     c.fetch_add(1, Ordering::Relaxed);
                 }
             }),
+            |_poison, _panic_info| {},
         );
         // producers in blocking streams (send synchronous)
         let producers: Vec<_> = (0..8)
@@ -543,17 +613,18 @@ mod tests {
         let sum = Arc::new(AtomicU64::new(0));
 
         let s = sum.clone();
-        let pool = async_pool(
+        let pool = async_pool_slot(
             TokioRuntime,
             instance::Config::new(2, 4),
             rx.into_receivers(),
-            handler::Batch(move |batch: &[u64]| {
+            handler::PerItem(move |v: &u64| {
                 let s = s.clone();
-                let part: u64 = batch.iter().sum();
+                let v = *v;
                 async move {
-                    s.fetch_add(part, Ordering::Relaxed);
+                    s.fetch_add(v, Ordering::Relaxed);
                 }
             }),
+            |_poison, _panic_info| {},
         );
 
         for i in 0..10_000u64 {
@@ -580,11 +651,11 @@ mod tests {
         let last_c = last.clone();
         let viol_c = violations.clone();
         let proc_c = processed.clone();
-        let pool = async_pool(
+        let pool = async_pool_slot(
             TokioRuntime,
             instance::Config::new(1, 8).batch_size(16),
             rx.into_receivers(),
-            handler::PerItem(move |(k, seq): (u64, u64)| {
+            handler::PerItem(move |&(k, seq): &(u64, u64)| {
                 let last = last_c.clone();
                 let viol = viol_c.clone();
                 let proc = proc_c.clone();
@@ -596,6 +667,7 @@ mod tests {
                     proc.fetch_add(1, Ordering::Relaxed);
                 }
             }),
+            |_poison, _panic_info| {},
         );
 
         let producers: Vec<_> = (0..KEYS)
@@ -675,16 +747,16 @@ mod tests {
         let last_c = last.clone();
         let viol_c = violations.clone();
         let proc_c = processed.clone();
-        let pool = async_pool(
+        let pool = async_pool_slot(
             TokioRuntime,
             instance::Config::new(1, 8).batch_size(16),
             rx.into_receivers(),
-            handler::PerItem(move |(k, seq): (String, u64)| {
+            handler::PerItem(move |kv: &(String, u64)| {
                 let last = last_c.clone();
                 let viol = viol_c.clone();
                 let proc = proc_c.clone();
+                let (idx, seq): (usize, u64) = (kv.0[1..].parse().unwrap(), kv.1);
                 async move {
-                    let idx: usize = k[1..].parse().unwrap();
                     let prev = last[idx].swap(seq, Ordering::Relaxed);
                     if seq != 0 && seq <= prev {
                         viol.fetch_add(1, Ordering::Relaxed);
@@ -692,6 +764,7 @@ mod tests {
                     proc.fetch_add(1, Ordering::Relaxed);
                 }
             }),
+            |_poison, _panic_info| {},
         );
 
         let producers: Vec<_> = (0..KEYS)
@@ -756,17 +829,18 @@ mod tests {
         let sum = Arc::new(AtomicU64::new(0));
 
         let s = sum.clone();
-        let pool = async_pool(
+        let pool = async_pool_slot(
             TokioRuntime,
             instance::Config::new(2, 2),
             rx.into_receivers(),
-            handler::Batch(move |batch: &[(String, u64)]| {
+            handler::PerItem(move |kv: &(String, u64)| {
                 let s = s.clone();
-                let part: u64 = batch.iter().map(|(_, v)| *v).sum();
+                let v = kv.1;
                 async move {
-                    s.fetch_add(part, Ordering::Relaxed);
+                    s.fetch_add(v, Ordering::Relaxed);
                 }
             }),
+            |_poison, _panic_info| {},
         );
 
         const PER_KEY: u64 = 2500;
@@ -812,5 +886,335 @@ mod tests {
 
         let expected = keys.len() as u64 * (0..PER_KEY).sum::<u64>();
         assert_eq!(sum.load(Ordering::Relaxed), expected);
+    }
+}
+
+#[cfg(test)]
+mod panic_safety_tests {
+    use super::*;
+    use crate::channel::mpmc::round_robin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    const CAP: usize = 64;
+    #[cfg(miri)]
+    const N: u64 = 700;
+    #[cfg(not(miri))]
+    const N: u64 = 10_000;
+    // 1..=N, multiples of 7 panic
+    const POISON: u64 = N / 7;
+
+    /// Sync slot API + PerItem: zero loss.
+    /// Every item is either processed exactly once or handed to the dead letter sink exactly once,
+    /// and the sink receives precisely the poison items.
+    #[test]
+    fn sync_slot_ref_zero_loss() {
+        let (tx, rx) = round_robin::<u64, CAP>(2);
+        let ok = Arc::new(AtomicU64::new(0));
+        let dl_count = Arc::new(AtomicU64::new(0));
+        let dl_sum = Arc::new(AtomicU64::new(0));
+        let c = ok.clone();
+        let (dc, ds) = (dl_count.clone(), dl_sum.clone());
+        let pool = sync_pool_slot(
+            instance::Config::new(2, 2),
+            rx.into_receivers(),
+            handler::PerItem(move |v: &u64| {
+                if *v % 7 == 0 {
+                    panic!("babah on {v}");
+                }
+                c.fetch_add(1, Ordering::Relaxed);
+            }),
+            move |poison: u64, _panic_info| {
+                dc.fetch_add(1, Ordering::Relaxed);
+                ds.fetch_add(poison, Ordering::Relaxed);
+            },
+        );
+        let producer = std::thread::spawn(move || {
+            for i in 1..=N {
+                tx.send(i).unwrap();
+            }
+        });
+        producer.join().unwrap();
+        pool.wait_stopping();
+
+        let ok = ok.load(Ordering::Relaxed);
+        let dl = dl_count.load(Ordering::Relaxed);
+        assert_eq!(ok + dl, N, "lost or duplicated items");
+        assert_eq!(dl, POISON);
+        let expected_sum: u64 = (1..=N).filter(|v| v % 7 == 0).sum();
+        assert_eq!(dl_sum.load(Ordering::Relaxed), expected_sum);
+    }
+
+    /// A panicking dead letter sink must not kill the worker.
+    /// Handler panics on multiples of 7 and the sink itself always panics;
+    /// the pool must still process every non poison item and stop cleanly.
+    #[test]
+    fn sync_slot_panicking_sink_does_not_kill_worker() {
+        let (tx, rx) = round_robin::<u64, CAP>(2);
+        let ok = Arc::new(AtomicU64::new(0));
+        let c = ok.clone();
+        let pool = sync_pool_slot(
+            instance::Config::new(2, 2),
+            rx.into_receivers(),
+            handler::PerItem(move |v: &u64| {
+                if *v % 7 == 0 {
+                    panic!("babah on {v}");
+                }
+                c.fetch_add(1, Ordering::Relaxed);
+            }),
+            |_poison: u64, _panic_info| panic!("sink is broken too"),
+        );
+        let producer = std::thread::spawn(move || {
+            for i in 1..=N {
+                tx.send(i).unwrap();
+            }
+        });
+        producer.join().unwrap();
+        pool.wait_stopping(); // must not hang
+
+        assert_eq!(ok.load(Ordering::Relaxed), N - POISON);
+    }
+
+    /// Poison accounting on the async slot pool: every non poison item processed exactly once,
+    /// receivers exactly the poison items, panics counted.
+    #[cfg(not(miri))]
+    #[test]
+    fn async_slot_panics_counted_exactly() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (tx, rx) = round_robin::<u64, CAP>(2);
+            let ok = Arc::new(AtomicU64::new(0));
+            let dl_count = Arc::new(AtomicU64::new(0));
+            let c = ok.clone();
+            let dc = dl_count.clone();
+            let pool = async_pool_slot(
+                tests::TokioRuntime,
+                instance::Config::new(2, 2),
+                rx.into_receivers(),
+                handler::PerItem(move |v: &u64| {
+                    let c = c.clone();
+                    let v = *v;
+                    async move {
+                        if v % 7 == 0 {
+                            panic!("babah on {v}");
+                        }
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                }),
+                move |_poison: u64, _panic_info| {
+                    dc.fetch_add(1, Ordering::Relaxed);
+                },
+            );
+            let sender = tokio::task::spawn(async move {
+                for i in 1..=N {
+                    tx.send_async(i).await.unwrap();
+                }
+            });
+            sender.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let panics = pool.handler_panics();
+            pool.wait_stopping().await;
+            assert_eq!(ok.load(Ordering::Relaxed), N - POISON);
+            assert_eq!(dl_count.load(Ordering::Relaxed), POISON);
+            assert!(panics >= POISON);
+        });
+    }
+
+    /// Keyed routing + sync slot pool: zero loss per key. Poison values
+    /// land in dl with the exact per key sum proves dead lettering does not cross contaminate shards.
+    #[test]
+    fn sync_key_slot_zero_loss() {
+        use crate::channel::mpmc::shard_key;
+        let (tx, rx) = shard_key::<u64, CAP>(4);
+        let ok = Arc::new(AtomicU64::new(0));
+        let dl_count = Arc::new(AtomicU64::new(0));
+        let dl_sum = Arc::new(AtomicU64::new(0));
+        let c = ok.clone();
+        let (dc, ds) = (dl_count.clone(), dl_sum.clone());
+        let pool = sync_pool_slot(
+            instance::Config::new(2, 4),
+            rx.into_receivers(),
+            handler::PerItem(move |v: &u64| {
+                if *v % 7 == 0 {
+                    panic!("babah on {v}");
+                }
+                c.fetch_add(1, Ordering::Relaxed);
+            }),
+            move |poison: u64, _panic_info| {
+                dc.fetch_add(1, Ordering::Relaxed);
+                ds.fetch_add(poison, Ordering::Relaxed);
+            },
+        );
+        const KEYS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
+        let producer = std::thread::spawn(move || {
+            for i in 1..=N {
+                let key = KEYS[(i % 4) as usize];
+                tx.send(key, i).unwrap();
+            }
+        });
+        producer.join().unwrap();
+        pool.wait_stopping();
+
+        let ok = ok.load(Ordering::Relaxed);
+        let dl = dl_count.load(Ordering::Relaxed);
+        assert_eq!(ok + dl, N, "lost or duplicated items (keyed)");
+        assert_eq!(dl, POISON);
+        let expected_sum: u64 = (1..=N).filter(|v| v % 7 == 0).sum();
+        assert_eq!(dl_sum.load(Ordering::Relaxed), expected_sum);
+    }
+
+    /// Keyed routing + async slot pool: zero loss, panics counted.
+    #[cfg(not(miri))]
+    #[test]
+    fn async_key_slot_zero_loss() {
+        use crate::channel::mpmc::shard_key;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (tx, rx) = shard_key::<u64, CAP>(4);
+            let ok = Arc::new(AtomicU64::new(0));
+            let dl_count = Arc::new(AtomicU64::new(0));
+            let dl_sum = Arc::new(AtomicU64::new(0));
+            let c = ok.clone();
+            let (dc, ds) = (dl_count.clone(), dl_sum.clone());
+            let pool = async_pool_slot(
+                tests::TokioRuntime,
+                instance::Config::new(2, 4),
+                rx.into_receivers(),
+                handler::PerItem(move |v: &u64| {
+                    let c = c.clone();
+                    let v = *v;
+                    async move {
+                        if v % 7 == 0 {
+                            panic!("babah on {v}");
+                        }
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                }),
+                move |poison: u64, _panic_info| {
+                    dc.fetch_add(1, Ordering::Relaxed);
+                    ds.fetch_add(poison, Ordering::Relaxed);
+                },
+            );
+            const KEYS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
+            let sender = tokio::task::spawn(async move {
+                for i in 1..=N {
+                    let key = KEYS[(i % 4) as usize];
+                    tx.send_async(key, i).await.unwrap();
+                }
+            });
+            sender.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let panics = pool.handler_panics();
+            pool.wait_stopping().await;
+
+            let ok = ok.load(Ordering::Relaxed);
+            let dl = dl_count.load(Ordering::Relaxed);
+            assert_eq!(ok + dl, N);
+            assert_eq!(dl, POISON);
+            let expected_sum: u64 = (1..=N).filter(|v| v % 7 == 0).sum();
+            assert_eq!(dl_sum.load(Ordering::Relaxed), expected_sum);
+            assert!(panics >= POISON);
+        });
+    }
+
+    /// Group routing + sync slot pool: zero loss.
+    /// Values are tagged by symbol so dl contents are verifiable per group.
+    #[test]
+    fn sync_group_slot_zero_loss() {
+        use crate::channel::mpmc::{ShardGroupCase, shard_group};
+        let groups: &[&[&str]] = &[&["AAA", "BBB"], &["CCC", "DDD"]];
+        let (tx, rx) = shard_group::<u64, CAP>(ShardGroupCase::Groups { groups });
+        let ok = Arc::new(AtomicU64::new(0));
+        let dl_count = Arc::new(AtomicU64::new(0));
+        let dl_sum = Arc::new(AtomicU64::new(0));
+        let c = ok.clone();
+        let (dc, ds) = (dl_count.clone(), dl_sum.clone());
+        let pool = sync_pool_slot(
+            instance::Config::new(2, 2),
+            rx.into_receivers(),
+            handler::PerItem(move |v: &u64| {
+                if *v % 7 == 0 {
+                    panic!("babah on {v}");
+                }
+                c.fetch_add(1, Ordering::Relaxed);
+            }),
+            move |poison: u64, _panic_info| {
+                dc.fetch_add(1, Ordering::Relaxed);
+                ds.fetch_add(poison, Ordering::Relaxed);
+            },
+        );
+        const SYMS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
+        let handles: Vec<_> = SYMS.iter().map(|s| tx.handle(s).unwrap()).collect();
+        let producer = std::thread::spawn(move || {
+            for i in 1..=N {
+                let h = handles[(i % 4) as usize];
+                tx.send(h, i).unwrap();
+            }
+        });
+        producer.join().unwrap();
+        pool.wait_stopping();
+
+        let ok = ok.load(Ordering::Relaxed);
+        let dl = dl_count.load(Ordering::Relaxed);
+        assert_eq!(ok + dl, N, "lost or duplicated items (grouped)");
+        assert_eq!(dl, POISON);
+        let expected_sum: u64 = (1..=N).filter(|v| v % 7 == 0).sum();
+        assert_eq!(dl_sum.load(Ordering::Relaxed), expected_sum);
+    }
+
+    /// Group routing + async slot pool: zero loss, panics counted.
+    #[cfg(not(miri))]
+    #[test]
+    fn async_group_slot_zero_loss() {
+        use crate::channel::mpmc::{ShardGroupCase, shard_group};
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let groups: &[&[&str]] = &[&["AAA", "BBB"], &["CCC", "DDD"]];
+            let (tx, rx) = shard_group::<u64, CAP>(ShardGroupCase::Groups { groups });
+            let ok = Arc::new(AtomicU64::new(0));
+            let dl_count = Arc::new(AtomicU64::new(0));
+            let dl_sum = Arc::new(AtomicU64::new(0));
+            let c = ok.clone();
+            let (dc, ds) = (dl_count.clone(), dl_sum.clone());
+            let pool = async_pool_slot(
+                tests::TokioRuntime,
+                instance::Config::new(2, 2),
+                rx.into_receivers(),
+                handler::PerItem(move |v: &u64| {
+                    let c = c.clone();
+                    let v = *v;
+                    async move {
+                        if v % 7 == 0 {
+                            panic!("babah on {v}");
+                        }
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                }),
+                move |poison: u64, _panic_info| {
+                    dc.fetch_add(1, Ordering::Relaxed);
+                    ds.fetch_add(poison, Ordering::Relaxed);
+                },
+            );
+            const SYMS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
+            let handles: Vec<_> = SYMS.iter().map(|s| tx.handle(s).unwrap()).collect();
+            let sender = tokio::task::spawn(async move {
+                for i in 1..=N {
+                    let h = handles[(i % 4) as usize];
+                    tx.send_async(h, i).await.unwrap();
+                }
+            });
+            sender.await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let panics = pool.handler_panics();
+            pool.wait_stopping().await;
+
+            let ok = ok.load(Ordering::Relaxed);
+            let dl = dl_count.load(Ordering::Relaxed);
+            assert_eq!(ok + dl, N);
+            assert_eq!(dl, POISON);
+            let expected_sum: u64 = (1..=N).filter(|v| v % 7 == 0).sum();
+            assert_eq!(dl_sum.load(Ordering::Relaxed), expected_sum);
+            assert!(panics >= POISON);
+        });
     }
 }

@@ -2,7 +2,7 @@
 use hel::{
     channel::{mpmc::round_robin, nearest_power_of_two},
     pool::{
-        async_pool,
+        async_pool_slot,
         handler::PerItem,
         instance::Config,
         traits::{AsyncJoinHandle, AsyncRuntime},
@@ -54,20 +54,21 @@ fn main() {
 
         // token only stops producers, the pool processes everything sent.
         let p = processed.clone();
-        let pool = async_pool(
+        let pool = async_pool_slot(
             TokioRuntime,
             Config::new(1, 4),
             rx.into_receivers(),
-            PerItem(move |v: u64| {
+            PerItem(move |v: &u64| {
                 let p = p.clone();
+                let _ = *v;
                 async move {
-                    let _ = v;
                     p.fetch_add(1, Relaxed);
                 }
             }),
+            |_poison, _panic_info| {},
         );
 
-        //  PRODUCERS: biased select! — cancel stops sending immediately.
+        //  PRODUCERS: biased select! - cancel stops sending immediately.
         //  What has already been sent (i increments) is NOT lost. tx clone is dropped at the end of each task.
         let producers: Vec<_> = (0..8)
             .map(|_pi| {
@@ -76,24 +77,24 @@ fn main() {
                 let sent = sent.clone();
                 tokio::spawn(async move {
                     let mut i = 0u64;
-                    let mut slot: Option<u64> = None;
+                    let mut next: Option<u64> = None;
                     while i < PER_PRODUCER {
-                        if slot.is_none() {
-                            slot = Some(i);
+                        if next.is_none() {
+                            next = Some(i);
                         }
                         tokio::select! {
                             biased; // cancellation takes priority over send
                             _ = token_p.cancelled() => break, // stop sending
-                            r = tx.send_ref_async(&mut slot) => {
+                            r = tx.send_ref_async(&mut next) => {
                                 if r.is_err() { break; } // Disconnected
-                                i += 1; // We count ONLY what is actually sent
+                                i += 1; // We count only what is actually sent
                             }
                         }
                     }
-                    if let Some(v) = slot.take() {
+                    if let Some(v) = next.take() {
                         println!("recovered unsent value {v} on cancellation");
                     }
-                    sent.fetch_add(i, Relaxed); // how much did THIS producer send?
+                    sent.fetch_add(i, Relaxed); // how much did this producer send?
                 })
             })
             .collect();

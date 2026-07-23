@@ -2,7 +2,7 @@
 use hel::{
     channel::{mpmc::shard_key, nearest_power_of_two},
     pool::{
-        async_pool,
+        async_pool_slot,
         handler::PerItem,
         instance::Config,
         traits::{AsyncJoinHandle, AsyncRuntime},
@@ -51,16 +51,18 @@ fn main() {
         let (tx, rx) = shard_key::<u64, CAP>(8);
         let sum = Arc::new(AtomicU64::new(0));
         let s = sum.clone();
-        let pool = async_pool(
+        let pool = async_pool_slot(
             TokioRuntime,
             Config::new(1, 8),
             rx.into_receivers(),
-            PerItem(move |v: u64| {
+            PerItem(move |v: &u64| {
                 let s = s.clone();
+                let v = *v;
                 async move {
                     s.fetch_add(v, Relaxed);
                 }
             }),
+            |_poison, _panic_info| {},
         );
 
         let producers: Vec<_> = (0..4)

@@ -4,7 +4,7 @@ use hel::{
         mpmc::{ShardGroupCase, shard_group},
         nearest_power_of_two,
     },
-    pool::{handler::PerItem, instance::Config, sync_pool},
+    pool::{handler::PerItem, instance::Config, sync_pool_slot},
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -12,7 +12,7 @@ use std::thread;
 
 const CAP: usize = nearest_power_of_two(1024);
 
-// группы по секторам (4 группы → 4 шарда)
+// groups by sector (4 groups -> 4 shards)
 const GROUPS: &[&[&str]] = &[
     &["AAPL", "MSFT", "GOOG", "ORCL", "INTC", "AMD", "NVDA"], // 0: tech
     &["TSLA", "UBER", "LYFT"],                                // 1: auto
@@ -29,12 +29,13 @@ fn main() {
     let (tx, rx) = shard_group::<u64, CAP>(ShardGroupCase::Groups { groups: GROUPS });
     let sum = Arc::new(AtomicU64::new(0));
     let s = sum.clone();
-    let pool = sync_pool(
+    let pool = sync_pool_slot(
         Config::new(1, 4), // 4 groups -> up to 4 workers
         rx.into_receivers(),
         PerItem(move |v: &u64| {
             s.fetch_add(*v, Relaxed);
         }),
+        |_poison, _panic_info| {},
     );
 
     let producers: Vec<_> = (0..4)

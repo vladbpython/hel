@@ -1,5 +1,6 @@
 pub mod core;
 pub mod errors;
+pub(crate) mod loom_tests;
 pub mod receiver;
 pub mod sender;
 pub mod sync;

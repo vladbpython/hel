@@ -3,10 +3,10 @@ use criterion::{
 };
 use hel::channel::{mpmc::round_robin, nearest_power_of_two};
 use hel::pool::{
-    async_pool,
+    async_pool_slot,
     handler::PerItem,
     instance::Config,
-    sync_pool,
+    sync_pool_slot,
     traits::{AsyncJoinHandle, AsyncRuntime},
 };
 use std::future::Future;
@@ -62,13 +62,14 @@ fn run_sync(shards: usize, consumers: usize, work: u32, n: u64) -> Duration {
     let processed = Arc::new(AtomicU64::new(0));
 
     let p = processed.clone();
-    let pool = sync_pool(
+    let pool = sync_pool_slot(
         Config::new(consumers, consumers).batch_size(64),
         rx.into_receivers(),
         PerItem(move |v: &u64| {
             black_box(cpu_work(*v, work));
             p.fetch_add(1, Ordering::Relaxed);
         }),
+        |_poison: u64, _panic_info| {},
     );
 
     thread::sleep(Duration::from_millis(5)); // warming up workers
@@ -105,17 +106,19 @@ fn run_async(rt: &Runtime, shards: usize, consumers: usize, work: u32, n: u64) -
         let processed = Arc::new(AtomicU64::new(0));
 
         let p = processed.clone();
-        let pool = async_pool(
+        let pool = async_pool_slot(
             TokioRuntime,
             Config::new(consumers, consumers).batch_size(64),
             rx.into_receivers(),
-            PerItem(move |v: u64| {
+            PerItem(move |v: &u64| {
                 let p = p.clone();
+                let v = *v;
                 async move {
                     black_box(cpu_work(v, work));
                     p.fetch_add(1, Ordering::Relaxed);
                 }
             }),
+            |_poison: u64, _panic_info| {},
         );
 
         tokio::time::sleep(Duration::from_millis(5)).await; // warming up workers

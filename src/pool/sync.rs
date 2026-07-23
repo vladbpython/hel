@@ -18,11 +18,16 @@ impl SyncPool {
     pub fn processed(&self) -> u64 {
         self.state.processed()
     }
+
+    pub fn handler_panics(&self) -> u64 {
+        self.state.handler_panics()
+    }
+
     pub fn active(&self) -> usize {
         self.state.active()
     }
 
-    pub fn get_singal_stop(&self) -> Stop {
+    pub fn get_signal_stop(&self) -> Stop {
         Stop::new(self.state.clone())
     }
 
@@ -56,11 +61,16 @@ impl<AR: AsyncRuntime> AsyncPool<AR> {
     pub fn processed(&self) -> u64 {
         self.state.processed()
     }
+
+    pub fn handler_panics(&self) -> u64 {
+        self.state.handler_panics()
+    }
+
     pub fn active(&self) -> usize {
         self.state.active()
     }
 
-    pub fn get_singal_stop(&self) -> Stop {
+    pub fn get_signal_stop(&self) -> Stop {
         Stop::new(self.state.clone())
     }
 

@@ -1,11 +1,12 @@
-// Sync struct-handler PER-ITEM - heavy calculation FOR EACH element.
-// Trait: SyncHandler<T>::handle(&mut Vec<T>, n) —> drain(..n) one at a time.
-// PerItem is beneficial when the calculation is INDEPENDENT on the element (there is no aggregate over the array):
-// transformation, validation, heavy function from one value.
+// Ownership boundary:
+// - panic BEFORE slot.take() -> item stays with the worker -> dead letter (zero loss);
+// - panic AFTER slot.take()   -> the handler accepted ownership; the item is consumed by contract (counted via handler_panics).
+// PerItem style processing is what the slot API is: one item per call.
 
 use hel::{
     channel::{mpmc::round_robin, nearest_power_of_two},
-    pool::{instance::Config, sync_pool, traits::SyncHandler},
+    helper::panic::PanicReason,
+    pool::{instance::Config, sync_pool_slot, traits::SyncSlotHandler},
 };
 use std::hint::black_box;
 use std::sync::Arc;
@@ -16,30 +17,28 @@ const CAP: usize = nearest_power_of_two(1024);
 
 struct Accum {
     processed: AtomicU64,
-    result_sum: AtomicU64, // the sum of the results of a heavy calculation
+    result_sum: AtomicU64,
 }
 
-// Struct-handler PER ITEM: heavy calculation for each element
+// Custom struct handler: heavy independent computation per element.
+// Reads by reference  never takes ownership, so ANY panic here is recoverable:
+// the item lands in the dead-letter sink, not in the void.
 struct HeavyPerItem {
     accum: Arc<Accum>,
 }
 
-impl SyncHandler<u64> for HeavyPerItem {
-    fn handle(&self, batch: &mut Vec<u64>, n: usize) {
-        // &batch[..n]: read from the link WITHOUT owned move (heavy_transform only reads the value).
-        for &item in &batch[..n] {
-            //heavy INDEPENDENT calculation per element (no aggregate by array)
-            let result = heavy_transform(item);
+impl SyncSlotHandler<u64> for HeavyPerItem {
+    fn handle(&self, slot: &mut Option<u64>) {
+        if let Some(item) = slot.as_ref() {
+            let result = heavy_transform(*item);
             self.accum.result_sum.fetch_add(result, Relaxed);
             self.accum.processed.fetch_add(1, Relaxed);
         }
-        //cleanup AFTER processing (single shift, like Batch)
-        batch.drain(..n);
+        // No take(): the worker clears the slot on success. If we needed to KEEP the item (send it onward, store it),
+        // we would take() explicitly accepting that a panic after that point consumes it.
     }
 }
 
-// heavy independent transformation of one meaning.
-// black_box prevents the optimizer from throwing out the loop (otherwise the load will disappear).
 fn heavy_transform(v: u64) -> u64 {
     black_box((0..2000).fold(v, |acc, _| acc.wrapping_mul(31).wrapping_add(1)))
 }
@@ -51,11 +50,15 @@ fn main() {
         result_sum: AtomicU64::new(0),
     });
 
-    let pool = sync_pool(
+    let pool = sync_pool_slot(
         Config::new(1, 4).batch_size(64),
         rx.into_receivers(),
         HeavyPerItem {
             accum: accum.clone(),
+        },
+        // Dead-letter sink: receives the item and the panic cause.
+        |poison: u64, panic_info: PanicReason| {
+            eprintln!("dead-letter: item={poison} panic_info={panic_info:?}");
         },
     );
 
@@ -76,9 +79,9 @@ fn main() {
     drop(tx);
     pool.wait_stopping();
 
-    println!("PER ITEM:");
+    println!("PER ITEM (slot):");
     println!("processed  = {}", accum.processed.load(Relaxed));
     println!("result_sum = {}", accum.result_sum.load(Relaxed));
     assert_eq!(accum.processed.load(Relaxed), TOTAL, "loss of elements");
-    println!("OK: processed by {TOTAL} (heavy calculation per element, scale by workers)");
+    println!("OK: processed {TOTAL} (heavy per-element compute, scaled by workers)");
 }

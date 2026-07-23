@@ -1,7 +1,7 @@
 // round_robin + PerItem (sync): uniform distribution, one element at a time.
 use hel::{
     channel::{mpmc::round_robin, nearest_power_of_two},
-    pool::{handler::PerItem, instance::Config, sync_pool},
+    pool::{handler::PerItem, instance::Config, sync_pool_slot},
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -11,12 +11,13 @@ fn main() {
     let (tx, rx) = round_robin::<u64, CAP>(4);
     let sum = Arc::new(AtomicU64::new(0));
     let s = sum.clone();
-    let pool = sync_pool(
+    let pool = sync_pool_slot(
         Config::new(1, 4),
         rx.into_receivers(),
         PerItem(move |v: &u64| {
             s.fetch_add(*v, Relaxed);
         }),
+        |_poison, _panic_info| {},
     );
 
     for i in 0..10_000u64 {

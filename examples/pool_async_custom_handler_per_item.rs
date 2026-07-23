@@ -1,14 +1,13 @@
-//! DbSink PerItem (struct handler) — processing one tick at a time.
-//! Trait ONE: AsyncHandler<Vec<T> -> Vec<T>>. Per item logic is done INSIDE
-//! via batch.drain(..) like a per item wrapper, but struct gives &self.shared
-//! Some ticks go into the database, some don’t -> unsuccessful ones go into the failed buffer for analysis.
+// - insert attempt runs by reference (no take) -> a panic anywhere in the DB call leaves the tick in the slot -> dead-letter, zero loss;
+// - on rejection the handler take()s the tick to move it into the failed buffer — an explicit ownership transfer, visible in code.
 
 use hel::{
     channel::{mpmc::round_robin, nearest_power_of_two},
+    helper::panic::PanicReason,
     pool::{
-        async_pool,
+        async_pool_slot,
         instance::Config,
-        traits::{AsyncHandler, AsyncJoinHandle, AsyncRuntime},
+        traits::{AsyncJoinHandle, AsyncRuntime, AsyncSlotHandler},
     },
 };
 use std::future::Future;
@@ -30,36 +29,37 @@ struct Shared {
     failed: Mutex<Vec<Tick>>,
 }
 
-// insert ONE tick: true = entered, false = rejected (double/constained).
+// insert ONE tick: true = inserted, false = rejected (dup/constraint).
 async fn insert_one(tick: &Tick, inserted: &AtomicU64) -> bool {
-    tokio::task::yield_now().await; // imitation await DB
+    tokio::task::yield_now().await; // imitation of an awaited DB call
     if tick.id % 2 == 0 {
-        false // even ones "didn't come in"
+        false // even ids are "rejected"
     } else {
         inserted.fetch_add(1, Relaxed);
         true
     }
 }
 
-// Struct handler PerItem: trait Vec<T> -> Vec<T>, per item through drain
 struct DbSink {
     shared: Arc<Shared>,
 }
 
-impl AsyncHandler<Tick> for DbSink {
-    // The trait gives Vec (pool owns), return cleared for reuse.
-    // We process INSIDE ONE AT A TIME via drain (like a per item wrapper).
-    // &self.shared - WITHOUT Arc clone on batch (future holds &self via await).
-    async fn handle(&self, mut batch: Vec<Tick>) -> Vec<Tick> {
-        for tick in batch.drain(..) {
-            //drain: processes and empties; owned tick via await
-            if !insert_one(&tick, &self.shared.inserted).await {
-                // did not log in -> failed (owned tick is moved; short lock without await)
+impl AsyncSlotHandler<Tick> for DbSink {
+    async fn handle(&self, slot: &mut Option<Tick>) {
+        // By reference: the db call happens while the worker still owns the tick.
+        // A panic here (driver bug, serialization error) is recoverable: the tick goes to the dead-letter sink.
+        let accepted = match slot.as_ref() {
+            Some(tick) => insert_one(tick, &self.shared.inserted).await,
+            None => return,
+        };
+        // explicit take() only where we must keep the tick:
+        if !accepted {
+            if let Some(tick) = slot.take() {
+                // short lock, no await while holding it
                 self.shared.failed.lock().unwrap().push(tick);
             }
         }
-        // batch is empty (drain has emptied), capacity is saved -> reuse
-        batch
+        // accepted: no take needed the worker clears the slot.
     }
 }
 
@@ -95,20 +95,25 @@ fn main() {
     rt.block_on(async {
         let (tx, rx) = round_robin::<Tick, CAP>(4);
 
-        // Arc<Shared> - ONE clone when creating a pool (struct handler holds &self,
-        // there is NO clone on batch, unlike PerItem closure)
         let shared = Arc::new(Shared {
             inserted: AtomicU64::new(0),
             failed: Mutex::new(Vec::new()),
         });
 
-        let pool = async_pool(
+        // Dead letter sink completes the zero loss accounting: ticks whose
+        // handler panicked (as opposed to cleanly rejected) land here with the cause attached.
+        let dl_shared = shared.clone();
+        let pool = async_pool_slot(
             TokioRuntime,
             Config::new(1, 4).batch_size(64),
             rx.into_receivers(),
             DbSink {
                 shared: shared.clone(),
-            }, // struct handler
+            },
+            move |poison: Tick, panic_info: PanicReason| {
+                eprintln!("dead letter: id={} panic_info={panic_info:?}", poison.id);
+                dl_shared.failed.lock().unwrap().push(poison);
+            },
         );
 
         const TOTAL: u64 = 10_000;
@@ -132,15 +137,13 @@ fn main() {
         for h in producers {
             h.await.unwrap();
         }
-
         drop(tx);
         pool.wait_stopping().await;
 
-        // after shutdown: unsuccessful ones collected for analysis
         let inserted = shared.inserted.load(Relaxed);
         let failed = shared.failed.lock().unwrap();
         println!("entered the database: {inserted}");
-        println!("failed (failed): {}", failed.len());
+        println!("failed: {}", failed.len());
         println!("total: {}", inserted + failed.len() as u64);
 
         if !failed.is_empty() {
@@ -150,8 +153,7 @@ fn main() {
             }
         }
 
-        // zero loss: accepted + failed == sent
         assert_eq!(inserted + failed.len() as u64, TOTAL, "data loss");
-        println!("OK: zero loss (passed + failed == {TOTAL})");
+        println!("OK: zero loss (inserted + failed == {TOTAL})");
     });
 }

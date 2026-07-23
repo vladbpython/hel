@@ -76,3 +76,12 @@ impl AtomicWaker {
         self.inner.lock().unwrap().take()
     }
 }
+
+#[cfg(loom)]
+pub(crate) fn yield_now() {
+    loom::thread::yield_now();
+}
+#[cfg(not(loom))]
+pub(crate) fn yield_now() {
+    std::thread::yield_now();
+}
