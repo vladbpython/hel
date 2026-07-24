@@ -5,6 +5,7 @@ pub(crate) mod loom_tests;
 pub mod signal;
 pub mod sync;
 pub mod traits;
+pub(crate) mod util;
 
 use crate::{
     helper::panic::PanicReason,
@@ -17,8 +18,8 @@ const MONITOR_TICK: Duration = Duration::from_millis(10);
 
 /// The worker owns each item until the handler commits (`slot.take()`).
 /// On a handler panic:
-/// - item still in slot -> delivered to `dead_letter` (zero loss),
-/// - item already taken -> consumed by contract, counted via `handler_panics` (the handler owned it at the panic point).
+/// - item still in slot  -> delivered to `dead_letter` (zero loss),
+/// - item already taken  -> consumed by contract, counted via `handler_panics` (the handler owned it at the panic point).
 pub fn async_pool_slot<AR, T, const CAP: usize, I, H, D>(
     async_runtime: AR,
     cfg: instance::Config,
@@ -52,10 +53,9 @@ where
             let mut buf: Vec<T> = Vec::with_capacity(cfg.batch_size);
             let mut idle_streak: u32 = 0;
             while !state.is_stopped() {
-                let active = state.active();
                 let mut done = false;
                 for shard in 0..shards {
-                    if !instance::claim_or_release(&state, id, shard, active) {
+                    if !instance::claim_or_release(&state, id, shard) {
                         continue;
                     }
                     let (n, dc) = receivers[shard].try_recv_batch(&mut buf, cfg.batch_size);
@@ -92,8 +92,12 @@ where
                     idle_streak = 0;
                 } else {
                     idle_streak = idle_streak.saturating_add(1);
-                    if instance::idle_backoff_step(idle_streak) {
-                        ar.sleep(instance::IDLE_SLEEP).await;
+                    match instance::idle_phase(idle_streak) {
+                        instance::IdlePhase::Spin => std::hint::spin_loop(),
+                        // Give the runtime thread back to other tasks instead
+                        // of blocking it. See YieldNow.
+                        instance::IdlePhase::Yield => util::YieldNow::default().await,
+                        instance::IdlePhase::Sleep => ar.sleep(instance::IDLE_SLEEP).await,
                     }
                 }
             }
@@ -143,8 +147,8 @@ async fn sleep_interruptible_async<AR: traits::AsyncRuntime>(
 /// - handler panic before `take()` -> item delivered to `dead_letter`,
 /// - handler panic after `take()` -> consumed by contract, counted,
 /// - `dead_letter` panic -> item dropped but counted, worker survives (bottom of the hierarchy: nobody left to hand it to).
-/// Batching is preserved on the receiver side;
-/// items are fed to the handler one at a time through the slot.
+///   Batching is preserved on the receiver side;
+///   items are fed to the handler one at a time through the slot.
 pub fn sync_pool_slot<T, const CAP: usize, I, H, D>(
     cfg: instance::Config,
     receivers: Vec<Receiver<T, CAP, I>>,
@@ -175,10 +179,9 @@ where
             let mut buf: Vec<T> = Vec::with_capacity(cfg.batch_size);
             let mut idle_streak: u32 = 0;
             while !state.is_stopped() {
-                let active = state.active();
                 let mut done = false;
                 for shard in 0..shards {
-                    if !instance::claim_or_release(&state, id, shard, active) {
+                    if !instance::claim_or_release(&state, id, shard) {
                         continue;
                     }
                     let (n, dc) = receivers[shard].try_recv_batch(&mut buf, cfg.batch_size);
@@ -215,8 +218,10 @@ where
                     idle_streak = 0;
                 } else {
                     idle_streak = idle_streak.saturating_add(1);
-                    if instance::idle_backoff_step(idle_streak) {
-                        thread::sleep(instance::IDLE_SLEEP);
+                    match instance::idle_phase(idle_streak) {
+                        instance::IdlePhase::Spin => std::hint::spin_loop(),
+                        instance::IdlePhase::Yield => thread::yield_now(),
+                        instance::IdlePhase::Sleep => thread::sleep(instance::IDLE_SLEEP),
                     }
                 }
             }
@@ -1064,7 +1069,7 @@ mod panic_safety_tests {
     }
 
     /// Keyed routing + async slot pool: zero loss, panics counted.
-    #[cfg(not(miri))]
+    //#[cfg(not(miri))]
     #[test]
     fn async_key_slot_zero_loss() {
         use crate::channel::mpmc::shard_key;
