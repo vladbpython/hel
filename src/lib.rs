@@ -8,7 +8,11 @@ pub(crate) mod shard;
 pub(crate) mod shim;
 
 pub mod channel {
-    pub use super::internal_channel::{errors, nearest_power_of_two};
+    pub use super::internal_channel::{
+        errors, 
+        nearest_power_of_two,
+        receiver::Receiver,
+    };
     pub mod mpmc {
         pub use super::super::shard::mpmc::{
             receiver::ShardReceiver, sender_group::*, sender_key::*, sender_round_robin::*,

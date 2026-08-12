@@ -18,8 +18,9 @@ hel is also sharded. Instead of one ring buffer shared by all producers, hel cre
 
 ### Version
 
-- Current version is - `2.1.0`
+- Current version is - `2.2.0`
 - Changes are documented in `change_log/v{version}.md`
+- [crate hel-rs](https://crates.io/crates/hel-rs)
 
 ## Benchmark results — X86 (MACOS)
 
