@@ -1,11 +1,6 @@
 use crate::internal_channel::{receiver::Receiver, traits::InnerChannel};
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
-    time::Duration,
-};
+use crate::shim::loom::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::{sync::Arc, time::Duration};
 
 pub const IDLE_SPIN: u32 = 128;
 pub const IDLE_YIELD: u32 = 256;
@@ -120,6 +115,7 @@ pub struct State {
     owner: Vec<AtomicUsize>,   // owner[shard] = worker id, or NONE
     desired: Vec<AtomicUsize>, // desired[shard] = worker id that should own it, picked by load
     active: AtomicUsize,       // current active consumers
+    max_active: AtomicUsize,   // peak active reached
     shutdown: AtomicBool,      // stop flag (set by cancel/shutdown or autodrain)
     processed: AtomicU64,      // total items processed
     shards: usize,             // shard count (immutable)
@@ -140,6 +136,7 @@ impl State {
                 .map(|s| AtomicUsize::new(desired_owner(s, active)))
                 .collect(),
             active: AtomicUsize::new(active),
+            max_active: AtomicUsize::new(active),
             shutdown: AtomicBool::new(false),
             processed: AtomicU64::new(0),
             shards,
@@ -167,6 +164,14 @@ impl State {
     #[inline]
     pub(crate) fn set_active(&self, n: usize) {
         self.active.store(n, Ordering::Release);
+        if n > self.max_active.load(Ordering::Relaxed) {
+            self.max_active.store(n, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn max_active(&self) -> usize {
+        self.max_active.load(Ordering::Relaxed)
     }
 
     #[inline]

@@ -339,19 +339,24 @@ mod tests {
 
         let (tx, rx) = shard_key::<(u64, u64), CAP>(4);
         let last: Arc<Vec<AtomicU64>> = Arc::new((0..KEYS).map(|_| AtomicU64::new(0)).collect());
-        let violations = Arc::new(AtomicU64::new(0));
+        let no_fifo_counter = Arc::new(AtomicU64::new(0));
         let processed = Arc::new(AtomicU64::new(0));
 
         let last_c = last.clone();
-        let viol_c = violations.clone();
+        let no_fifo_counter_c = no_fifo_counter.clone();
         let proc_c = processed.clone();
         let pool = sync_pool_slot(
-            instance::Config::new(1, 4).batch_size(4),
+            instance::Config::new(1, 4)
+                .batch_size(4)
+                .sample_interval(Duration::from_millis(2)),
             rx.into_receivers(),
             handler::PerItem(move |(k, seq): &(u64, u64)| {
+                std::hint::black_box(
+                    (0..2000u64).fold(*seq, |a, x| a.wrapping_mul(x).wrapping_add(1)),
+                );
                 let prev = last_c[*k as usize].swap(*seq, Ordering::Relaxed);
                 if *seq != 0 && *seq <= prev {
-                    viol_c.fetch_add(1, Ordering::Relaxed);
+                    no_fifo_counter_c.fetch_add(1, Ordering::Relaxed);
                 }
                 proc_c.fetch_add(1, Ordering::Relaxed);
             }),
@@ -380,13 +385,25 @@ mod tests {
                 })
             })
             .collect();
+
         for p in producers {
             p.join().unwrap();
         }
         drop(tx);
-
+        // Prove a resize actually happened: the pool's peak worker count must
+        // exceed the min, else "under resize" was never exercised (one owner the
+        // whole run -> per-key order trivially preserved, no handoff).
+        let max_active = pool.max_active();
         pool.wait_stopping();
 
+        // Under Miri the item count is tiny and the timing-driven scaling is not
+        // reliably reachable; the FIFO/loss checks below still run.
+        if !cfg!(miri) {
+            assert!(
+                max_active > 1,
+                "resize never happened active stayed at {max_active}, per key FIFO was not tested across a handoff"
+            );
+        }
         let expected = KEYS as u64 * per_key;
         assert_eq!(
             processed.load(Ordering::Relaxed),
@@ -394,7 +411,7 @@ mod tests {
             "loss/duplicates"
         );
         assert_eq!(
-            violations.load(Ordering::Relaxed),
+            no_fifo_counter.load(Ordering::Relaxed),
             0,
             "broken FIFO on resize"
         );
@@ -650,24 +667,29 @@ mod tests {
 
         let (tx, rx) = shard_key::<(u64, u64), CAP>(8);
         let last: Arc<Vec<AtomicU64>> = Arc::new((0..KEYS).map(|_| AtomicU64::new(0)).collect());
-        let violations = Arc::new(AtomicU64::new(0));
+        let no_fifo_counter = Arc::new(AtomicU64::new(0));
         let processed = Arc::new(AtomicU64::new(0));
 
         let last_c = last.clone();
-        let viol_c = violations.clone();
+        let no_fifo_counter_c = no_fifo_counter.clone();
         let proc_c = processed.clone();
         let pool = async_pool_slot(
             TokioRuntime,
-            instance::Config::new(1, 8).batch_size(16),
+            instance::Config::new(1, 8)
+                .batch_size(16)
+                .sample_interval(Duration::from_millis(2)),
             rx.into_receivers(),
             handler::PerItem(move |&(k, seq): &(u64, u64)| {
                 let last = last_c.clone();
-                let viol = viol_c.clone();
+                let n_f_c = no_fifo_counter_c.clone();
                 let proc = proc_c.clone();
                 async move {
+                    std::hint::black_box(
+                        (0..2000u64).fold(seq, |a, x| a.wrapping_mul(x).wrapping_add(1)),
+                    );
                     let prev = last[k as usize].swap(seq, Ordering::Relaxed);
                     if seq != 0 && seq <= prev {
-                        viol.fetch_add(1, Ordering::Relaxed);
+                        n_f_c.fetch_add(1, Ordering::Relaxed);
                     }
                     proc.fetch_add(1, Ordering::Relaxed);
                 }
@@ -709,9 +731,14 @@ mod tests {
             p.await.unwrap();
         }
         drop(tx);
-
+        // Prove a resize actually happened, see the sync test for rationale.
+        let max_active = pool.max_active();
         pool.wait_stopping().await;
 
+        assert!(
+            max_active > 1,
+            "resize never happened active stayed at {max_active}, per key FIFO was not tested across a handoff"
+        );
         let expected = KEYS as u64 * PER_KEY;
         assert_eq!(
             processed.load(Ordering::Relaxed),
@@ -719,7 +746,7 @@ mod tests {
             "loss/duplicates"
         );
         assert_eq!(
-            violations.load(Ordering::Relaxed),
+            no_fifo_counter.load(Ordering::Relaxed),
             0,
             "broken FIFO on resize"
         );
@@ -731,7 +758,6 @@ mod tests {
     async fn tokio_group_order_under_resize() {
         const KEYS: usize = 16;
         const PER_KEY: u64 = 2000;
-
         let (tx, rx) = shard_group::<(String, u64), CAP>(ShardGroupCase::Groups {
             groups: &[
                 &["k0", "k1"],
@@ -746,25 +772,30 @@ mod tests {
         });
 
         let last: Arc<Vec<AtomicU64>> = Arc::new((0..KEYS).map(|_| AtomicU64::new(0)).collect());
-        let violations = Arc::new(AtomicU64::new(0));
+        let no_fifo_counter = Arc::new(AtomicU64::new(0));
         let processed = Arc::new(AtomicU64::new(0));
 
         let last_c = last.clone();
-        let viol_c = violations.clone();
+        let no_fifo_counter_c = no_fifo_counter.clone();
         let proc_c = processed.clone();
         let pool = async_pool_slot(
             TokioRuntime,
-            instance::Config::new(1, 8).batch_size(16),
+            instance::Config::new(1, 8)
+                .batch_size(16)
+                .sample_interval(Duration::from_millis(2)),
             rx.into_receivers(),
             handler::PerItem(move |kv: &(String, u64)| {
                 let last = last_c.clone();
-                let viol = viol_c.clone();
+                let n_f_c = no_fifo_counter_c.clone();
                 let proc = proc_c.clone();
                 let (idx, seq): (usize, u64) = (kv.0[1..].parse().unwrap(), kv.1);
                 async move {
+                    std::hint::black_box(
+                        (0..2000u64).fold(seq, |a, x| a.wrapping_mul(x).wrapping_add(1)),
+                    );
                     let prev = last[idx].swap(seq, Ordering::Relaxed);
                     if seq != 0 && seq <= prev {
-                        viol.fetch_add(1, Ordering::Relaxed);
+                        n_f_c.fetch_add(1, Ordering::Relaxed);
                     }
                     proc.fetch_add(1, Ordering::Relaxed);
                 }
@@ -808,9 +839,14 @@ mod tests {
             p.await.unwrap();
         }
         drop(tx);
-
+        // Prove a resize actually happened, see the sync test for rationale.
+        let max_active = pool.max_active();
         pool.wait_stopping().await;
 
+        assert!(
+            max_active > 1,
+            "resize never happened active stayed at {max_active}, per key FIFO was not tested across a handoff"
+        );
         let expected = KEYS as u64 * PER_KEY;
         assert_eq!(
             processed.load(Ordering::Relaxed),
@@ -818,7 +854,7 @@ mod tests {
             "loss/duplicates"
         );
         assert_eq!(
-            violations.load(Ordering::Relaxed),
+            no_fifo_counter.load(Ordering::Relaxed),
             0,
             "per key FIFO for shard_group is broken during resize"
         );
@@ -897,9 +933,15 @@ mod tests {
 #[cfg(test)]
 mod panic_safety_tests {
     use super::*;
-    use crate::channel::mpmc::round_robin;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::channel::mpmc::{ShardGroupCase, round_robin, shard_group, shard_key};
+    use std::{
+        panic,
+        sync::{
+            Arc,
+            atomic::{AtomicU8, AtomicU64, Ordering},
+        },
+        thread,
+    };
 
     const CAP: usize = 64;
     #[cfg(miri)]
@@ -909,17 +951,96 @@ mod panic_safety_tests {
     // 1..=N, multiples of 7 panic
     const POISON: u64 = N / 7;
 
+    struct TesterPoison {
+        ok: Vec<AtomicU8>,   // ok[v] = times value v was processed
+        dead: Vec<AtomicU8>, // dead[v] = times value v was dead
+    }
+    impl TesterPoison {
+        fn new(n: u64) -> Arc<Self> {
+            Arc::new(Self {
+                ok: (0..=n).map(|_| AtomicU8::new(0)).collect(),
+                dead: (0..=n).map(|_| AtomicU8::new(0)).collect(),
+            })
+        }
+        fn processed(&self, v: u64) {
+            self.ok[v as usize].fetch_add(1, Ordering::Relaxed);
+        }
+        fn dead_lettered(&self, v: u64) {
+            self.dead[v as usize].fetch_add(1, Ordering::Relaxed);
+        }
+        fn assert_exactly_once(&self, n: u64, poison: impl Fn(u64) -> bool) {
+            for v in 1..=n {
+                let ok = self.ok[v as usize].load(Ordering::Relaxed);
+                let dead = self.dead[v as usize].load(Ordering::Relaxed);
+                if poison(v) {
+                    assert_eq!(
+                        (ok, dead),
+                        (0, 1),
+                        "poison {v}: want dead once, got processed={ok} dead={dead}"
+                    );
+                } else {
+                    assert_eq!(
+                        (ok, dead),
+                        (1, 0),
+                        "value {v}: want processed once, got processed={ok} dead={dead}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "want processed once")]
+    fn tester_poison_catches_loss_and_dup() {
+        let t = TesterPoison::new(5);
+        for v in 1..=5 {
+            if v == 3 {
+                continue; // value 3 lost
+            }
+            t.processed(v);
+        }
+        t.processed(5); // value 5 processed twice
+        t.assert_exactly_once(5, |v| v % 7 == 0);
+    }
+
+    #[test]
+    fn owner_guard_releases_all_shards_on_panic() {
+        let state = instance::State::new(2, 1);
+        let s = state.clone();
+        let prev = panic::take_hook();
+        panic::set_hook(Box::new(|_| {})); // silence the expected panic
+        let joined = thread::spawn(move || {
+            let _guard = super::guard::OwnerGuard::new(&s, 0);
+            for shard in 0..2 {
+                let _ = instance::claim_or_release_to(&s, 0, shard, 0);
+            }
+            panic!("worker 0 crashed"); // unwind through OwnerGuard::drop
+        })
+        .join();
+        panic::set_hook(prev);
+
+        assert!(joined.is_err(), "the worker must have panicked");
+        for shard in 0..2 {
+            assert_eq!(
+                state.owner(shard).load(Ordering::Relaxed),
+                instance::NONE,
+                "shard {shard} not released after the owner thread unwound"
+            );
+            assert!(
+                instance::claim_or_release_to(&state, 1, shard, 1),
+                "survivor cannot claim shard {shard} after crash"
+            );
+        }
+    }
+
     /// Sync slot API + PerItem: zero loss.
     /// Every item is either processed exactly once or handed to the dead letter sink exactly once,
     /// and the sink receives precisely the poison items.
     #[test]
     fn sync_slot_ref_zero_loss() {
         let (tx, rx) = round_robin::<u64, CAP>(2);
-        let ok = Arc::new(AtomicU64::new(0));
-        let dl_count = Arc::new(AtomicU64::new(0));
-        let dl_sum = Arc::new(AtomicU64::new(0));
-        let c = ok.clone();
-        let (dc, ds) = (dl_count.clone(), dl_sum.clone());
+        let tester = TesterPoison::new(N);
+        let (tp, td) = (tester.clone(), tester.clone());
         let pool = sync_pool_slot(
             instance::Config::new(2, 2),
             rx.into_receivers(),
@@ -927,11 +1048,10 @@ mod panic_safety_tests {
                 if *v % 7 == 0 {
                     panic!("babah on {v}");
                 }
-                c.fetch_add(1, Ordering::Relaxed);
+                tp.processed(*v);
             }),
             move |poison: u64, _panic_info| {
-                dc.fetch_add(1, Ordering::Relaxed);
-                ds.fetch_add(poison, Ordering::Relaxed);
+                td.dead_lettered(poison);
             },
         );
         let producer = std::thread::spawn(move || {
@@ -942,12 +1062,7 @@ mod panic_safety_tests {
         producer.join().unwrap();
         pool.wait_stopping();
 
-        let ok = ok.load(Ordering::Relaxed);
-        let dl = dl_count.load(Ordering::Relaxed);
-        assert_eq!(ok + dl, N, "lost or duplicated items");
-        assert_eq!(dl, POISON);
-        let expected_sum: u64 = (1..=N).filter(|v| v % 7 == 0).sum();
-        assert_eq!(dl_sum.load(Ordering::Relaxed), expected_sum);
+        tester.assert_exactly_once(N, |v| v % 7 == 0);
     }
 
     /// A panicking dead letter sink must not kill the worker.
@@ -988,26 +1103,24 @@ mod panic_safety_tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let (tx, rx) = round_robin::<u64, CAP>(2);
-            let ok = Arc::new(AtomicU64::new(0));
-            let dl_count = Arc::new(AtomicU64::new(0));
-            let c = ok.clone();
-            let dc = dl_count.clone();
+            let tester = TesterPoison::new(N);
+            let (tp, td) = (tester.clone(), tester.clone());
             let pool = async_pool_slot(
                 tests::TokioRuntime,
                 instance::Config::new(2, 2),
                 rx.into_receivers(),
                 handler::PerItem(move |v: &u64| {
-                    let c = c.clone();
+                    let tp = tp.clone();
                     let v = *v;
                     async move {
                         if v % 7 == 0 {
                             panic!("babah on {v}");
                         }
-                        c.fetch_add(1, Ordering::Relaxed);
+                        tp.processed(v);
                     }
                 }),
-                move |_poison: u64, _panic_info| {
-                    dc.fetch_add(1, Ordering::Relaxed);
+                move |poison: u64, _panic_info| {
+                    td.dead_lettered(poison);
                 },
             );
             let sender = tokio::task::spawn(async move {
@@ -1019,8 +1132,7 @@ mod panic_safety_tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             let panics = pool.handler_panics();
             pool.wait_stopping().await;
-            assert_eq!(ok.load(Ordering::Relaxed), N - POISON);
-            assert_eq!(dl_count.load(Ordering::Relaxed), POISON);
+            tester.assert_exactly_once(N, |v| v % 7 == 0);
             assert!(panics >= POISON);
         });
     }
@@ -1029,13 +1141,9 @@ mod panic_safety_tests {
     /// land in dl with the exact per key sum proves dead lettering does not cross contaminate shards.
     #[test]
     fn sync_key_slot_zero_loss() {
-        use crate::channel::mpmc::shard_key;
         let (tx, rx) = shard_key::<u64, CAP>(4);
-        let ok = Arc::new(AtomicU64::new(0));
-        let dl_count = Arc::new(AtomicU64::new(0));
-        let dl_sum = Arc::new(AtomicU64::new(0));
-        let c = ok.clone();
-        let (dc, ds) = (dl_count.clone(), dl_sum.clone());
+        let tester = TesterPoison::new(N);
+        let (tp, td) = (tester.clone(), tester.clone());
         let pool = sync_pool_slot(
             instance::Config::new(2, 4),
             rx.into_receivers(),
@@ -1043,11 +1151,10 @@ mod panic_safety_tests {
                 if *v % 7 == 0 {
                     panic!("babah on {v}");
                 }
-                c.fetch_add(1, Ordering::Relaxed);
+                tp.processed(*v);
             }),
             move |poison: u64, _panic_info| {
-                dc.fetch_add(1, Ordering::Relaxed);
-                ds.fetch_add(poison, Ordering::Relaxed);
+                td.dead_lettered(poison);
             },
         );
         const KEYS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
@@ -1060,44 +1167,34 @@ mod panic_safety_tests {
         producer.join().unwrap();
         pool.wait_stopping();
 
-        let ok = ok.load(Ordering::Relaxed);
-        let dl = dl_count.load(Ordering::Relaxed);
-        assert_eq!(ok + dl, N, "lost or duplicated items (keyed)");
-        assert_eq!(dl, POISON);
-        let expected_sum: u64 = (1..=N).filter(|v| v % 7 == 0).sum();
-        assert_eq!(dl_sum.load(Ordering::Relaxed), expected_sum);
+        tester.assert_exactly_once(N, |v| v % 7 == 0);
     }
 
     /// Keyed routing + async slot pool: zero loss, panics counted.
-    //#[cfg(not(miri))]
+    #[cfg(not(miri))]
     #[test]
     fn async_key_slot_zero_loss() {
-        use crate::channel::mpmc::shard_key;
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let (tx, rx) = shard_key::<u64, CAP>(4);
-            let ok = Arc::new(AtomicU64::new(0));
-            let dl_count = Arc::new(AtomicU64::new(0));
-            let dl_sum = Arc::new(AtomicU64::new(0));
-            let c = ok.clone();
-            let (dc, ds) = (dl_count.clone(), dl_sum.clone());
+            let tester = TesterPoison::new(N);
+            let (tp, td) = (tester.clone(), tester.clone());
             let pool = async_pool_slot(
                 tests::TokioRuntime,
                 instance::Config::new(2, 4),
                 rx.into_receivers(),
                 handler::PerItem(move |v: &u64| {
-                    let c = c.clone();
+                    let tp = tp.clone();
                     let v = *v;
                     async move {
                         if v % 7 == 0 {
                             panic!("babah on {v}");
                         }
-                        c.fetch_add(1, Ordering::Relaxed);
+                        tp.processed(v);
                     }
                 }),
                 move |poison: u64, _panic_info| {
-                    dc.fetch_add(1, Ordering::Relaxed);
-                    ds.fetch_add(poison, Ordering::Relaxed);
+                    td.dead_lettered(poison);
                 },
             );
             const KEYS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
@@ -1112,12 +1209,7 @@ mod panic_safety_tests {
             let panics = pool.handler_panics();
             pool.wait_stopping().await;
 
-            let ok = ok.load(Ordering::Relaxed);
-            let dl = dl_count.load(Ordering::Relaxed);
-            assert_eq!(ok + dl, N);
-            assert_eq!(dl, POISON);
-            let expected_sum: u64 = (1..=N).filter(|v| v % 7 == 0).sum();
-            assert_eq!(dl_sum.load(Ordering::Relaxed), expected_sum);
+            tester.assert_exactly_once(N, |v| v % 7 == 0);
             assert!(panics >= POISON);
         });
     }
@@ -1126,14 +1218,10 @@ mod panic_safety_tests {
     /// Values are tagged by symbol so dl contents are verifiable per group.
     #[test]
     fn sync_group_slot_zero_loss() {
-        use crate::channel::mpmc::{ShardGroupCase, shard_group};
         let groups: &[&[&str]] = &[&["AAA", "BBB"], &["CCC", "DDD"]];
         let (tx, rx) = shard_group::<u64, CAP>(ShardGroupCase::Groups { groups });
-        let ok = Arc::new(AtomicU64::new(0));
-        let dl_count = Arc::new(AtomicU64::new(0));
-        let dl_sum = Arc::new(AtomicU64::new(0));
-        let c = ok.clone();
-        let (dc, ds) = (dl_count.clone(), dl_sum.clone());
+        let tester = TesterPoison::new(N);
+        let (tp, td) = (tester.clone(), tester.clone());
         let pool = sync_pool_slot(
             instance::Config::new(2, 2),
             rx.into_receivers(),
@@ -1141,11 +1229,10 @@ mod panic_safety_tests {
                 if *v % 7 == 0 {
                     panic!("babah on {v}");
                 }
-                c.fetch_add(1, Ordering::Relaxed);
+                tp.processed(*v);
             }),
             move |poison: u64, _panic_info| {
-                dc.fetch_add(1, Ordering::Relaxed);
-                ds.fetch_add(poison, Ordering::Relaxed);
+                td.dead_lettered(poison);
             },
         );
         const SYMS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
@@ -1159,45 +1246,35 @@ mod panic_safety_tests {
         producer.join().unwrap();
         pool.wait_stopping();
 
-        let ok = ok.load(Ordering::Relaxed);
-        let dl = dl_count.load(Ordering::Relaxed);
-        assert_eq!(ok + dl, N, "lost or duplicated items (grouped)");
-        assert_eq!(dl, POISON);
-        let expected_sum: u64 = (1..=N).filter(|v| v % 7 == 0).sum();
-        assert_eq!(dl_sum.load(Ordering::Relaxed), expected_sum);
+        tester.assert_exactly_once(N, |v| v % 7 == 0);
     }
 
     /// Group routing + async slot pool: zero loss, panics counted.
     #[cfg(not(miri))]
     #[test]
     fn async_group_slot_zero_loss() {
-        use crate::channel::mpmc::{ShardGroupCase, shard_group};
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let groups: &[&[&str]] = &[&["AAA", "BBB"], &["CCC", "DDD"]];
             let (tx, rx) = shard_group::<u64, CAP>(ShardGroupCase::Groups { groups });
-            let ok = Arc::new(AtomicU64::new(0));
-            let dl_count = Arc::new(AtomicU64::new(0));
-            let dl_sum = Arc::new(AtomicU64::new(0));
-            let c = ok.clone();
-            let (dc, ds) = (dl_count.clone(), dl_sum.clone());
+            let tester = TesterPoison::new(N);
+            let (tp, td) = (tester.clone(), tester.clone());
             let pool = async_pool_slot(
                 tests::TokioRuntime,
                 instance::Config::new(2, 2),
                 rx.into_receivers(),
                 handler::PerItem(move |v: &u64| {
-                    let c = c.clone();
+                    let tp = tp.clone();
                     let v = *v;
                     async move {
                         if v % 7 == 0 {
                             panic!("babah on {v}");
                         }
-                        c.fetch_add(1, Ordering::Relaxed);
+                        tp.processed(v);
                     }
                 }),
                 move |poison: u64, _panic_info| {
-                    dc.fetch_add(1, Ordering::Relaxed);
-                    ds.fetch_add(poison, Ordering::Relaxed);
+                    td.dead_lettered(poison);
                 },
             );
             const SYMS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
@@ -1213,12 +1290,7 @@ mod panic_safety_tests {
             let panics = pool.handler_panics();
             pool.wait_stopping().await;
 
-            let ok = ok.load(Ordering::Relaxed);
-            let dl = dl_count.load(Ordering::Relaxed);
-            assert_eq!(ok + dl, N);
-            assert_eq!(dl, POISON);
-            let expected_sum: u64 = (1..=N).filter(|v| v % 7 == 0).sum();
-            assert_eq!(dl_sum.load(Ordering::Relaxed), expected_sum);
+            tester.assert_exactly_once(N, |v| v % 7 == 0);
             assert!(panics >= POISON);
         });
     }

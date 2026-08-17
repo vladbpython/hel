@@ -268,3 +268,46 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Drop
         }
     }
 }
+
+#[cfg(test)]
+mod recv_any_cancel_tests {
+    use crate::{channel::mpmc::round_robin, internal_channel::traits::InnerChannel};
+    use std::{
+        future::Future,
+        task::{Context, Waker},
+    };
+    const CAP: usize = 16;
+
+    // Poll a fresh `recv_any()` once with a no-op waker so it parks and
+    // registers an async slot on every shard, then drop it cancellation.
+    fn park_then_cancel_recv_any(rx: &mut super::ShardReceiver<u64, CAP>) {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut fut = std::pin::pin!(rx.recv_any());
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "recv_any on empty shards must park, not resolve"
+        );
+        // `fut` drops here -> RecvAnyFuture::Drop runs cancel_async_slot on every shard.
+    }
+
+    #[test]
+    fn recv_any_cancel_does_not_leak_async_slots() {
+        let (_tx, mut rx) = round_robin::<u64, CAP>(4);
+
+        for _ in 0..100 {
+            park_then_cancel_recv_any(&mut rx);
+        }
+
+        for i in 0..rx.receivers.len() {
+            let queued = rx.receivers[i]
+                .inner_ref()
+                .receiver_waiters()
+                .async_count_seqcst();
+            assert!(
+                queued <= 1,
+                "shard {i} leaked {queued} cancelled recv_any slots, expected <= 1"
+            );
+        }
+    }
+}

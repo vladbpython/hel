@@ -3,9 +3,10 @@ use core::ops::DerefMut;
 // atomics + fence
 
 #[cfg(loom)]
-pub(crate) use loom::sync::atomic::{AtomicBool, AtomicUsize, fence};
+pub(crate) use loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, fence};
 #[cfg(not(loom))]
-pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, fence};
+#[allow(unused_imports)]
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, fence};
 
 pub(crate) use std::sync::atomic::Ordering;
 

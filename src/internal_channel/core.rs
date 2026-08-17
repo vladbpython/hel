@@ -259,18 +259,20 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
         let mut tail = self.tail.load(Ordering::Relaxed);
         let (pos, k) = loop {
             let head = self.head.load(Ordering::Acquire);
-            let used = tail.wrapping_sub(head);
             // The tail snapshot could have gone bad: another producer moved tail,
             // the consumer sent head FOR our snapshot → used "negative"
             // (wrap in huge usize). Without guard CAP used panics in debug
             // (caught by Miri) and gives garbage free in release. Let's re-read it.
-            if used > CAP {
+            if head > tail {
                 tail = self.tail.load(Ordering::Relaxed);
                 continue;
             }
-            if used == CAP {
+
+            let used = tail.wrapping_sub(head);
+            if used >= CAP {
                 return 0;
             }
+
             let k = buf.len().min(CAP - used);
             match self.tail.compare_exchange_weak(
                 tail,
@@ -494,12 +496,11 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
         let (pos, k) = loop {
             let head = self.head.load(Ordering::Acquire);
             // Two distinct cases yield used >= CAP, and they need opposite handling:
-            // 1. Stale snapshot: another producer moved tail, the consumer moved
-            // head PAST our snapshot -> head > tail -> wrapping_sub wraps to a huge usize. Re reading tail fixes it.
-            // 2. Over reservation: push_fetch_add does an unconditional fetch_add, so N senders blocked on a full channel
-            // push tail up to head + CAP + N. Here tail > head and rereading tail does NOT help,
-            // it stays large until consumers advance head.
-            // Spinning would turn try_send_batch into a hot loop; return instead.
+            // 1. Stale snapshot: another producer moved tail, consumer moved head past our snapshot -> head > tail -> wrapping_sub wraps to a huge usize.
+            // Re reading tail fixes it.
+            // 2. Over reservation: push_fetch_add does an unconditional fetch_add, so n senders blocked on a full channel push tail up to head + CAP + n.
+            // Here tail > head and rereading tail does not help, it stays large until consumers advance head.
+            // Spinning would turn try_send_batch into a hot loop, return instead.
             if head > tail {
                 tail = self.tail.load(Ordering::Relaxed);
                 continue;
@@ -714,7 +715,7 @@ unsafe impl<T: Send, const CAP: usize> Sync for SingleInner<T, CAP> {}
 #[cfg(test)]
 mod core_init_tests {
     use super::*;
-    use std::sync::atomic::Ordering;
+    use std::{sync::atomic::Ordering, time::Duration};
 
     // Basic: fields are correct
     #[test]
@@ -895,5 +896,79 @@ mod core_init_tests {
             );
         }
         drop(inner); // Drop: reclaim a,b; skip both abort holes
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn seq_push_batch_overreserved_does_not_spin() {
+        let inner: Arc<SeqInner<u64, 2>> = SeqInner::new();
+        inner.push_fetch_add(1).unwrap();
+        inner.push_fetch_add(2).unwrap(); // full -> tail = head + CAP = 2
+        // a blocked fetch_add sender would have bumped tail past head + CAP:
+        inner.tail.fetch_add(1, Ordering::Relaxed); // tail = 3 = head(0) + CAP(2) + 1
+        let done = Arc::new(AtomicBool::new(false));
+        let inner2 = inner.clone();
+        let done2 = done.clone();
+        let h = thread::spawn(move || {
+            let mut buf = vec![9u64];
+            let n = inner2.push_batch(&mut buf);
+            done2.store(true, Ordering::Release);
+            n
+        });
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            done.load(Ordering::Acquire),
+            "SeqInner::push_batch busy spins on over reservation instead of returning"
+        );
+        assert_eq!(
+            h.join().unwrap(),
+            0,
+            "over reserved channel must accept nothing"
+        );
+    }
+
+    #[test]
+    fn miri_drops() {
+        #[derive(Debug)]
+        struct Tracked(Arc<AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        let inner: Arc<SeqInner<Tracked, 2>> = SeqInner::new();
+        inner.push_fetch_add(Tracked(drops.clone())).unwrap(); // a
+        inner.push_fetch_add(Tracked(drops.clone())).unwrap(); // b -> full
+        let mut blocked = Vec::new();
+        for _ in 0..2 {
+            let i = inner.clone();
+            let d = drops.clone();
+            // c and d: fetch_add reserves a slot past head + CAP, then aborts.
+            blocked.push(thread::spawn(move || i.push_fetch_add(Tracked(d))));
+        }
+        thread::yield_now();
+        inner.rx_close();
+        inner.notify_all_on_rx_close();
+        for b in blocked {
+            // the aborted push returns its value (Err), dropped here, not by the ring.
+            assert!(
+                b.join().unwrap().is_err(),
+                "rx closed push must return the value"
+            );
+        }
+        // a and b are still in the ring, only the two returned values dropped.
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            2,
+            "returned aborted values must drop exactly once"
+        );
+        drop(inner); // ring Drop reclaims a, b and must SKIP both abort holes.
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            4,
+            "ring must drop exactly a and b, skipping the abort holes"
+        );
     }
 }

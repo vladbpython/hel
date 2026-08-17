@@ -27,6 +27,10 @@ impl SyncPool {
         self.state.active()
     }
 
+    pub fn max_active(&self) -> usize {
+        self.state.max_active()
+    }
+
     pub fn get_signal_stop(&self) -> Stop {
         Stop::new(self.state.clone())
     }
@@ -68,6 +72,10 @@ impl<AR: AsyncRuntime> AsyncPool<AR> {
 
     pub fn active(&self) -> usize {
         self.state.active()
+    }
+
+    pub fn max_active(&self) -> usize {
+        self.state.max_active()
     }
 
     pub fn get_signal_stop(&self) -> Stop {

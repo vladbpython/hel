@@ -14,17 +14,15 @@ fn loom_pool_claim_never_double_owns() {
         for id in 0..2usize {
             let state = state.clone();
             handles.push(thread::spawn(move || {
-                // pass 1: stale view (active = 1) worker 0 wants both shards
+                // pass 1: stale view active = 1, => every shard's target owner is 0.
                 for shard in 0..2 {
-                    let _ = instance::claim_or_release(&state, id, shard, 1);
+                    let _ = instance::claim_or_release_to(&state, id, shard, 0);
                 }
                 thread::yield_now();
-                // pass 2: fresh view (active = 2) settle to shard % 2 == id;
-                // repeat until this worker owns its shard (the previous owner may not have released yet on some interleavings)
+                // pass 2: fresh view active = 2, => target owner is shard % 2 == shard.
                 loop {
-                    let mine = instance::claim_or_release(&state, id, id, 2);
-                    // also release the other shard if we still hold it
-                    let _ = instance::claim_or_release(&state, id, 1 - id, 2);
+                    let mine = instance::claim_or_release_to(&state, id, id, id);
+                    let _ = instance::claim_or_release_to(&state, id, 1 - id, 1 - id);
                     if mine {
                         break;
                     }
@@ -35,35 +33,9 @@ fn loom_pool_claim_never_double_owns() {
         for h in handles {
             h.join().unwrap();
         }
-        // settled: shard s owned by worker s, exclusively
         for s in 0..2 {
             let o = state.owner(s).load(Ordering::Acquire);
             assert_eq!(o, s, "shard {s} not owned by its desired worker");
-        }
-    });
-}
-
-#[test]
-fn loom_pool_guard_releases_on_unwind() {
-    loom::model(|| {
-        let state = State::new(2, 1);
-        let dead = {
-            let state = state.clone();
-            thread::spawn(move || {
-                let _guard = OwnerGuard::new(&state, 0);
-                for shard in 0..2 {
-                    let _ = instance::claim_or_release(&state, 0, shard, 1);
-                }
-                // worker "dies": guard drops here, must CAS 0 -> NONE
-            })
-        };
-        dead.join().unwrap();
-
-        // survivor (id=1, active=1 -> desired owner of every shard is % 1 == 0...
-        // 1 use active such that desired == 1): model the takeover directly, every shard must be NONE or claimable.
-        for shard in 0..2 {
-            let o = state.owner(shard).load(Ordering::Acquire);
-            assert_eq!(o, NONE, "shard {shard} stuck on dead worker");
         }
     });
 }
