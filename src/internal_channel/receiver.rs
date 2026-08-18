@@ -4,6 +4,7 @@ use super::{
     sync::{AsyncSlot, SyncNode},
     traits::{InnerChannel, MultiConsumer, ReceiverOps},
 };
+use crate::shim::loom::{park, park_timeout, yield_now};
 use std::{
     future::Future,
     hint::spin_loop,
@@ -11,7 +12,6 @@ use std::{
     pin::Pin,
     sync::{Arc, atomic::Ordering},
     task::{Context, Poll},
-    thread::{park, park_timeout, yield_now},
     time::{Duration, Instant},
 };
 
@@ -55,8 +55,8 @@ pub fn recv_impl<T, const CAP: usize>(
         if inner.yield_before_park() {
             // Adaptive spin before parking symmetry to SPIN_COUNT on
             // sender's side. Without it, consumer in the streaming pattern
-            // parks on EVERY message: futex wait+wake ~1-3 µs per
-            // circle → collapse on Linux (17-24% high-severe outliers, rr worse than key).
+            // parks on EVERY message: futex wait+wake ~1-3 \u00b5s per
+            // circle \u2192 collapse on Linux (17-24% high-severe outliers, rr worse than key).
             // Spin holds the consumer hot while the producer adds the next element.
             for _ in 0..SPIN_COUNT {
                 spin_loop();
@@ -376,7 +376,7 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
         }
     }
 
-    /// Approximate number of items currently in this shard's queue (tail − head).
+    /// Approximate number of items currently in this shard's queue (tail \u2212 head).
     /// A concurrent snapshot may be off by a few under active producers/consumers.
     /// Cheap (two relaxed atomic loads).
     #[inline]
@@ -481,27 +481,27 @@ impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
         Self { inner }
     }
 
-    pub fn try_recv(&self) -> Result<T, TryRecvError> {
+    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         try_recv(self.inner.as_ref())
     }
 
-    pub fn recv(&self) -> Result<T, RecvError> {
+    pub fn recv(&mut self) -> Result<T, RecvError> {
         recv_impl(self.inner.as_ref(), None)
     }
 
-    pub fn recv_timeout(&self, d: Duration) -> Result<T, RecvError> {
+    pub fn recv_timeout(&mut self, d: Duration) -> Result<T, RecvError> {
         recv_impl(self.inner.as_ref(), Some(Instant::now() + d))
     }
 
-    pub fn recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
+    pub fn recv_batch(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         recv_batch(self.inner.as_ref(), buf, max, None)
     }
 
-    pub fn recv_batch_timeout(&self, buf: &mut Vec<T>, max: usize, d: Duration) -> (usize, bool) {
+    pub fn recv_batch_timeout(&mut self, buf: &mut Vec<T>, max: usize, d: Duration) -> (usize, bool) {
         recv_batch(self.inner.as_ref(), buf, max, Some(Instant::now() + d))
     }
 
-    pub fn recv_async(&self) -> SingleRecvFuture<'_, T, CAP> {
+    pub fn recv_async(&mut self) -> SingleRecvFuture<'_, T, CAP> {
         GenericRecvFuture {
             inner: &self.inner,
             slot: None,
@@ -509,7 +509,7 @@ impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
         }
     }
 
-    pub async fn recv_batch_async(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
+    pub async fn recv_batch_async(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         if max == 0 {
             return (0, false);
         }
@@ -521,11 +521,11 @@ impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
         (1 + n, dc)
     }
 
-    pub fn iter(&self) -> SingleIter<'_, T, CAP> {
+    pub fn iter(&mut self) -> SingleIter<'_, T, CAP> {
         SingleIter { r: self }
     }
 
-    pub fn stream(&self) -> SignleRecvStream<'_, T, CAP> {
+    pub fn stream(&mut self) -> SignleRecvStream<'_, T, CAP> {
         GenericRecvStream {
             inner: &self.inner,
             slot: None,
@@ -544,7 +544,7 @@ impl<T, const CAP: usize> Drop for SingleReceiver<T, CAP> {
 // SPSC Iterators
 
 pub struct SingleIter<'a, T, const CAP: usize> {
-    r: &'a SingleReceiver<T, CAP>,
+    r: &'a mut SingleReceiver<T, CAP>,
 }
 impl<T: Send + 'static, const CAP: usize> Iterator for SingleIter<'_, T, CAP> {
     type Item = T;
@@ -571,7 +571,9 @@ impl<T: Send + 'static, const CAP: usize> IntoIterator for SingleReceiver<T, CAP
     }
 }
 
-impl<'a, T: Send + 'static, const CAP: usize> IntoIterator for &'a SingleReceiver<T, CAP> {
+// Iterating consumes messages, so it borrows the SPSC receiver exclusively:
+// the single consumer invariant is the same one `&mut self` guards on the recv methods.
+impl<'a, T: Send + 'static, const CAP: usize> IntoIterator for &'a mut SingleReceiver<T, CAP> {
     type Item = T;
     type IntoIter = SingleIter<'a, T, CAP>;
     fn into_iter(self) -> SingleIter<'a, T, CAP> {

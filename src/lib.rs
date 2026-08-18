@@ -2,7 +2,7 @@ pub(crate) mod cache;
 pub mod helper;
 pub(crate) mod internal_channel;
 pub mod macros;
-#[cfg(feature = "pool")]
+//[cfg(feature = "pool")]
 pub mod pool;
 pub(crate) mod shard;
 pub(crate) mod shim;

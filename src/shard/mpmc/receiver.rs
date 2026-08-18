@@ -128,7 +128,7 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardReceiver
         let mut total = 0usize;
         for i in 0..n {
             let idx = (start + i) % n;
-            let (count, _) = self.receivers[idx].recv_batch(buf, max_per_shard);
+            let (count, _) = self.receivers[idx].try_recv_batch(buf, max_per_shard);
             total += count;
         }
         if total > 0 {
@@ -270,11 +270,13 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Drop
 }
 
 #[cfg(test)]
-mod recv_any_cancel_tests {
+mod recv_any_tests {
     use crate::{channel::mpmc::round_robin, internal_channel::traits::InnerChannel};
     use std::{
         future::Future,
+        sync::{Arc, atomic::{AtomicBool,Ordering}},
         task::{Context, Waker},
+        time::Duration,
     };
     const CAP: usize = 16;
 
@@ -309,5 +311,34 @@ mod recv_any_cancel_tests {
                 "shard {i} leaked {queued} cancelled recv_any slots, expected <= 1"
             );
         }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn try_recv_batch_any_does_not_block_on_an_empty_shard() {
+        let (tx, rx) = round_robin::<u64, 16>(2);
+        tx.try_send(1).unwrap(); // шард 0
+        tx.try_send(2).unwrap(); // шард 1
+        let mut srx = rx;
+        // Empty shard 0 directly, keeping its sender alive.
+        let _ = srx.receiver(0).try_recv().unwrap();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let d2 = done.clone();
+        let h = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let n = srx.try_recv_batch_any(&mut buf, 8);
+            d2.store(true, Ordering::Release);
+            (n, buf)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let finished = done.load(Ordering::Acquire);
+        if !finished {
+            drop(tx); // unblock the hung thread so the test can fail cleanly
+            let _ = h.join();
+            panic!("try_recv_batch_any blocked on a connected empty shard");
+        }
+        let (n, buf) = h.join().unwrap();
+        assert_eq!((n, buf), (1, vec![2]), "must drain exactly the full shard");
     }
 }

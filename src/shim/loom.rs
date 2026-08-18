@@ -86,3 +86,31 @@ pub(crate) fn yield_now() {
 pub(crate) fn yield_now() {
     std::thread::yield_now();
 }
+
+#[cfg(loom)]
+pub(crate) use loom::thread::{Thread, current as thread_current, park};
+#[cfg(not(loom))]
+pub(crate) use std::thread::{Thread, current as thread_current, park, park_timeout};
+#[cfg(loom)]
+pub(crate) fn park_timeout(_d: std::time::Duration) {
+    park();
+}
+
+#[cfg(loom)]
+pub(crate) use loom::cell::UnsafeCell;
+ 
+#[cfg(not(loom))]
+#[derive(Debug)]
+pub(crate) struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
+ 
+#[cfg(not(loom))]
+impl<T> UnsafeCell<T> {
+    #[inline(always)]
+    pub(crate) const fn new(data: T) -> UnsafeCell<T> {
+        UnsafeCell(std::cell::UnsafeCell::new(data))
+    }
+    #[inline(always)]
+    pub(crate) fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+        f(self.0.get())
+    }
+}

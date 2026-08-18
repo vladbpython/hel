@@ -237,13 +237,13 @@ mod tests {
 
     #[test]
     fn single_try_recv_empty() {
-        let (_tx, rx) = scsp_bounded::<u64, 8>(); // _tx is alive -the channel is open
+        let (mut _tx, mut rx) = scsp_bounded::<u64, 8>(); // _tx is alive -the channel is open
         assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 
     #[test]
     fn single_recv_basic_1p1c() {
-        let (tx, rx) = scsp_bounded::<u64, 8>();
+        let (mut tx, mut rx) = scsp_bounded::<u64, 8>();
         let p = thread::spawn(move || {
             for i in 0..4u64 {
                 tx.send(i).unwrap();
@@ -259,14 +259,14 @@ mod tests {
 
     #[test]
     fn single_recv_disconnected() {
-        let (tx, rx) = scsp_bounded::<u64, 8>();
+        let (tx, mut rx) = scsp_bounded::<u64, 8>();
         drop(tx);
         assert_eq!(rx.recv(), Err(RecvError::Disconnected));
     }
 
     #[test]
     fn single_drop_receiver_signals_sender() {
-        let (tx, rx) = scsp_bounded::<u64, 8>();
+        let (mut tx, rx) = scsp_bounded::<u64, 8>();
         drop(rx);
         assert!(tx.try_send(1).is_err());
     }
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn single_ordering_strict() {
         const N: u64 = 8;
-        let (tx, rx) = scsp_bounded::<u64, 16>();
+        let (mut tx, mut rx) = scsp_bounded::<u64, 16>();
         let p = thread::spawn(move || {
             for i in 0..N {
                 tx.send(i).unwrap();
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn miri_spsc_push_batch_concurrent_with_pop() {
         const N: u64 = 16;
-        let (tx, rx) = scsp_bounded::<u64, 4>(); // CAP=4 — постоянный wrap-around
+        let (mut tx, mut rx) = scsp_bounded::<u64, 4>(); // CAP=4 — постоянный wrap-around
         let c: thread::JoinHandle<Vec<_>> = thread::spawn(move || {
             let mut got = Vec::new();
             loop {
@@ -411,7 +411,7 @@ mod tests {
 
     #[test]
     fn miri_drop_undelivered_spsc() {
-        let (tx, rx) = scsp_bounded::<String, 4>();
+        let (mut tx, rx) = scsp_bounded::<String, 4>();
         for i in 0..4 {
             tx.try_send(format!("payload {i}")).unwrap();
         }

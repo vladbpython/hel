@@ -2,19 +2,22 @@ use super::{
     sync::{Slot, SyncList},
     traits::{InnerChannel, MultiConsumer, MultiProducer},
 };
-use crate::cache::Padding;
+use crate::{
+    cache::Padding,
+    shim,
+};
+use shim::loom::{
+    AtomicBool, AtomicUsize, Ordering
+};
+
 #[cfg(not(loom))]
 use std::hint;
 #[cfg(not(loom))]
 use std::time;
-
 use std::{
     mem::MaybeUninit,
     ptr::addr_of_mut,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
+    sync::Arc,
     thread,
 };
 
@@ -41,7 +44,7 @@ fn notify_one_waiter(list: &SyncList) {
     // read count==0 before its store becomes visible to the consumer,
     // consumer reread the old seq and park. Lost wakeup,
     // caught Miri (weak memory) on a spinning producer with a full channel.
-    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    shim::loom::fence(shim::loom::Ordering::SeqCst);
     let a = list.async_count_seqcst();
     let b = list.blocking_count_acquire();
     if a > 0 || b > 0 {
@@ -123,17 +126,17 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
         loop {
             let slot = &self.slots[tail & mask];
             let seq = slot.sequence.load(Ordering::Acquire);
-            let diff = seq as isize - tail as isize;
+            let diff = seq.wrapping_sub(tail) as isize;
             if diff == 0 {
                 match self.tail.compare_exchange_weak(
                     tail,
-                    tail + 1,
+                    tail.wrapping_add(1),
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        unsafe { (*slot.data.get()).write(value) };
-                        slot.sequence.store(tail + 1, Ordering::Release);
+                        slot.data.with_mut(|p| unsafe { (*p).write(value) });
+                        slot.sequence.store(tail.wrapping_add(1), Ordering::Release);
                         return Ok(());
                     }
                     Err(t) => tail = t,
@@ -182,7 +185,7 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
             #[cfg(loom)]
             {
                 let _ = waits;
-                crate::shim::loom::yield_now(); // every wait step is a loom branch
+                shim::loom::yield_now(); // every wait step is a loom branch
             }
             #[cfg(not(loom))]
             if waits < SENDER_SPIN_COUNT {
@@ -193,8 +196,8 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
                 thread::sleep(SLEEP);
             }
         }
-        unsafe { (*slot.data.get()).write(value) };
-        slot.sequence.store(pos + 1, Ordering::Release);
+        slot.data.with_mut(|p| unsafe { (*p).write(value) });
+        slot.sequence.store(pos.wrapping_add(1), Ordering::Release);
         Ok(())
     }
 
@@ -205,17 +208,17 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
         loop {
             let slot = &self.slots[head & mask];
             let seq = slot.sequence.load(Ordering::Acquire);
-            let diff = seq as isize - (head + 1) as isize;
-            let next_seq = head + CAP;
+            let diff = seq.wrapping_sub(head.wrapping_add(1)) as isize;
+            let next_seq = head.wrapping_add(CAP);
             if diff == 0 {
                 match self.head.compare_exchange_weak(
                     head,
-                    head + 1,
+                    head.wrapping_add(1),
                     Ordering::AcqRel,
                     Ordering::Relaxed,
                 ) {
                     Ok(_) => {
-                        let v = unsafe { (*slot.data.get()).assume_init_read() };
+                        let v = slot.data.with_mut(|p| unsafe { (*p).assume_init_read() });
                         slot.sequence.store(next_seq, Ordering::Release);
                         return Some(v);
                     }
@@ -231,9 +234,9 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
 
     #[inline]
     pub fn queued(&self) -> usize {
-        let tail = self.tail.load(Ordering::Acquire);
         let head = self.head.load(Ordering::Acquire);
-        tail.saturating_sub(head)
+        let tail = self.tail.load(Ordering::Acquire);
+        tail.wrapping_sub(head)
     }
 }
 
@@ -263,7 +266,8 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
             // the consumer sent head FOR our snapshot → used "negative"
             // (wrap in huge usize). Without guard CAP used panics in debug
             // (caught by Miri) and gives garbage free in release. Let's re-read it.
-            if head > tail {
+            let dist = tail.wrapping_sub(head) as isize;
+            if dist < 0 {
                 tail = self.tail.load(Ordering::Relaxed);
                 continue;
             }
@@ -276,7 +280,7 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
             let k = buf.len().min(CAP - used);
             match self.tail.compare_exchange_weak(
                 tail,
-                tail + k,
+                tail.wrapping_add(k),
                 Ordering::AcqRel,
                 Ordering::Relaxed,
             ) {
@@ -285,7 +289,7 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
             }
         };
         for i in 0..k {
-            let p = pos + i;
+            let p = pos.wrapping_add(i);
             let slot = &self.slots[p & mask];
             while slot.sequence.load(Ordering::Acquire) != p {
                 if self.rx_closed.load(Ordering::Acquire) {
@@ -296,14 +300,14 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
                 // Window “CAS head → seq.store” for the consumer. yield_now, as in
                 // push_fetch_add: gives the scheduler (and Miri) a switch point;
                 // pure spin_loop here livelock under Miri with preemption rate=0.
-                thread::yield_now();
+                shim::loom::yield_now();
             }
         }
         for (i, value) in buf.drain(..k).enumerate() {
-            let p = pos + i;
+            let p = pos.wrapping_add(i);
             let slot = &self.slots[p & mask];
-            unsafe { (*slot.data.get()).write(value) };
-            slot.sequence.store(p + 1, Ordering::Release);
+            slot.data.with_mut(|p| unsafe { (*p).write(value) });
+            slot.sequence.store(p.wrapping_add(1), Ordering::Release);
         }
         k
     }
@@ -396,10 +400,12 @@ impl<T, const CAP: usize> Drop for SeqInner<T, CAP> {
         let mask = CAP - 1;
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
-        for pos in head..tail {
+        let count = tail.wrapping_sub(head);
+        for n in 0..count {
+            let pos = head.wrapping_add(n);
             let slot = &self.slots[pos & mask];
-            if slot.sequence.load(Ordering::Relaxed) == pos + 1 {
-                unsafe { (*slot.data.get()).assume_init_drop() };
+            if slot.sequence.load(Ordering::Relaxed) == pos.wrapping_add(1) {
+                slot.data.with_mut(|p| unsafe { (*p).assume_init_drop() });
             }
         }
     }
@@ -451,10 +457,10 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
         let mask = CAP - 1;
         let tail = self.tail.load(Ordering::Relaxed);
         let slot = &self.slots[tail & mask];
-        if slot.sequence.load(Ordering::Acquire) as isize - tail as isize == 0 {
-            unsafe { (*slot.data.get()).write(v) };
-            slot.sequence.store(tail + 1, Ordering::Release);
-            self.tail.store(tail + 1, Ordering::Relaxed);
+        if slot.sequence.load(Ordering::Acquire) == tail {
+            slot.data.with_mut(|p| unsafe { (*p).write(v) });
+            slot.sequence.store(tail.wrapping_add(1), Ordering::Release);
+            self.tail.store(tail.wrapping_add(1), Ordering::Relaxed);
             Ok(())
         } else {
             Err(v)
@@ -466,11 +472,11 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
         let mask = CAP - 1;
         let head = self.head.load(Ordering::Relaxed);
         let slot = &self.slots[head & mask];
-        let next_seq = head + CAP;
-        if slot.sequence.load(Ordering::Acquire) as isize - (head + 1) as isize == 0 {
-            let v = unsafe { (*slot.data.get()).assume_init_read() };
+        let next_seq = head.wrapping_add(CAP);
+        if slot.sequence.load(Ordering::Acquire) == head.wrapping_add(1) {
+            let v = slot.data.with_mut(|p| unsafe { (*p).assume_init_read() });
             slot.sequence.store(next_seq, Ordering::Release);
-            self.head.store(head + 1, Ordering::Relaxed);
+            self.head.store(head.wrapping_add(1), Ordering::Relaxed);
             Some(v)
         } else {
             None
@@ -492,36 +498,15 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
             return 0;
         }
         let mask = CAP - 1;
-        let mut tail = self.tail.load(Ordering::Relaxed);
-        let (pos, k) = loop {
-            let head = self.head.load(Ordering::Acquire);
-            // Two distinct cases yield used >= CAP, and they need opposite handling:
-            // 1. Stale snapshot: another producer moved tail, consumer moved head past our snapshot -> head > tail -> wrapping_sub wraps to a huge usize.
-            // Re reading tail fixes it.
-            // 2. Over reservation: push_fetch_add does an unconditional fetch_add, so n senders blocked on a full channel push tail up to head + CAP + n.
-            // Here tail > head and rereading tail does not help, it stays large until consumers advance head.
-            // Spinning would turn try_send_batch into a hot loop, return instead.
-            if head > tail {
-                tail = self.tail.load(Ordering::Relaxed);
-                continue;
-            }
-            let used = tail.wrapping_sub(head);
-            if used >= CAP {
-                return 0;
-            }
-            let k = buf.len().min(CAP - used);
-            match self.tail.compare_exchange_weak(
-                tail,
-                tail + k,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break (tail, k),
-                Err(t) => tail = t,
-            }
-        };
+        let pos = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        let used = pos.wrapping_sub(head);
+        if used >= CAP {
+            return 0;
+        }
+        let k = buf.len().min(CAP - used);
         for i in 0..k {
-            let p = pos + i;
+            let p = pos.wrapping_add(i);
             let slot = &self.slots[p & mask];
             while slot.sequence.load(Ordering::Acquire) != p {
                 if self.rx_closed.load(Ordering::Acquire) {
@@ -531,15 +516,16 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
                 }
                 // Window CAS head -> seq.store for the consumer. yield_now, as in
                 // push_fetch_add: gives the scheduler a switch point.
-                crate::shim::loom::yield_now();
+                shim::loom::yield_now();
             }
         }
         for (i, value) in buf.drain(..k).enumerate() {
-            let p = pos + i;
+            let p = pos.wrapping_add(i);
             let slot = &self.slots[p & mask];
-            unsafe { (*slot.data.get()).write(value) };
-            slot.sequence.store(p + 1, Ordering::Release);
+            slot.data.with_mut(|p| unsafe { (*p).write(value) });
+            slot.sequence.store(p.wrapping_add(1), Ordering::Release);
         }
+        self.tail.store(pos.wrapping_add(k), Ordering::Relaxed);
         k
     }
 
@@ -591,9 +577,9 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
 
     #[inline]
     pub fn queued(&self) -> usize {
-        let tail = self.tail.load(Ordering::Acquire);
         let head = self.head.load(Ordering::Acquire);
-        tail.saturating_sub(head)
+        let tail = self.tail.load(Ordering::Acquire);
+        tail.wrapping_sub(head)
     }
 }
 
@@ -700,10 +686,12 @@ impl<T, const CAP: usize> Drop for SingleInner<T, CAP> {
         let mask = CAP - 1;
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
-        for pos in head..tail {
+        let count = tail.wrapping_sub(head);
+        for n in 0..count {
+            let pos = head.wrapping_add(n);
             let slot = &self.slots[pos & mask];
-            if slot.sequence.load(Ordering::Relaxed) == pos + 1 {
-                unsafe { (*slot.data.get()).assume_init_drop() };
+            if slot.sequence.load(Ordering::Relaxed) == pos.wrapping_add(1) {
+                slot.data.with_mut(|p| unsafe { (*p).assume_init_drop() });
             }
         }
     }
@@ -715,7 +703,7 @@ unsafe impl<T: Send, const CAP: usize> Sync for SingleInner<T, CAP> {}
 #[cfg(test)]
 mod core_init_tests {
     use super::*;
-    use std::{sync::atomic::Ordering, time::Duration};
+    use std::{sync::atomic::Ordering, time::{Duration,Instant}};
 
     // Basic: fields are correct
     #[test]
@@ -970,5 +958,171 @@ mod core_init_tests {
             4,
             "ring must drop exactly a and b, skipping the abort holes"
         );
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn queued_never_reports_empty_while_busy() {
+        const CAP_GUARD: usize = 1 << 20; // far above CAP, far below a wrapped value
+        let inner: Arc<SeqInner<u64, 64>> = SeqInner::new();
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let (p, s) = (inner.clone(), stop.clone());
+        let prod = thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let _ = p.push(1);
+            }
+        });
+        let (c, s) = (inner.clone(), stop.clone());
+        let cons = thread::spawn(move || {
+            while !s.load(Ordering::Relaxed) {
+                let _ = c.pop();
+            }
+        });
+
+        // The channel is hammered from both sides, so it is essentially never empty,
+        // huge `queued()` would mean the subtraction underflowed.
+        let mut fake = 0u64;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(300) {
+            if inner.queued() > CAP_GUARD {
+                fake += 1;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        prod.join().unwrap();
+        cons.join().unwrap();
+        assert_eq!(fake, 0, "queued() underflowed and returned a wrapped value");
+    }
+}
+
+#[cfg(test)]
+mod core_wrap_tests {
+    use super::*;
+
+    fn warp_seq<T, const CAP: usize>(inner: &SeqInner<T, CAP>, start: usize) {
+        inner.head.store(start, Ordering::Relaxed);
+        inner.tail.store(start, Ordering::Relaxed);
+        for i in 0..CAP {
+            let pos = start.wrapping_add(i);
+            inner.slots[pos & (CAP - 1)].sequence.store(pos, Ordering::Relaxed);
+        }
+    }
+
+    fn warp_single<T, const CAP: usize>(inner: &SingleInner<T, CAP>, start: usize) {
+        inner.head.store(start, Ordering::Relaxed);
+        inner.tail.store(start, Ordering::Relaxed);
+        for i in 0..CAP {
+            let pos = start.wrapping_add(i);
+            inner.slots[pos & (CAP - 1)].sequence.store(pos, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn seq_fifo_across_wrap() {
+        let inner: Arc<SeqInner<u64, 4>> = SeqInner::new();
+        warp_seq(&inner, usize::MAX - 2);
+        let mut got = Vec::new();
+        for v in 1..=10u64 {
+            loop {
+                match inner.push(v) {
+                    Ok(()) => break,
+                    Err(_) => got.push(inner.pop().unwrap()),
+                }
+            }
+        }
+        while let Some(v) = inner.pop() {
+            got.push(v);
+        }
+        assert_eq!(got, (1..=10).collect::<Vec<u64>>(), "FIFO broken across the wrap");
+    }
+
+    #[test]
+    fn single_fifo_across_wrap() {
+        let inner: Arc<SingleInner<u64, 4>> = SingleInner::new();
+        warp_single(&inner, usize::MAX - 2);
+        let mut got = Vec::new();
+        for v in 1..=10u64 {
+            loop {
+                match inner.push(v) {
+                    Ok(()) => break,
+                    Err(_) => got.push(inner.pop().unwrap()),
+                }
+            }
+        }
+        while let Some(v) = inner.pop() {
+            got.push(v);
+        }
+        assert_eq!(got, (1..=10).collect::<Vec<u64>>(), "FIFO broken across the wrap");
+    }
+
+    #[test]
+    fn drop_reclaims_across_wrap() {
+        struct Tracked(Arc<AtomicUsize>);
+        impl Drop for Tracked {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let inner: Arc<SeqInner<Tracked, 2>> = SeqInner::new();
+            warp_seq(&inner, usize::MAX - 1);
+            assert!(inner.push(Tracked(drops.clone())).is_ok());
+            assert!(inner.push(Tracked(drops.clone())).is_ok()); // tail wraps to 1
+        }
+        assert_eq!(drops.load(Ordering::Relaxed), 2, "SeqInner leaked at the wrap");
+
+        let drops2 = Arc::new(AtomicUsize::new(0));
+        {
+            let inner: Arc<SingleInner<Tracked, 2>> = SingleInner::new();
+            warp_single(&inner, usize::MAX - 1);
+            assert!(inner.push(Tracked(drops2.clone())).is_ok());
+            assert!(inner.push(Tracked(drops2.clone())).is_ok());
+        }
+        assert_eq!(drops2.load(Ordering::Relaxed), 2, "SingleInner leaked at the wrap");
+    }
+
+    #[test]
+    fn queued_across_wrap() {
+        let inner: Arc<SeqInner<u64, 4>> = SeqInner::new();
+        warp_seq(&inner, usize::MAX - 1);
+        inner.push(1).unwrap();
+        inner.push(2).unwrap();
+        assert_eq!(inner.queued(), 2, "queued() lied at the wrap");
+        assert!(!inner.is_empty());
+    }
+
+    #[test]
+    fn push_batch_fifo_across_wrap() {
+        let inner: Arc<SingleInner<u64, 4>> = SingleInner::new();
+        warp_single(&inner, usize::MAX - 1);
+        let mut buf = vec![1u64, 2, 3, 4];
+        assert_eq!(InnerChannel::push_batch(&*inner, &mut buf), 4);
+        let mut out = Vec::new();
+        let (n, _) = inner.pop_batch(&mut out, 8);
+        assert_eq!(n, 4);
+        assert_eq!(out, vec![1, 2, 3, 4]);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn seq_push_batch_overreserved_at_wrap_returns() {
+        let inner: Arc<SeqInner<u64, 2>> = SeqInner::new();
+        warp_seq(&inner, usize::MAX - 5);
+        inner.push(1).unwrap();
+        inner.push(2).unwrap(); // full
+        inner.tail.fetch_add(5, Ordering::Relaxed); // reservation wraps past zero
+        let done = Arc::new(AtomicBool::new(false));
+        let (i2, d2) = (inner.clone(), done.clone());
+        let h = thread::spawn(move || {
+            let mut b = vec![9u64];
+            let n = i2.push_batch(&mut b);
+            d2.store(true, Ordering::Release);
+            n
+        });
+        thread::sleep(std::time::Duration::from_millis(300));
+        assert!(done.load(Ordering::Acquire), "push_batch livelocked at the wrap");
+        assert_eq!(h.join().unwrap(), 0, "over-reserved ring must accept nothing");
     }
 }

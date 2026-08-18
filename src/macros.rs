@@ -261,7 +261,7 @@ mod tests {
         let ch = spsc!(u64, 64, 4);
         let pairs: Vec<_> = ch.into_pairs().collect();
         assert_eq!(pairs.len(), 4);
-        for (shard_id, tx, rx) in pairs {
+        for (shard_id, mut tx, mut rx) in pairs {
             tx.try_send(shard_id as u64).unwrap();
             assert_eq!(rx.try_recv().unwrap(), shard_id as u64);
         }
@@ -270,8 +270,8 @@ mod tests {
     #[test]
     fn sharded_spsc_macro_take_pair() {
         let mut ch = spsc!(u64, 64, 4);
-        let (tx0, rx0) = ch.take_pair(0).unwrap();
-        let (tx2, rx2) = ch.take_pair(2).unwrap();
+        let (mut tx0, mut rx0) = ch.take_pair(0).unwrap();
+        let (mut tx2, mut rx2) = ch.take_pair(2).unwrap();
         assert_eq!(ch.remaining(), vec![1, 3]);
         tx0.try_send(10).unwrap();
         tx2.try_send(20).unwrap();

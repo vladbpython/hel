@@ -50,6 +50,7 @@ pub trait SenderOps<T: Send + 'static, const CAP: usize>: Send + 'static {
     fn sender_sub(&self, o: Ordering) -> usize;
     fn tx_close(&self);
     fn notify_all_on_tx_close(&self);
+    fn queued(&self) -> usize;
 }
 
 // Blanket impl for any InnerChannel
@@ -94,6 +95,10 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + Send + 'stat
 
     fn notify_all_on_tx_close(&self) {
         self.notify_all_on_tx_close()
+    }
+
+    fn queued(&self) -> usize{
+        InnerChannel::queued(self)
     }
 }
 

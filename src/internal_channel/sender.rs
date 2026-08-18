@@ -7,13 +7,13 @@ use super::{
     sync::{AsyncSlot, SyncList, SyncNode},
     traits::{MultiProducer, SenderOps},
 };
+use crate::shim::loom::{park,park_timeout};
 use std::{
     future::Future,
     marker::PhantomData,
     pin::Pin,
     sync::{Arc, atomic::Ordering},
     task::{Context, Poll},
-    thread::{park, park_timeout},
     time::{Duration, Instant},
 };
 
@@ -42,8 +42,8 @@ pub fn send_impl<T: Send + 'static, const CAP: usize>(
     deadline: Option<Instant>,
 ) -> Result<(), SendError<T>> {
     // No deadline: try push_blocking first.
-    // ARM SeqInner: fetch_add blocks internally → Ok or Err(rx_closed) only.
-    // Intel / SingleInner: push_blocking == push (CAS) → may return Err(Full) → fall through.
+    // ARM SeqInner: fetch_add blocks internally \u2192 Ok or Err(rx_closed) only.
+    // Intel / SingleInner: push_blocking == push (CAS) \u2192 may return Err(Full) \u2192 fall through.
     if deadline.is_none() {
         if inner.is_rx_closed() {
             return Err(SendError::Disconnected(value));
@@ -100,16 +100,14 @@ pub fn send_impl<T: Send + 'static, const CAP: usize>(
         }
 
         let mut node = SyncNode::new_blocking();
-        let node_ptr = &mut node as *mut SyncNode;
-        inner.sender_waiters().push_blocking(node_ptr);
+        let parked = inner.sender_waiters().sync_guard(&mut node);
 
         if inner.is_rx_closed() {
-            inner.sender_waiters().remove(node_ptr);
             return Err(SendError::Disconnected(value));
         }
         match inner.push(value) {
             Ok(()) => {
-                inner.sender_waiters().remove(node_ptr);
+                drop(parked);
                 inner.notify_receivers();
                 return Ok(());
             }
@@ -120,7 +118,6 @@ pub fn send_impl<T: Send + 'static, const CAP: usize>(
             Some(dl) => park_timeout(dl.saturating_duration_since(Instant::now())),
             None => park(),
         }
-        inner.sender_waiters().remove(node_ptr);
     }
 }
 
@@ -407,15 +404,16 @@ pub struct Sender<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP> = Se
 /// Async send future for MPMC channel.
 pub type SenderFuture<'a, T, const CAP: usize, I> = GenericSendFuture<'a, T, CAP, I>;
 
-/// SPSC sender has exactly one producer, `Clone` is missing at the type level.
-pub type SingleSender<T, const CAP: usize> = Sender<T, CAP, SingleInner<T, CAP>>;
-
 impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
     pub fn new(inner: Arc<I>) -> Self {
         Self {
             inner,
             _t: PhantomData,
         }
+    }
+
+    pub fn queued(&self) -> usize {
+        self.inner.as_ref().queued()
     }
 
     pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
@@ -468,7 +466,7 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
     /// - `Err(Disconnected)` -> `*slot == Some(v)`, recipients are closed;
     /// - cancellation (drop pending) -> `*slot == Some(v)`, there was no sending.
     ///
-    /// An empty `slot` on input is interpreted as “nothing to send” and
+    /// An empty `slot` on input is interpreted as \u201cnothing to send\u201d and
     /// `Ok(())` ends idempotently (fused semantics).
     ///
     /// Future borrows `self` and `slot`, so is not `'static`
@@ -509,6 +507,7 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
         self.send_ref_async(value).await.map_err(|_| ())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] 
     pub async fn send_batch_async(&self, buf: &mut Vec<T>) -> usize {
         let fast = self.inner.push_batch(buf); // one publication per batch
         if fast > 0 {
@@ -541,16 +540,9 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
     }
 }
 
-// SingleSender needs ref_inner helper — add via inherent impl on the type alias
-impl<T: Send, const CAP: usize> Sender<T, CAP, SingleInner<T, CAP>> {
-    pub fn ref_inner(&self) -> &Arc<SingleInner<T, CAP>> {
-        &self.inner
-    }
-}
-
 // Clone exists ONLY for multi-producer inners (SeqInner).
 // SingleSender (SPSC) does not implement Clone type level guarantee:
-// a clone of an SPSC sender would mean two producers on a protocol without CAS → UB.
+// a clone of an SPSC sender would mean two producers on a protocol without CAS \u2192 UB.
 impl<T: Send, const CAP: usize, I: SenderOps<T, CAP> + MultiProducer> Clone for Sender<T, CAP, I> {
     fn clone(&self) -> Self {
         self.inner.sender_add(Ordering::Relaxed);
@@ -562,6 +554,121 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP> + MultiProducer> Clone for 
 }
 
 impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Drop for Sender<T, CAP, I> {
+    fn drop(&mut self) {
+        if self.inner.sender_sub(Ordering::AcqRel) == 1 {
+            self.inner.tx_close();
+            self.inner.notify_all_on_tx_close();
+        }
+    }
+}
+
+
+/// SPSC sender: exactly one producer, enforced by the compiler.
+pub struct SingleSender<T: Send + 'static, const CAP: usize> {
+    inner: Arc<SingleInner<T, CAP>>,
+}
+
+impl<T: Send + 'static, const CAP: usize> SingleSender<T, CAP> {
+    pub fn new(inner: Arc<SingleInner<T, CAP>>) -> Self {
+        Self { inner }
+    }
+
+    pub fn ref_inner(&self) -> &Arc<SingleInner<T, CAP>> {
+        &self.inner
+    }
+
+    pub fn try_send(&mut self, value: T) -> Result<(), TrySendError<T>> {
+        try_send(self.inner.as_ref(), value)
+    }
+
+    pub fn send(&mut self, value: T) -> Result<(), SendError<T>> {
+        send_impl(self.inner.as_ref(), value, None)
+    }
+
+    pub fn send_timeout(&mut self, value: T, d: Duration) -> Result<(), SendError<T>> {
+        send_impl(self.inner.as_ref(), value, Some(Instant::now() + d))
+    }
+
+    /// Non blocking batch send: fast path only, no blocking fallback.
+    /// Returns number sent. Unsent items remain in buf.
+    pub fn try_send_batch(
+        &mut self,
+        buf: &mut Vec<T>,
+    ) -> Result<usize, BatchSendError<TrySendBatchError>> {
+        try_send_batch(self.inner.as_ref(), buf)
+    }
+
+    pub fn send_batch(
+        &mut self,
+        buf: &mut Vec<T>,
+    ) -> Result<usize, BatchSendError<SendBatchError>> {
+        send_batch_impl(self.inner.as_ref(), buf, None)
+    }
+
+    pub fn send_batch_timeout(
+        &mut self,
+        buf: &mut Vec<T>,
+        d: Duration,
+    ) -> Result<usize, BatchSendError<SendBatchError>> {
+        send_batch_impl(self.inner.as_ref(), buf, Some(Instant::now() + d))
+    }
+
+    pub fn send_async(
+        &mut self,
+        value: T,
+    ) -> SenderFuture<'_, T, CAP, SingleInner<T, CAP>> {
+        GenericSendFuture {
+            inner: &self.inner,
+            value: Some(value),
+            slot: None,
+            _t: PhantomData,
+        }
+    }
+
+    /// Cancel safe async send that never loses the value
+    pub async fn send_ref_async(
+        &mut self,
+        slot: &mut Option<T>,
+    ) -> Result<(), AsyncSendRefError> {
+        SendPending {
+            inner: &self.inner,
+            value: slot,
+            slot: None,
+        }
+        .await
+        .map_err(|()| AsyncSendRefError::Disconnected)
+    }
+
+    pub async fn send_batch_async(&mut self, buf: &mut Vec<T>) -> usize {
+        let fast = self.inner.push_batch(buf); // one publication per batch
+        if fast > 0 {
+            self.inner.notify_receivers();
+        }
+        if buf.is_empty() {
+            return fast;
+        }
+
+        let mut g = Restore::new(buf); // reverses inside
+        let mut sent = fast;
+
+        while let Some(value) = g.buf.pop() {
+            g.pending = Some(value);
+            let done = SendPending {
+                inner: &self.inner,
+                value: &mut g.pending,
+                slot: None,
+            }
+            .await;
+            match done {
+                Ok(()) => sent += 1,
+                Err(()) => break,
+            }
+        }
+        sent
+    }
+}
+
+impl<T: Send + 'static, const CAP: usize> Drop for SingleSender<T, CAP> {
     fn drop(&mut self) {
         if self.inner.sender_sub(Ordering::AcqRel) == 1 {
             self.inner.tx_close();

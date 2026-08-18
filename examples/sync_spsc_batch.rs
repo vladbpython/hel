@@ -11,7 +11,7 @@ fn main() {
 
     let handles: Vec<_> = ch
         .into_pairs()
-        .map(|(shard_id, tx, rx)| {
+        .map(|(shard_id, mut tx, mut rx)| {
             let consumer = thread::spawn(move || {
                 let mut total = 0u64;
                 let mut buf = Vec::with_capacity(BATCH);

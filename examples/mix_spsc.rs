@@ -17,7 +17,7 @@ fn main() {
 
     let handles: Vec<_> = ch
         .into_pairs()
-        .map(|(shard_id, tx, rx)| {
+        .map(|(shard_id, mut tx, mut rx)| {
             // Async consumer processes data asynchronously
             let consumer = rt.spawn(async move {
                 let mut sum = 0.0f64;

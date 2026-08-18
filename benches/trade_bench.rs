@@ -91,12 +91,32 @@ fn make_pools(producers: u64, n: u64) -> Pools {
     }
 }
 
+fn keys_one_per_shard(shards: usize) -> Vec<&'static str> {
+    assert!(shards.is_power_of_two(), "shard count must be a power of two");
+    let (tx, _rx) = shard_key::<Trade, 2>(shards);
+    let mut by_shard: Vec<Option<&'static str>> = vec![None; shards];
+    let mut i = 0u64;
+    while by_shard.iter().any(Option::is_none) {
+        let k = format!("S{i}");
+        let shard = tx.shard_for(&k);
+        if by_shard[shard].is_none() {
+            // Only the keys we keep are leaked: `shards` of them, once.
+            by_shard[shard] = Some(Box::leak(k.into_boxed_str()));
+        }
+        i += 1;
+        assert!(i < 1_000_000, "could not cover every shard");
+    }
+    by_shard.into_iter().map(Option::unwrap).collect()
+}
+
 /// Один уникальный символ на пул — для shard_key с 1 продюсером на шард.
 fn make_unique_sym_pools(num_pools: usize, n: u64) -> Pools {
+    let keys = keys_one_per_shard(num_pools);
     let items_per = n / num_pools as u64;
     let data: Vec<Vec<Trade>> = (0..num_pools)
         .map(|p| {
-            let (sym, price, qty) = SYMBOLS[p % SYMBOLS.len()];
+            let sym = keys[p];
+            let (_, price, qty) = SYMBOLS[p % SYMBOLS.len()];
             (0..items_per)
                 .map(|i| Trade {
                     e: "trade",
@@ -252,7 +272,7 @@ fn hel_spsc_sync(sb: Arc<Barrier>, eb: Arc<Barrier>, n: u64, num_shards: usize) 
     let expected = num_shards as u64 * (items_per * (items_per - 1) / 2);
     let total = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();
-    for (_, tx, rx) in ch.into_pairs() {
+    for (_, mut tx, mut rx) in ch.into_pairs() {
         handles.push(sync_consumer!(rx, total, sb, eb));
         let items: Vec<Trade> = (0..items_per).map(|i| make_trade(i, 0)).collect();
         let sb2 = sb.clone();
@@ -566,7 +586,7 @@ fn run_hel_spsc<const CAP: usize>(rt: &Runtime, pools: &Pools) -> Duration {
         let pairs: Vec<_> = ch
             .into_pairs()
             .enumerate()
-            .map(|(p, (_, tx, rx))| {
+            .map(|(p, (_, mut tx, mut rx))| {
                 let t = total.clone();
                 let data = data.clone();
                 let bc = bar.clone();
@@ -869,7 +889,7 @@ fn run_hel_spsc_batch<const CAP: usize>(rt: &Runtime, pools: &Pools) -> Duration
         let pairs: Vec<_> = ch
             .into_pairs()
             .enumerate()
-            .map(|(p, (_, tx, rx))| {
+            .map(|(p, (_, mut tx, mut rx))| {
                 let t = total.clone();
                 let data = data.clone();
                 let bc = bar.clone();
@@ -1074,7 +1094,7 @@ fn run_hel_spsc_prebatch<const CAP: usize>(rt: &Runtime, pools: &Pools) -> Durat
         let pairs: Vec<_> = ch
             .into_pairs()
             .enumerate()
-            .map(|(p, (_, tx, rx))| {
+            .map(|(p, (_, mut tx, mut rx))| {
                 let t = total.clone();
                 let data = data.clone();
                 let bc = bar.clone();

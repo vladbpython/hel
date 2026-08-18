@@ -19,7 +19,7 @@ fn main() {
 
         let handles: Vec<(AbortHandle, AbortHandle)> = ch
             .into_pairs()
-            .map(|(shard_id, tx, rx)| {
+            .map(|(shard_id, mut tx, mut rx)| {
                 let token_c = token.clone();
                 let token_p = token.clone();
 

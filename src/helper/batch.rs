@@ -1,8 +1,8 @@
-/// BATCH DRAIN: Safe stop all 6 sync/async × shard_key/round_robin/spsc combinations.
+/// BATCH DRAIN: Safe stop all 6 sync/async \u00d7 shard_key/round_robin/spsc combinations.
 use std::mem;
 
 /// SYNC batch drain for all 3 channels.
-/// The correct order is sewn: drain buf → check dc. `handler` for each element;
+/// The correct order is sewn: drain buf \u2192 check dc. `handler` for each element;
 /// `acc` accumulates Output. Only comes out when the channel is closed and
 /// empty without losing the last batch.
 pub fn drain_batch<T, F, H, O>(max: usize, mut recv: F, mut handler: H, init: O) -> O
@@ -35,7 +35,7 @@ where
 ///   },
 /// init)
 ///```
-/// The drain → check invariant is preserved: the last nonempty batch (with dc) too
+/// The drain \u2192 check invariant is preserved: the last nonempty batch (with dc) too
 /// goes to sink. For an empty final (n=0, dc=true) sink is not called.
 pub fn drain_batch_sink<T, F, S, O>(max: usize, mut recv: F, mut sink: S, init: O) -> O
 where
@@ -59,9 +59,9 @@ where
 
 /// ASYNC batch drain for all 3 channels.
 /// Reception: `recv` owns both receiver and buffer (takes by value, returns
-/// `(rx, buf, n, dc)`). future does not borrow external `&mut` → lifetime is clean,
+/// `(rx, buf, n, dc)`). future does not borrow external `&mut` \u2192 lifetime is clean,
 /// Send is intact. Both resources are reused via back and forth.
-/// The drain→check invariant is the same as in sync.
+/// The drain\u2192check invariant is the same as in sync.
 pub async fn drain_batch_async<R, F, Fut, T, H, O>(
     mut rx: R,
     max: usize,
@@ -106,7 +106,7 @@ where
 /// `O` accumulator (as in sync drain_batch_sink), but passed by OWNERSHIP
 /// `(Vec<T>, O) -> Future<(Vec<T>, O)>`: async closure cannot hold
 /// `&mut O` via .await (lifetime), so acc leaves and returns.
-/// The drain → check invariant is preserved: the last non empty batch also goes to sink.
+/// The drain \u2192 check invariant is preserved: the last non empty batch also goes to sink.
 pub async fn drain_batch_async_sink<R, F, Fut, T, S, SFut, O>(
     mut rx: R,
     max: usize,
@@ -126,7 +126,7 @@ where
         let (r, b, n, dc) = recv(rx, buf, max).await;
         rx = r;
         if n > 0 {
-            let (empty, a) = sink(b, acc).await; //whole batch + acc → sink, (empty Vec, acc) back
+            let (empty, a) = sink(b, acc).await; //whole batch + acc \u2192 sink, (empty Vec, acc) back
             buf = empty;
             acc = a;
         } else {
@@ -151,11 +151,11 @@ mod tests {
     fn drain_batch_keeps_last_when_n_and_dc_together() {
         for prefill in [1u64, 2, 5, 255, 256] {
             let mut ch = shard_spsc::<u64, 256>(1);
-            let (tx, rx) = ch.take_pair(0).unwrap();
+            let (mut tx, mut rx) = ch.take_pair(0).unwrap();
             for i in 0..prefill {
                 tx.try_send(i).unwrap();
             }
-            drop(tx); // закрыли ДО чтения → первый recv_batch даст (n, dc=true)
+            drop(tx); // \u0437\u0430\u043a\u0440\u044b\u043b\u0438 \u0414\u041e \u0447\u0442\u0435\u043d\u0438\u044f \u2192 \u043f\u0435\u0440\u0432\u044b\u0439 recv_batch \u0434\u0430\u0441\u0442 (n, dc=true)
             let got = drain_batch(
                 256,
                 move |buf: &mut Vec<u64>, m| rx.recv_batch(buf, m),
@@ -172,7 +172,7 @@ mod tests {
     fn drain_batch_sink_computes_over_whole_array() {
         for prefill in [1u64, 5, 64, 200] {
             let mut ch = shard_spsc::<u64, 256>(1);
-            let (tx, rx) = ch.take_pair(0).unwrap();
+            let (mut tx, mut rx) = ch.take_pair(0).unwrap();
             for i in 1..=prefill {
                 tx.try_send(i).unwrap();
             }
@@ -206,8 +206,8 @@ mod tests {
     #[test]
     fn drain_batch_sink_no_call_on_empty_final() {
         let mut ch = shard_spsc::<u64, 256>(1);
-        let (tx, rx) = ch.take_pair(0).unwrap();
-        drop(tx); // закрыт пустым
+        let (tx, mut rx) = ch.take_pair(0).unwrap();
+        drop(tx); // \u0437\u0430\u043a\u0440\u044b\u0442 \u043f\u0443\u0441\u0442\u044b\u043c
         let calls = drain_batch_sink(
             64,
             move |buf: &mut Vec<u64>, m| rx.recv_batch(buf, m),
@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn drain_batch_sink_collects_whole_batch() {
         let mut ch = shard_spsc::<u64, 256>(1);
-        let (tx, rx) = ch.take_pair(0).unwrap();
+        let (mut tx, mut rx) = ch.take_pair(0).unwrap();
         for i in 0..200u64 {
             tx.try_send(i).unwrap();
         }
@@ -254,7 +254,7 @@ mod tests {
             "not all elements went through the sink"
         );
         assert!(calls >= 1, "sink didn't volunteer");
-        // содержимое == исходному (0..200), ни потерь, ни дублей
+        // \u0441\u043e\u0434\u0435\u0440\u0436\u0438\u043c\u043e\u0435 == \u0438\u0441\u0445\u043e\u0434\u043d\u043e\u043c\u0443 (0..200), \u043d\u0438 \u043f\u043e\u0442\u0435\u0440\u044c, \u043d\u0438 \u0434\u0443\u0431\u043b\u0435\u0439
         let mut got = collected;
         got.sort_unstable();
         assert_eq!(got, (0..200u64).collect::<Vec<_>>(), "contents != original");
@@ -266,7 +266,7 @@ mod tests {
         // SPSC
         for prefill in [1u64, 2, 5, 255, 256] {
             let ch = shard_spsc::<u64, 256>(1);
-            let (tx, rx) = ch.into_wrapped_pairs().next().unwrap();
+            let (mut tx, rx) = ch.into_wrapped_pairs().next().unwrap();
             for i in 0..prefill {
                 tx.try_send(i).unwrap();
             }
@@ -274,7 +274,7 @@ mod tests {
             let got = drain_batch_async(
                 rx,
                 256,
-                |rx, mut buf, max| async move {
+                |mut rx, mut buf, max| async move {
                     let (n, dc) = rx.recv_batch_async(&mut buf, max).await;
                     (rx, buf, n, dc)
                 },
@@ -320,7 +320,7 @@ mod tests {
         };
 
         let ch = shard_spsc::<u64, 256>(1);
-        let (tx, rx) = ch.into_wrapped_pairs().next().unwrap();
+        let (mut tx, rx) = ch.into_wrapped_pairs().next().unwrap();
         for i in 0..200u64 {
             tx.try_send(i).unwrap();
         }
@@ -335,7 +335,7 @@ mod tests {
         let total = drain_batch_async_sink(
             rx,
             256,
-            |rx, mut buf, max| async move {
+            |mut rx, mut buf, max| async move {
                 let (n, dc) = rx.recv_batch_async(&mut buf, max).await;
                 (rx, buf, n, dc)
             },

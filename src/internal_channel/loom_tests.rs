@@ -1,7 +1,7 @@
 // Loom tests for the Vyukov ring
 #![cfg(all(test, loom))]
 
-use super::core::SeqInner;
+use super::core::{SeqInner,SingleInner};
 use super::traits::InnerChannel;
 use loom::thread;
 use std::sync::{
@@ -250,5 +250,53 @@ fn algo_ring_two_aborts_over_reservation() {
         drop(ch);
         // 1,2 reclaimed by Drop; 3 returned via Err; 9 dropped with buf
         assert_eq!(drops.load(std::sync::atomic::Ordering::Relaxed), 4);
+    });
+}
+
+#[test]
+fn loom_blocking_sender_is_never_left_parked() {
+    loom::model(|| {
+        // SingleInner on purpose for SeqInner `push_blocking` is push_fetch_add`,
+        // which blocks inside itself and never reaches the park path,
+        // so a SeqInner model would prove nothing about parking.
+        let ch: Arc<SingleInner<usize, CAP>> = SingleInner::new();
+        // Fill the ring: the next send has to park.
+        assert!(ch.push(1).is_ok());
+        assert!(ch.push(2).is_ok());
+
+        let prod = {
+            let ch = ch.clone();
+            thread::spawn(move || {
+                // Blocks: enqueue node -> re-check -> park -> retry.
+                super::sender::send_impl(ch.as_ref(), 3usize, None).is_ok()
+            })
+        };
+
+        // Free exactly one slot and wake whoever is waiting for it.
+        let taken = ch.pop().expect("ring was filled");
+        ch.notify_senders();
+
+        assert!(prod.join().unwrap(), "blocked sender did not complete");
+        assert_eq!(taken, 1, "FIFO broken");
+    });
+}
+
+#[test]
+fn loom_blocking_receiver_is_never_left_parked() {
+    loom::model(|| {
+        let ch: Arc<SeqInner<usize, CAP>> = SeqInner::new();
+
+        let cons = {
+            let ch = ch.clone();
+            thread::spawn(move || super::receiver::recv_impl(ch.as_ref(), None))
+        };
+
+        assert!(ch.push(7).is_ok());
+        ch.notify_receivers();
+
+        assert_eq!(
+            cons.join().unwrap().expect("receiver did not complete"),
+            7
+        );
     });
 }

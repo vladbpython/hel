@@ -8,7 +8,7 @@ use crate::internal_channel::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration,Instant};
 
 // SymbolHandle
 
@@ -320,13 +320,15 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
             return Ok(0);
         }
         let (groups, mut unused) = self.group_by_route(buf, &key_fn);
+        let deadline = Instant::now() + d;
         let mut total = 0usize;
         let mut groups = groups.into_iter().enumerate();
         while let Some((shard, mut group)) = groups.next() {
             if group.is_empty() {
                 continue;
             }
-            match self.senders[shard].send_batch_timeout(&mut group, d) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.senders[shard].send_batch_timeout(&mut group, left) {
                 Ok(sent) => total += sent,
                 Err(e) => {
                     total += e.sent;
@@ -356,7 +358,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
     /// Unlike shard_key (fast path retry via try_send_batch): here
     /// layout ONCE, because unused cannot be driven through hash to retry
     /// Strict routing control requires one time grouping by map.
-    pub async fn send_batch_async(
+     pub async fn send_batch_async(
         &self,
         buf: &mut Vec<T>,
         key_fn: impl for<'k> Fn(&'k T) -> &'k str,
@@ -371,33 +373,43 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
 
         for shard in 0..g.num_groups() {
             loop {
-                match self.senders[shard].try_send_batch(g.group_mut(shard)) {
-                    Ok(sent) => {
-                        total += sent;
-                        break; // group is gone
-                    }
-                    Err(e) => {
-                        total += e.sent;
-                        if g.group_mut(shard).is_empty() {
-                            break;
-                        }
-                        // Backpressure: await the head (FIFO), then retry the
-                        // batch. No rerouting, the group is already laid out.
-                        let disconnected = self.senders[shard]
-                            .send_async_from(g.take_head(shard))
-                            .await
-                            .is_err();
-                        if disconnected {
-                            // `g` drops here: groups, orphans and the pending
-                            // item all go back into `buf`.
-                            return Err(shard_error::ShardAsyncBatchSendError {
-                                shard,
-                                sent: total,
-                            });
-                        }
-                        total += 1;
+                if g.is_group_empty(shard) {
+                    break;
+                }
+                // Bulk while there is room: stage a chunk, send it, put back
+                // whatever did not fit. Both moves are O(chunk),
+                // so bulk stays usable at every batch size.
+                let free = CAP.saturating_sub(self.senders[shard].queued());
+                if free > 0 {
+                    let stage = g.bulk_stage(shard, free);
+                    let sent_now = match self.senders[shard].try_send_batch(stage) {
+                        Ok(n) => n,
+                        Err(e) => e.sent,
+                    };
+                    g.bulk_return();
+                    total += sent_now;
+                    if sent_now > 0 {
+                        continue; // made progress, try for more
                     }
                 }
+                if g.is_group_empty(shard) {
+                    break;
+                }
+                // Channel is full: park on the head. O(1) to take it,
+                // so a long backpressure stretch stays linear.
+                let disconnected = self.senders[shard]
+                    .send_async_from(g.take_head(shard))
+                    .await
+                    .is_err();
+                if disconnected {
+                    // `g` drops here: groups, orphans and the pending
+                    // item all go back into `buf`.
+                    return Err(shard_error::ShardAsyncBatchSendError {
+                        shard,
+                        sent: total,
+                    });
+                }
+                total += 1;
             }
         }
         // `g` drops on the way out: groups are empty by now, orphans go to `buf`.

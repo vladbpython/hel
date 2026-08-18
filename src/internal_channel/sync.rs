@@ -1,16 +1,18 @@
 use crate::shim::loom::{
-    AtomicBool, AtomicUsize, AtomicWaker, Lock, Mutex, Ordering, PLMutex, fence,
+    AtomicBool, AtomicUsize, AtomicWaker, Lock, Mutex, Ordering, PLMutex, Thread, UnsafeCell,
+    thread_current, fence,
 };
 
 use std::{
-    cell::UnsafeCell,
     collections::VecDeque,
-    marker::PhantomPinned,
+    marker::{
+        PhantomData,
+        PhantomPinned
+    },
     mem::MaybeUninit,
     ptr::null_mut,
     sync::Arc,
     task::Waker,
-    thread::{self, Thread},
 };
 
 pub struct Slot<T> {
@@ -81,7 +83,7 @@ impl SyncNode {
     }
     pub fn new_blocking() -> Self {
         let mut s = Self::new();
-        s.kind = Some(SyncKind::Blocking(thread::current()));
+        s.kind = Some(SyncKind::Blocking(thread_current()));
         s
     }
     pub fn is_in_list(&self) -> bool {
@@ -153,6 +155,30 @@ impl SyncRawList {
 }
 unsafe impl Send for SyncRawList {}
 
+pub struct SyncGuard<'a> {
+    list: &'a SyncList,
+    node: *mut SyncNode,
+    _node: PhantomData<&'a mut SyncNode>,
+}
+
+impl<'a> SyncGuard<'a> {
+    fn new(list: &'a SyncList, node: &'a mut SyncNode) -> Self {
+        let node: *mut SyncNode = node;
+        list.push_blocking(node);
+        Self {
+            list,
+            node,
+            _node: PhantomData,
+        }
+    }
+}
+
+impl Drop for SyncGuard<'_> {
+    fn drop(&mut self) {
+        self.list.remove(self.node);
+    }
+}
+
 /// Unified waiter list: parking_lot::Mutex for async, std::Mutex for blocking.
 /// This is the best achieved version for unified blocking + async architecture.
 pub struct SyncList {
@@ -193,6 +219,11 @@ impl SyncList {
         if was_in {
             self.blocking_count.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    /// Links node into the blocking list and unlinks it when the guard drops.
+    pub fn sync_guard<'a>(&'a self, node: &'a mut SyncNode) -> SyncGuard<'a> {
+        SyncGuard::new(self, node)
     }
 
     /// count.fetch_add(SeqCst) = Dekker read fence for async.
@@ -412,5 +443,46 @@ mod loom_tests {
             );
             assert!(qlen <= 2, "queue grew beyond the slots ever pushed");
         });
+    }
+}
+
+
+#[cfg(all(not(loom), test))]
+mod sync_guard_tests {
+    use super::*;
+    use std::panic;
+
+    #[test]
+    fn unwind_while_parked_unlinks_the_node() {
+        let list = SyncList::new();
+
+        let r = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            let mut node = SyncNode::new_blocking();
+            let _parked = list.sync_guard(&mut node);
+            assert!(list.has_waiters(), "node should be linked while parked");
+            panic!("unwind through the wait");
+        }));
+        assert!(r.is_err(), "the probe must actually panic");
+
+        assert!(
+            !list.has_waiters(),
+            "node stayed linked after the unwind: the list holds a dangling pointer"
+        );
+        assert_eq!(list.blocking_count_acquire(), 0, "waiter count leaked");
+        // A pop now would follow that stale pointer if it were still linked.
+        assert!(list.blocking.lock_().pop_front().is_none());
+    }
+
+    /// The ordinary path still unlinks exactly once.
+    #[test]
+    fn normal_exit_unlinks_the_node() {
+        let list = SyncList::new();
+        {
+            let mut node = SyncNode::new_blocking();
+            let _parked = list.sync_guard(&mut node);
+            assert_eq!(list.blocking_count_acquire(), 1);
+        }
+        assert_eq!(list.blocking_count_acquire(), 0);
+        assert!(!list.has_waiters());
     }
 }

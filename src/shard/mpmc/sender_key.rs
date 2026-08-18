@@ -5,7 +5,7 @@ use super::{
     receiver::ShardReceiver,
 };
 use crate::internal_channel::{mpmc_bounded, nearest_power_of_two, sender::Sender};
-use std::{sync::Arc, time::Duration};
+use std::{sync::Arc, time::{Duration,Instant}};
 
 // ShardedKey (ByKey)
 
@@ -207,13 +207,15 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
         if buf.is_empty() {
             return Ok(0);
         }
+        let deadline = Instant::now() + d;
         let mut total = 0usize;
         let mut groups = self.group_by_shard(buf, &key_fn).into_iter().enumerate();
         while let Some((shard, mut group)) = groups.next() {
             if group.is_empty() {
                 continue;
             }
-            match self.senders[shard].send_batch_timeout(&mut group, d) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.senders[shard].send_batch_timeout(&mut group, left) {
                 Ok(sent) => total += sent,
                 Err(e) => {
                     total += e.sent;
@@ -248,42 +250,51 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
         if buf.is_empty() {
             return Ok(0);
         }
-        // ОТЛИЧИЕ: у key раскладка называется group_by_shard и сирот не бывает —
-        // hash_key отображает ЛЮБОЙ ключ на шард. Если она возвращает только
-        // Vec<Vec<T>>, передай пустой unused.
         let groups = self.group_by_shard(buf, &key_fn);
         let mut g = RestoreGroups::new(buf, groups, Vec::new());
         let mut total = 0usize;
 
         for shard in 0..g.num_groups() {
             loop {
-                match self.senders[shard].try_send_batch(g.group_mut(shard)) {
-                    Ok(sent) => {
-                        total += sent;
-                        break;
-                    }
-                    Err(e) => {
-                        total += e.sent;
-                        if g.group_mut(shard).is_empty() {
-                            break;
-                        }
-                        // ОТЛИЧИЕ: в ошибку идёт key — снимаем его с головы
-                        // группы ДО того, как элемент уедет в pending.
-                        let key = key_fn(&g.group_mut(shard)[0]).to_string();
-                        let disconnected = self.senders[shard]
-                            .send_async_from(g.take_head(shard))
-                            .await
-                            .is_err();
-                        if disconnected {
-                            return Err(shard_error::ShardKeyAsyncBatchSendError {
-                                key,
-                                shard,
-                                sent: total,
-                            });
-                        }
-                        total += 1;
+                if g.is_group_empty(shard) {
+                    break;
+                }
+                // Bulk while there is room: stage a chunk, send it, put back
+                // whatever did not fit. Both moves are O(chunk),
+                // so bulk stays usable at every batch size.
+                let free = CAP.saturating_sub(self.senders[shard].queued());
+                if free > 0 {
+                    let stage = g.bulk_stage(shard, free);
+                    let sent_now = match self.senders[shard].try_send_batch(stage) {
+                        Ok(n) => n,
+                        Err(e) => e.sent,
+                    };
+                    g.bulk_return();
+                    total += sent_now;
+                    if sent_now > 0 {
+                        continue; // made progress, try for more
                     }
                 }
+                if g.is_group_empty(shard) {
+                    break;
+                }
+                // Channel is full: park on the head. O(1) to take it, so a long
+                // backpressure stretch stays linear.
+                // the difference is that the key is in error -> remove it from the head of the group before
+                // the element will go to pending.
+                let key = key_fn(g.head(shard)).to_string();
+                let disconnected = self.senders[shard]
+                    .send_async_from(g.take_head(shard))
+                    .await
+                    .is_err();
+                if disconnected {
+                    return Err(shard_error::ShardKeyAsyncBatchSendError {
+                        key,
+                        shard,
+                        sent: total,
+                    });
+                }
+                total += 1;
             }
         }
         Ok(total)
@@ -773,4 +784,111 @@ mod tests {
         assert_eq!(err.err, AsyncSendRefError::Disconnected);
         assert_eq!(slot, Some(1));
     }
+
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn drain_mode_keeps_per_key_fifo() {
+        const CAP: usize = 4;
+        const N: u64 = 40;
+        let (tx, rx) = shard_key::<(String, u64), CAP>(2);
+
+        // One key -> one shard. CAP is far smaller than N, so the bulk path
+        // fills the ring and everything after it goes through enter_drain.
+        let mut batch: Vec<(String, u64)> = (0..N).map(|i| ("AAA".to_string(), i)).collect();
+        let shard = rx.shard_for("AAA");
+
+        let consumer = tokio::spawn(async move {
+            let mut got = Vec::new();
+            while got.len() < N as usize {
+                match rx.recv_async(shard).await {
+                    Ok((_, seq)) => got.push(seq),
+                    Err(_) => break,
+                }
+            }
+            got
+        });
+
+        let sent = tx
+            .send_batch_async(&mut batch, |(s, _)| s.as_str())
+            .await
+            .unwrap();
+        assert_eq!(sent, N as usize, "whole batch should go out");
+        assert!(batch.is_empty(), "nothing should be left behind");
+
+        let got = consumer.await.unwrap();
+        let want: Vec<u64> = (0..N).collect();
+        assert_eq!(got, want, "per key FIFO broken by the reversed drain");
+    }
+
+    /// Cancelling mid drain must leave `buf` in FIFO order, not reversed.
+    #[cfg(not(miri))]
+    #[tokio::test]
+    async fn cancel_mid_drain_restores_fifo_order() {
+        const CAP: usize = 4;
+        const N: u64 = 32;
+        let (tx, _rx) = shard_key::<(String, u64), CAP>(2);
+
+        let mut batch: Vec<(String, u64)> = (0..N).map(|i| ("AAA".to_string(), i)).collect();
+        // Nobody consumes: the ring fills, the rest enters drain mode and parks.
+        let r = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            tx.send_batch_async(&mut batch, |(s, _)| s.as_str()),
+        )
+        .await;
+        assert!(r.is_err(), "must still be waiting on a full shard");
+
+        assert!(!batch.is_empty(), "leftovers must come back");
+        let seqs: Vec<u64> = batch.iter().map(|(_, s)| *s).collect();
+        let mut sorted = seqs.clone();
+        sorted.sort_unstable();
+        assert_eq!(seqs, sorted, "leftovers came back reversed, FIFO is broken");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn send_batch_timeout_is_one_budget_across_shards() {
+        const CAP: usize = 2;
+        const SHARDS: usize = 4;
+        let (tx, rx) = shard_key::<(String, u64), CAP>(SHARDS);
+
+        let mut keys: Vec<&'static str> = Vec::new();
+        let mut seen = vec![false; SHARDS];
+        for k in ["k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9", "kA", "kB"] {
+            let sh = tx.shard_for(k);
+            if !seen[sh] {
+                seen[sh] = true;
+                keys.push(k);
+            }
+        }
+        assert_eq!(keys.len(), SHARDS, "could not cover every shard");
+
+        // Fill every shard.
+        for &k in &keys {
+            for i in 0..CAP as u64 {
+                tx.try_send(k, (k.to_string(), i)).unwrap();
+            }
+        }
+
+        let d = Duration::from_millis(40);
+        let mut rx = rx;
+        let drainer = thread::spawn(move || {
+            for shard in 0..SHARDS {
+                thread::sleep(Duration::from_millis(30));
+                let _ = rx.try_recv(shard);
+            }
+            rx
+        });
+
+        let mut batch: Vec<(String, u64)> = keys.iter().map(|k| (k.to_string(), 99)).collect();
+        let t = std::time::Instant::now();
+        let _ = tx.send_batch_timeout(&mut batch, d, |(s, _)| s.as_str());
+        let took = t.elapsed();
+        let _ = drainer.join();
+
+        assert!(
+            took < d * 2,
+            "took {took:?} for a {d:?} budget over {SHARDS} shards: the timeout is being spent per shard"
+        );
+    }
+    
 }

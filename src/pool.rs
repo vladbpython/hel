@@ -12,7 +12,7 @@ use crate::{
     internal_channel::{receiver::Receiver, traits::InnerChannel},
 };
 use futures::FutureExt;
-use std::{panic::AssertUnwindSafe, sync::Arc, thread, time::Duration};
+use std::{panic::{AssertUnwindSafe,catch_unwind}, sync::Arc, thread, time::Duration};
 
 const MONITOR_TICK: Duration = Duration::from_millis(10);
 
@@ -62,10 +62,12 @@ where
                     if n > 0 {
                         done = true;
                         for item in buf.drain(..n) {
-                            let mut slot = Some(item);
-                            let r = AssertUnwindSafe(handler.handle(&mut slot))
+                            let mut held = guard::CommitGuard::new(item, &*dead_letter);
+                            let slot = held.slot();
+                            let r = AssertUnwindSafe(async { handler.handle(slot).await })
                                 .catch_unwind()
                                 .await;
+                            let mut slot = held.disarm();
                             match r {
                                 Ok(()) => {
                                     // slot (taken or not) drops here: the item is committed/consumed.
@@ -76,7 +78,7 @@ where
                                     if let Some(poison) = slot.take() {
                                         // panic before take(): item is ours, hand it back zero loss.
                                         // A panicking  sink must not kill the worker.
-                                        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                        let _ = catch_unwind(AssertUnwindSafe(|| {
                                             dead_letter(poison, PanicReason(err))
                                         }));
                                     }
@@ -84,7 +86,8 @@ where
                                 }
                             }
                         }
-                    } else if dc {
+                    }
+                    if dc {
                         state.mark_closed(shard);
                     }
                 }
@@ -189,7 +192,7 @@ where
                         done = true;
                         for item in buf.drain(..n) {
                             let mut slot = Some(item);
-                            let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                            let r = catch_unwind(AssertUnwindSafe(|| {
                                 handler.handle(&mut slot)
                             }));
                             match r {
@@ -202,7 +205,7 @@ where
                                     if let Some(poison) = slot.take() {
                                         // panic before take(): item is ours, hand it back zero loss.
                                         // A panicking sink must not kill the worker.
-                                        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                                        let _ = catch_unwind(AssertUnwindSafe(|| {
                                             dead_letter(poison, PanicReason(err))
                                         }));
                                     }
@@ -1294,4 +1297,112 @@ mod panic_safety_tests {
             assert!(panics >= POISON);
         });
     }
+
+    /// `AsyncSlotHandler::handle` returns `impl Future`, not `async fn`,
+    /// so an implementor may run code before the future exists. 
+    /// That code must be covered by the same panic net as the future.
+    struct PanicsBeforeTheFuture;
+    impl traits::AsyncSlotHandler<u64> for PanicsBeforeTheFuture {
+        fn handle(&self, slot: &mut Option<u64>) -> impl Future<Output = ()> + Send {
+            let v = slot.as_ref().copied().unwrap_or(0);
+            if v % 2 == 0 {
+                panic!("synchronous panic on {v}");
+            }
+            let _ = slot.take();
+            async move {}
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn sync_panic_in_handle_is_caught_and_dead_lettered() {
+        const N: u64 = 20;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (tx, rx) = round_robin::<u64, 64>(1);
+            let dead = Arc::new(AtomicU64::new(0));
+            let d = dead.clone();
+
+            let pool = async_pool_slot(
+                tests::TokioRuntime,
+                instance::Config::new(1, 1),
+                rx.into_receivers(),
+                PanicsBeforeTheFuture,
+                move |_poison: u64, _p| {
+                    d.fetch_add(1, Ordering::Relaxed);
+                },
+            );
+            for i in 1..=N {
+                while tx.try_send(i).is_err() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            drop(tx);
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+            let processed = pool.processed();
+            let panics = pool.handler_panics();
+            let dl = dead.load(Ordering::Relaxed);
+            pool.stop_and_wait().await;
+
+            // Every even item panics before its future exists.
+            assert_eq!(panics, N / 2, "synchronous panics were not counted");
+            assert_eq!(dl, N / 2, "items lost instead of dead-lettered");
+            assert_eq!(
+                processed,
+                N / 2,
+                "worker died instead of surviving the panic: odd items were stranded"
+            );
+        });
+    }
+
+    /// Per the slot contract the handler takes the item only at its commit point,
+    /// so while it awaits, the item still sits in the worker's slot.
+    /// Cancelling the worker task there used to drop the frame and the item with it,
+    /// nothing counted, nothing delivered.
+    /// Now the item comes back through `dead_letter`, flagged as a cancellation rather than a panic.
+    struct CommitsAfterAwait;
+    impl traits::AsyncSlotHandler<u64> for CommitsAfterAwait {
+        fn handle(&self, slot: &mut Option<u64>) -> impl std::future::Future<Output = ()> + Send {
+            async move {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                let _ = slot.take(); // commit point, never reached here
+            }
+        }
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn cancelled_worker_hands_the_item_back() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dead = Arc::new(AtomicU64::new(0));
+        let cancelled = Arc::new(AtomicU64::new(0));
+        let (d, c) = (dead.clone(), cancelled.clone());
+
+        rt.block_on(async move {
+            let (tx, rx) = round_robin::<u64, 64>(1);
+            let _pool = async_pool_slot(
+                tests::TokioRuntime,
+                instance::Config::new(1, 1),
+                rx.into_receivers(),
+                CommitsAfterAwait,
+                move |poison: u64, reason: PanicReason| {
+                    assert_eq!(poison, 42, "a different item came back");
+                    if reason.is_cancelled() {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                    d.fetch_add(1, Ordering::Relaxed);
+                },
+            );
+            tx.try_send(42).unwrap();
+            // Let the worker pick it up and park inside the handler.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        // Cancel every worker task while the handler is mid await.
+        rt.shutdown_timeout(Duration::from_millis(100));
+
+        assert_eq!(dead.load(Ordering::Relaxed), 1, "the inflight item was lost on cancellation");
+        assert_eq!(cancelled.load(Ordering::Relaxed), 1, "reason should say cancelled, not panic");
+    }
+
 }

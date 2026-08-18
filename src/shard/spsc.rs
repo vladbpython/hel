@@ -11,7 +11,7 @@
 //! let rt = tokio::runtime::Runtime::new().unwrap();
 //! rt.block_on(async {
 //!     let ch = SpscShard::<u64, 256>::new(4);
-//!     for (shard_id, tx, rx) in ch.into_pairs() {
+//!     for (shard_id, mut tx, mut rx) in ch.into_pairs() {
 //!         let s = shard_id as u64;
 //!         let p = tokio::spawn(async move {
 //!             tx.send_async(s).await.unwrap();
@@ -34,17 +34,13 @@
 //! ```
 
 use super::errors as shard_error;
-use crate::internal_channel::{
-    core::SingleInner,
-    receiver::SingleReceiver,
-    sender::{Sender, SingleSender},
-};
-
-type ShardPair<T, const CAP: usize> = (Sender<T, CAP, SingleInner<T, CAP>>, SingleReceiver<T, CAP>);
+use crate::internal_channel::{core::SingleInner, receiver::SingleReceiver, sender::SingleSender};
+use std::time::Duration;
 
 // Spsc sharded channel
+
 /// Builder for sharded SPSC channel.
-/// Stores all `(SingleSender, SingleReceiver)` pairs before distribution.
+/// Stores all `SingleSender`, `SingleReceiver` pairs before distribution.
 /// Use `into_pairs()` or `take_pair(i)` to get pairs.
 pub struct SpscShard<T: Send + 'static, const CAP: usize> {
     /// Option<> allows take_pair() to retrieve pairs independently
@@ -56,8 +52,7 @@ impl<T: Send + 'static, const CAP: usize> SpscShard<T, CAP> {
     /// `num_shards` does not have to be a power of two (no hash routing).
     pub fn new(num_shards: usize) -> Self {
         assert!(num_shards > 0, "num_shards must be > 0");
-        assert!(CAP.is_power_of_two(), "CAP must be a power of two");
-        let pairs: Vec<Option<ShardPair<T, CAP>>> = (0..num_shards)
+        let pairs: Vec<Option<(SingleSender<T, CAP>, SingleReceiver<T, CAP>)>> = (0..num_shards)
             .map(|_| {
                 let inner = SingleInner::new();
                 let tx = SingleSender::new(inner.clone());
@@ -81,7 +76,7 @@ impl<T: Send + 'static, const CAP: usize> SpscShard<T, CAP> {
     /// ```
     /// use hel::channel::spsc::SpscShard;
     /// let ch = SpscShard::<u64, 64>::new(4);
-    /// for (shard_id, tx, rx) in ch.into_pairs() {
+    /// for (shard_id, mut tx, mut rx) in ch.into_pairs() {
     ///     println!("shard {shard_id}");
     ///     drop((tx, rx));
     /// }
@@ -103,8 +98,8 @@ impl<T: Send + 'static, const CAP: usize> SpscShard<T, CAP> {
     /// ```
     /// use hel::channel::spsc::SpscShard;
     /// let mut ch = SpscShard::<u64, 64>::new(4);
-    /// let (tx0, rx0) = ch.take_pair(0).unwrap();
-    /// let (tx2, rx2) = ch.take_pair(2).unwrap();
+    /// let (mut tx0, mut rx0) = ch.take_pair(0).unwrap();
+    /// let (mut tx2, mut rx2) = ch.take_pair(2).unwrap();
     /// assert!(ch.take_pair(0).is_none(), "already taken");
     /// assert!(ch.take_pair(4).is_none(), "out of range");
     /// ```
@@ -145,7 +140,7 @@ pub struct SpscReceiver<T: Send + 'static, const CAP: usize> {
 }
 
 impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
-    pub fn try_send(&self, v: T) -> Result<(), shard_error::ShardTrySendError<T>> {
+    pub fn try_send(&mut self, v: T) -> Result<(), shard_error::ShardTrySendError<T>> {
         self.inner
             .try_send(v)
             .map_err(|err| shard_error::ShardTrySendError {
@@ -154,7 +149,7 @@ impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
             })
     }
 
-    pub fn send(&self, v: T) -> Result<(), shard_error::ShardSendError<T>> {
+    pub fn send(&mut self, v: T) -> Result<(), shard_error::ShardSendError<T>> {
         self.inner
             .send(v)
             .map_err(|err| shard_error::ShardSendError {
@@ -163,7 +158,20 @@ impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
             })
     }
 
-    pub async fn send_async(&self, v: T) -> Result<(), shard_error::ShardAsyncSendError<T>> {
+    pub fn send_timeout(
+        &mut self,
+        v: T,
+        d: Duration,
+    ) -> Result<(), shard_error::ShardSendError<T>> {
+        self.inner
+            .send_timeout(v, d)
+            .map_err(|err| shard_error::ShardSendError {
+                shard: self.shard_id,
+                err,
+            })
+    }
+
+    pub async fn send_async(&mut self, v: T) -> Result<(), shard_error::ShardAsyncSendError<T>> {
         self.inner
             .send_async(v)
             .await
@@ -176,7 +184,7 @@ impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
     /// Cancel safe async send without value loss.
     /// On any non `Ok` outcome (cancellation or disconnect) the value remains in `slot`.
     pub async fn send_ref_async(
-        &self,
+        &mut self,
         slot: &mut Option<T>,
     ) -> Result<(), shard_error::ShardAsyncSendRefError> {
         self.inner
@@ -190,7 +198,7 @@ impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
 
     /// Non-blocking batch send: one lock for the entire batch.
     pub fn try_send_batch(
-        &self,
+        &mut self,
         buf: &mut Vec<T>,
     ) -> Result<usize, shard_error::ShardTryBatchSendError> {
         self.inner
@@ -202,7 +210,7 @@ impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
             })
     }
     /// Blocking batch send: waits until everything is sent.
-    pub fn send_batch(&self, buf: &mut Vec<T>) -> Result<usize, shard_error::ShardBatchSendError> {
+    pub fn send_batch(&mut self, buf: &mut Vec<T>) -> Result<usize, shard_error::ShardBatchSendError> {
         self.inner
             .send_batch(buf)
             .map_err(|e| shard_error::ShardBatchSendError {
@@ -211,10 +219,29 @@ impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
                 reason: e.err,
             })
     }
+
+    pub fn send_batch_timeout(
+        &mut self,
+        buf: &mut Vec<T>,
+        d: Duration,
+    ) -> Result<usize, shard_error::ShardBatchSendError> {
+        self.inner
+            .send_batch_timeout(buf, d)
+            .map_err(|e| shard_error::ShardBatchSendError {
+                shard: self.shard_id,
+                sent: e.sent,
+                reason: e.err,
+            })
+    }
+
+    pub async fn send_batch_async(&mut self, buf: &mut Vec<T>) -> usize {
+        self.inner.send_batch_async(buf).await
+    }
+
 }
 
 impl<T: Send + 'static, const CAP: usize> SpscReceiver<T, CAP> {
-    pub fn try_recv(&self) -> Result<T, shard_error::ShardTryRecvError> {
+    pub fn try_recv(&mut self) -> Result<T, shard_error::ShardTryRecvError> {
         self.inner
             .try_recv()
             .map_err(|err| shard_error::ShardTryRecvError {
@@ -223,7 +250,7 @@ impl<T: Send + 'static, const CAP: usize> SpscReceiver<T, CAP> {
             })
     }
 
-    pub fn recv(&self) -> Result<T, shard_error::ShardRecvError> {
+    pub fn recv(&mut self) -> Result<T, shard_error::ShardRecvError> {
         self.inner
             .recv()
             .map_err(|err| shard_error::ShardRecvError {
@@ -232,7 +259,16 @@ impl<T: Send + 'static, const CAP: usize> SpscReceiver<T, CAP> {
             })
     }
 
-    pub async fn recv_async(&self) -> Result<T, shard_error::ShardAsyncRecvError> {
+    pub fn recv_timeout(&mut self, d: Duration) -> Result<T, shard_error::ShardRecvError> {
+        self.inner
+            .recv_timeout(d)
+            .map_err(|err| shard_error::ShardRecvError {
+                shard: self.shard_id,
+                err,
+            })
+    }
+
+    pub async fn recv_async(&mut self) -> Result<T, shard_error::ShardAsyncRecvError> {
         self.inner
             .recv_async()
             .await
@@ -242,11 +278,20 @@ impl<T: Send + 'static, const CAP: usize> SpscReceiver<T, CAP> {
             })
     }
 
-    pub fn recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
+    pub fn recv_batch(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         self.inner.recv_batch(buf, max)
     }
 
-    pub async fn recv_batch_async(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
+    pub fn recv_batch_timeout(
+        &mut self,
+        buf: &mut Vec<T>,
+        max: usize,
+        d: Duration,
+    ) -> (usize, bool) {
+        self.inner.recv_batch_timeout(buf, max, d)
+    }
+
+    pub async fn recv_batch_async(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         self.inner.recv_batch_async(buf, max).await
     }
 }
@@ -321,11 +366,11 @@ mod tests {
     fn take_pair_basic() {
         let mut ch = SpscShard::<u64, 8>::new(4);
         let (tx, rx) = ch.take_pair(0).unwrap();
-        let tx = SpscSender {
+        let mut tx = SpscSender {
             shard_id: 0,
             inner: tx,
         };
-        let rx = SpscReceiver {
+        let mut rx = SpscReceiver {
             shard_id: 0,
             inner: rx,
         };
@@ -351,7 +396,7 @@ mod tests {
     #[test]
     fn wrapped_pairs_have_shard_id() {
         let ch = SpscShard::<u64, 8>::new(3);
-        for (tx, rx) in ch.into_wrapped_pairs() {
+        for (mut tx, mut rx) in ch.into_wrapped_pairs() {
             assert_eq!(tx.shard_id, rx.shard_id);
             tx.try_send(tx.shard_id as u64).unwrap();
             assert_eq!(rx.try_recv().unwrap(), rx.shard_id as u64);
@@ -366,11 +411,11 @@ mod tests {
 
         let mut handles = Vec::new();
         for (shard_id, tx, rx) in ch.into_pairs() {
-            let tx = SpscSender {
+            let mut tx = SpscSender {
                 shard_id,
                 inner: tx,
             };
-            let rx = SpscReceiver {
+            let mut rx = SpscReceiver {
                 shard_id,
                 inner: rx,
             };
@@ -404,11 +449,11 @@ mod tests {
     fn disconnected_when_sender_dropped() {
         let mut ch = SpscShard::<u64, 8>::new(2);
         let (tx, rx) = ch.take_pair(0).unwrap();
-        let tx = SpscSender {
+        let mut tx = SpscSender {
             shard_id: 0,
             inner: tx,
         };
-        let rx = SpscReceiver {
+        let mut rx = SpscReceiver {
             shard_id: 0,
             inner: rx,
         };
@@ -425,7 +470,7 @@ mod tests {
     fn disconnected_when_receiver_dropped() {
         let mut ch = SpscShard::<u64, 8>::new(2);
         let (tx, rx) = ch.take_pair(0).unwrap();
-        let tx = SpscSender {
+        let mut tx = SpscSender {
             shard_id: 0,
             inner: tx,
         };
@@ -438,11 +483,11 @@ mod tests {
     async fn async_send_recv_basic() {
         let mut ch = SpscShard::<String, 8>::new(4);
         let (tx, rx) = ch.take_pair(0).unwrap();
-        let tx = SpscSender {
+        let mut tx = SpscSender {
             shard_id: 0,
             inner: tx,
         };
-        let rx = SpscReceiver {
+        let mut rx = SpscReceiver {
             shard_id: 0,
             inner: rx,
         };
@@ -458,7 +503,7 @@ mod tests {
 
         let handles: Vec<_> = ch
             .into_wrapped_pairs()
-            .map(|(tx, rx)| {
+            .map(|(mut tx, mut rx)| {
                 let t = total.clone();
                 let c = tokio::spawn(async move {
                     let mut s = 0u64;
@@ -492,11 +537,11 @@ mod tests {
     async fn spsc_send_ref_async_success_clears_slot() {
         let mut ch = SpscShard::<u64, 4>::new(1);
         let (tx, rx) = ch.take_pair(0).unwrap();
-        let tx = SpscSender {
+        let mut tx = SpscSender {
             shard_id: 0,
             inner: tx,
         };
-        let rx = SpscReceiver {
+        let mut rx = SpscReceiver {
             shard_id: 0,
             inner: rx,
         };
@@ -507,19 +552,18 @@ mod tests {
         assert_eq!(rx.recv_async().await.unwrap(), 7);
     }
 
-    // Cancellation must not lose the value: it stays in the caller's slot
-    // and nothing enters the channel.
+    // Cancellation must not lose the value: it stays in the caller's slot and nothing enters the channel.
     #[cfg(not(miri))]
     #[tokio::test]
     async fn spsc_send_ref_async_cancel_keeps_value() {
         const CAP: usize = 2;
         let mut ch = SpscShard::<u64, CAP>::new(1);
         let (tx, rx) = ch.take_pair(0).unwrap();
-        let tx = SpscSender {
+        let mut tx = SpscSender {
             shard_id: 0,
             inner: tx,
         };
-        let rx = SpscReceiver {
+        let mut rx = SpscReceiver {
             shard_id: 0,
             inner: rx,
         };
@@ -551,7 +595,7 @@ mod tests {
     async fn spsc_send_ref_async_disconnect_keeps_value() {
         let mut ch = SpscShard::<u64, 2>::new(1);
         let (tx, rx) = ch.take_pair(0).unwrap();
-        let tx = SpscSender {
+        let mut tx = SpscSender {
             shard_id: 0,
             inner: tx,
         };
