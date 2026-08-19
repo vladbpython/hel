@@ -5,6 +5,7 @@ use super::{
     traits::{InnerChannel, MultiConsumer, ReceiverOps},
 };
 use crate::shim::loom::{park, park_timeout, yield_now};
+use futures_core::Stream;
 use std::{
     future::Future,
     hint::spin_loop,
@@ -67,6 +68,7 @@ pub fn recv_impl<T, const CAP: usize>(
             }
             yield_now();
         }
+
         match inner.pop() {
             Some(v) => {
                 inner.notify_senders();
@@ -80,16 +82,14 @@ pub fn recv_impl<T, const CAP: usize>(
 
         // Sleep phase only after yield didn't help
         let mut node = SyncNode::new_blocking();
-        let ptr = &mut node as *mut SyncNode;
-        inner.receiver_waiters().push_blocking(ptr);
+        let parked = inner.receiver_waiters().sync_guard(&mut node);
         match inner.pop() {
             Some(v) => {
-                inner.receiver_waiters().remove(ptr);
+                drop(parked);
                 inner.notify_senders();
                 return Ok(v);
             }
             None if inner.is_tx_closed() && inner.is_empty() => {
-                inner.receiver_waiters().remove(ptr);
                 return Err(RecvError::Disconnected);
             }
             None => {}
@@ -98,7 +98,6 @@ pub fn recv_impl<T, const CAP: usize>(
             Some(dl) => park_timeout(dl.saturating_duration_since(Instant::now())),
             None => park(),
         }
-        inner.receiver_waiters().remove(ptr);
     }
 }
 
@@ -139,12 +138,12 @@ pub struct GenericRecvFuture<'a, T: Send + 'static, const CAP: usize, I: Receive
     _t: PhantomData<T>,
 }
 
-unsafe impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Send
+unsafe impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP> + Send + Sync> Send
     for GenericRecvFuture<'_, T, CAP, I>
 {
 }
 
-impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Future
+impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP> + Send + Sync> Future
     for GenericRecvFuture<'_, T, CAP, I>
 {
     type Output = Result<T, AsyncRecvError>;
@@ -220,7 +219,7 @@ unsafe impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Send
 {
 }
 
-impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> futures::Stream
+impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Stream
     for GenericRecvStream<'_, T, CAP, I>
 {
     type Item = T;

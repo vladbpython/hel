@@ -4,8 +4,17 @@ use super::{
     hash::hash_key,
     receiver::ShardReceiver,
 };
-use crate::internal_channel::{mpmc_bounded, nearest_power_of_two, sender::Sender};
-use std::{sync::Arc, time::{Duration,Instant}};
+use crate::internal_channel::{mpmc_bounded, shard_power_of_two, sender::Sender};
+use std::{
+    any::Any,
+    panic::{
+        AssertUnwindSafe,
+        catch_unwind,
+        resume_unwind
+    },
+    sync::Arc, 
+    time::{Duration,Instant}
+};
 
 // ShardedKey (ByKey)
 
@@ -109,9 +118,22 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
     ) -> Vec<Vec<T>> {
         let n = self.mask + 1;
         let mut groups: Vec<Vec<T>> = (0..n).map(|_| Vec::new()).collect();
+        let mut poisoned: Option<(Box<dyn Any + Send>, Vec<T>)> = None;
         for item in buf.drain(..) {
-            let shard = hash_key(key_fn(&item)) & self.mask;
-            groups[shard].push(item);
+            match &mut poisoned {
+                Some((_,data)) => data.push(item),
+                None => match catch_unwind(AssertUnwindSafe(|| hash_key(key_fn(&item)) & self.mask))  {
+                    Ok(shard) => groups[shard].push(item),
+                    Err(p) => poisoned = Some((p, vec![item]))
+                }
+            }
+        }
+        if let Some((p, mut rescue)) = poisoned {
+            for g in &mut groups {
+                buf.append(g);
+            }
+            buf.append(&mut rescue);
+            resume_unwind(p);
         }
         groups
     }
@@ -138,11 +160,11 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
                 Ok(sent) => total += sent,
                 Err(e) => {
                     total += e.sent;
-                    let first_key = group
+                    refill_on_error(buf, group, groups);
+                    let first_key = buf
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
-                    refill_on_error(buf, group, groups);
                     return Err(shard_error::ShardKeyTryBatchSendError {
                         key: first_key,
                         shard,
@@ -179,11 +201,11 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
                 Ok(sent) => total += sent,
                 Err(e) => {
                     total += e.sent;
-                    let first_key = group
+                    refill_on_error(buf, group, groups);
+                    let first_key = buf
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
-                    refill_on_error(buf, group, groups);
                     return Err(shard_error::ShardKeyBatchSendError {
                         key: first_key,
                         shard,
@@ -219,11 +241,11 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
                 Ok(sent) => total += sent,
                 Err(e) => {
                     total += e.sent;
-                    let first_key = group
+                    refill_on_error(buf, group, groups);
+                    let first_key = buf
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
-                    refill_on_error(buf, group, groups);
                     return Err(shard_error::ShardKeyBatchSendError {
                         key: first_key,
                         shard,
@@ -320,7 +342,7 @@ impl<T: Send + 'static, const CAP: usize> Clone for ShardKey<T, CAP> {
 pub fn shard_key<T: Send + 'static, const CAP: usize>(
     num_shards: usize,
 ) -> (ShardKey<T, CAP>, ShardReceiver<T, CAP>) {
-    let num_shards = nearest_power_of_two(num_shards);
+    let num_shards = shard_power_of_two(num_shards);
     let (senders, receivers): (Vec<_>, Vec<_>) =
         (0..num_shards).map(|_| mpmc_bounded::<T, CAP>()).unzip();
     (
@@ -335,6 +357,7 @@ pub fn shard_key<T: Send + 'static, const CAP: usize>(
 // Tests
 
 #[cfg(test)]
+#[cfg_attr(miri, allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::internal_channel::errors::{AsyncSendRefError, RecvError};
@@ -891,4 +914,26 @@ mod tests {
         );
     }
     
+}
+
+#[cfg(all(test, not(loom)))]
+mod key_fn_panic_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn panic_key_fn_does_not_lose_the_batch() {
+        let (tx, _rx) = shard_key::<u64, 8>(2);
+        let mut buf = vec![1u64, 2, 3, 4];
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            let _ = tx.try_send_batch(&mut buf, |v| {
+                if *v == 3 {
+                    panic!("malformed item");
+                }
+                "key"
+            });
+        }));
+        assert!(r.is_err(), "key_fn must have panicked");
+        assert_eq!(buf, vec![1, 2, 3, 4], "batch lost on key_fn panic");
+    }
 }

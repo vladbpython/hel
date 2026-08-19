@@ -1,7 +1,10 @@
 use super::instance::{NONE, State};
 use crate::helper::panic::PanicReason;
 use std::{
-    panic::AssertUnwindSafe,
+    panic::{
+        AssertUnwindSafe,
+        catch_unwind,
+    },
     sync::atomic::Ordering
 };
 
@@ -33,7 +36,6 @@ impl Drop for OwnerGuard<'_> {
 
 
 /// Holds the item while the handler runs, so it is never dropped on the floor.
-///
 /// The worker owns the item until the handler commits it `slot.take()`,
 /// which for an async handler happens on the far side of an `.await`. 
 /// If the runtime cancels the worker task at that await, the whole frame is dropped,
@@ -77,6 +79,36 @@ impl<T, D: Fn(T, PanicReason)> Drop for CommitGuard<'_, T, D> {
         if let Some(item) = self.slot.take() {
             // Dead letter sink that panics must not turn a cancellation into double panic.
             let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                (self.dead_letter)(item, PanicReason::cancelled())
+            }));
+        }
+    }
+}
+
+
+pub(crate) struct CommitBatchGuard<'a, T, D: Fn(T, PanicReason)> {
+    buf: &'a mut Vec<T>,
+    dead_letter: &'a D,
+}
+
+impl<'a, T, D: Fn(T, PanicReason)> CommitBatchGuard<'a, T, D> {
+
+    /// Takes ownership of every item currently in `buf`.
+    pub(crate) fn new(buf: &'a mut Vec<T>, dead_letter: &'a D) -> Self {
+        buf.reverse();
+        Self { buf, dead_letter }
+    }
+
+    /// Next item in the order the batch was received.
+    pub(crate) fn next(&mut self) -> Option<T> {
+        self.buf.pop()
+    }
+}
+
+impl<T, D: Fn(T, PanicReason)> Drop for CommitBatchGuard<'_, T, D> {
+    fn drop(&mut self) {
+        while let Some(item) = self.buf.pop() {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
                 (self.dead_letter)(item, PanicReason::cancelled())
             }));
         }

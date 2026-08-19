@@ -10,6 +10,7 @@ where
     F: FnMut(&mut Vec<T>, usize) -> (usize, bool),
     H: FnMut(T, &mut O),
 {
+    let max = max.max(1);
     let mut buf: Vec<T> = Vec::with_capacity(max);
     let mut acc = init;
     loop {
@@ -42,6 +43,7 @@ where
     F: FnMut(&mut Vec<T>, usize) -> (usize, bool),
     S: FnMut(Vec<T>, &mut O) -> Vec<T>,
 {
+    let max = max.max(1);
     let mut buf: Vec<T> = Vec::with_capacity(max);
     let mut acc = init;
     loop {
@@ -74,6 +76,7 @@ where
     Fut: Future<Output = (R, Vec<T>, usize, bool)>,
     H: FnMut(T, &mut O),
 {
+    let max = max.max(1);
     let mut buf: Vec<T> = Vec::with_capacity(max);
     let mut acc = init;
     loop {
@@ -120,6 +123,7 @@ where
     S: FnMut(Vec<T>, O) -> SFut,
     SFut: Future<Output = (Vec<T>, O)>,
 {
+    let max = max.max(1);
     let mut buf: Vec<T> = Vec::with_capacity(max);
     let mut acc = init;
     loop {
@@ -365,4 +369,30 @@ mod tests {
             "batch contents != original"
         );
     }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn drain_batch_with_zero_max_terminates() {
+        let (std_tx, std_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut ch = shard_spsc::<u64, 16>(1);
+            let (mut tx, mut rx) = ch.take_pair(0).unwrap();
+            for i in 0..5u64 {
+                tx.try_send(i).unwrap();
+            }
+            drop(tx);
+            let got = drain_batch(
+                0, // pathological: must behave like 1, not hang
+                move |buf: &mut Vec<u64>, m| rx.recv_batch(buf, m),
+                |_v, c: &mut u64| *c += 1,
+                0u64,
+            );
+            std_tx.send(got).unwrap();
+        });
+        let got = std_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("drain_batch(0, ..) spun forever");
+        assert_eq!(got, 5, "zero max lost elements or changed semantics");
+    }
+
 }

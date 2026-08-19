@@ -58,6 +58,23 @@ impl Config {
         }
     }
 
+    pub(crate) fn init(mut self) -> Self {
+        self.max_consumers = self.max_consumers.max(1);
+        self.min_consumers = self.min_consumers.clamp(1, self.max_consumers);
+        self.batch_size = self.batch_size.max(1);
+        self
+    }
+
+    pub fn min_consumers(mut self, value: usize) -> Self {
+        self.min_consumers = value;
+        self
+    }
+
+    pub fn max_consumers(mut self, value: usize) -> Self {
+        self.max_consumers = value;
+        self
+    }
+
     pub fn scale_up_fill(mut self, value: f64) -> Self {
         self.scale_up_fill = value;
         self
@@ -98,7 +115,7 @@ impl Config {
         if fill > self.scale_up_fill {
             // UP: jump to target
             let target = (fill * self.max_consumers as f64).ceil() as usize;
-            target.clamp(current, self.max_consumers)
+            target.min(self.max_consumers).max(current.min(self.max_consumers))
         } else if fill < self.scale_down_fill {
             // DOWN: STRICTLY one at a time, NOT a jump!
             current.saturating_sub(1).max(self.min_consumers)
@@ -590,5 +607,34 @@ mod placement_tests {
         assert_eq!(an, 2, "new: skew floor bumps active to hot+1");
         assert_eq!(cn, 1, "new: hot shard isolated");
         eprintln!();
+    }
+
+    #[test]
+    fn init_repairs_broken_fields() {
+        let mut cfg = Config::new(1, 4);
+        cfg.min_consumers = 10;
+        cfg.max_consumers = 0;
+        cfg.batch_size = 0;
+        let n = cfg.init();
+        assert_eq!(n.max_consumers, 1, "zero max becomes one worker");
+        assert_eq!(n.min_consumers, 1, "min pulled into 1..=max");
+        assert_eq!(n.batch_size, 1, "zero batch pulls at least one item");
+
+        // A well formed config passes through untouched.
+        let ok = Config::new(2, 8).batch_size(32).init();
+        assert_eq!(
+            (ok.min_consumers, ok.max_consumers, ok.batch_size),
+            (2, 8, 32),
+            "valid config must not be altered"
+        );
+    }
+
+    #[test]
+    fn decide_with_current_above_max_does_not_panic() {
+        let cfg = Config::new(1, 4);
+        assert_eq!(cfg.decide(10, 0.9), 4, "scale back toward max, not panic");
+        assert_eq!(cfg.decide(2, 0.9), 4, "scale up to target");
+        assert_eq!(cfg.decide(3, 0.5), 3, "hold inside the band");
+        assert_eq!(cfg.decide(3, 0.1), 2, "scale down one step");
     }
 }

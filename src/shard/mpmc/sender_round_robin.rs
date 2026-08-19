@@ -29,7 +29,7 @@ use super::super::errors as shard_error;
 use super::{buf::RestoreOne, receiver::ShardReceiver};
 
 use crate::internal_channel::{
-    core::SeqInner, mpmc_bounded, nearest_power_of_two, sender::Sender, traits::InnerChannel,
+    core::SeqInner, mpmc_bounded, shard_power_of_two, sender::Sender, traits::InnerChannel
 };
 use std::{
     sync::{Arc, atomic::AtomicUsize, atomic::Ordering},
@@ -39,8 +39,9 @@ use std::{
 /// Sharded channel with round robin routing.
 /// Each `push` goes to the next shard in sequence.
 /// No key even load distribution across consumers.
-/// Cloning
-/// Each clone has an independent cursor starts from 0.
+/// Cloning: each clone gets an independent cursor seeded from the parent's
+/// current position (`cursor.fetch_add(1)`),
+/// so clones start on different shards and do not pile onto shard 0 in lockstep.
 pub struct ShardRoundRobin<
     T: Send + 'static,
     const CAP: usize,
@@ -249,7 +250,7 @@ impl<
 pub fn round_robin<T: Send + 'static, const CAP: usize>(
     num_shards: usize,
 ) -> (ShardRoundRobin<T, CAP>, ShardReceiver<T, CAP>) {
-    let num_shards = nearest_power_of_two(num_shards);
+    let num_shards = shard_power_of_two(num_shards);
     let (senders, receivers): (Vec<_>, Vec<_>) =
         (0..num_shards).map(|_| mpmc_bounded::<T, CAP>()).unzip();
     (
@@ -265,6 +266,7 @@ pub fn round_robin<T: Send + 'static, const CAP: usize>(
 // Tests
 
 #[cfg(test)]
+#[cfg_attr(miri, allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::internal_channel::errors::{AsyncSendRefError, RecvError};

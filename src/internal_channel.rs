@@ -29,8 +29,17 @@ pub fn scsp_bounded<T: Send, const CAP: usize>() -> (
 }
 
 /// Helper function: Rounds n to the nearest power of two.
+/// NOT for shard counts: one shard is a legal configuration, those go through
+/// [`shard_power_of_two`].
 #[inline]
 pub const fn nearest_power_of_two(n: usize) -> usize {
+    let p = n.next_power_of_two();
+    if p < 2 { 2 } else { p }
+}
+
+///For ring capacities use [`nearest_power_of_two`], ring cannot work at CAP = 1.
+#[inline]
+pub const fn shard_power_of_two(n: usize) -> usize {
     if n == 0 {
         return 1;
     }
@@ -50,12 +59,71 @@ mod tests {
         core::SeqInner,
         errors::{AsyncRecvError, AsyncSendRefError, RecvError, TryRecvError},
         mpmc_bounded, scsp_bounded,
+        nearest_power_of_two,
         sender::Sender,
+        shard_power_of_two,
         traits::InnerChannel,
     };
     use futures::poll;
     use std::{sync::Arc, thread, time::Duration};
     use tokio::time::timeout;
+
+    // nearest_power_of_two
+
+    #[test]
+    fn pow2_exact() {
+        assert_eq!(nearest_power_of_two(1), 2);
+        assert_eq!(nearest_power_of_two(2), 2);
+        assert_eq!(nearest_power_of_two(4), 4);
+        assert_eq!(nearest_power_of_two(128), 128);
+        assert_eq!(nearest_power_of_two(1024), 1024);
+    }
+
+    #[test]
+    fn pow2_rounds_up() {
+        assert_eq!(nearest_power_of_two(3), 4);
+        assert_eq!(nearest_power_of_two(5), 8);
+        assert_eq!(nearest_power_of_two(100), 128);
+        assert_eq!(nearest_power_of_two(300), 512);
+        assert_eq!(nearest_power_of_two(430), 512);
+        assert_eq!(nearest_power_of_two(500), 512);
+        assert_eq!(nearest_power_of_two(513), 1024);
+        assert_eq!(nearest_power_of_two(1000), 1024);
+    }
+
+    #[test]
+    fn pow2_zero_returns_one() {
+        assert_eq!(nearest_power_of_two(0), 2);
+    }
+
+    // shard_power_of_two
+
+    #[test]
+    fn shard2_exact() {
+        assert_eq!(shard_power_of_two(1), 1);
+        assert_eq!(shard_power_of_two(2), 2);
+        assert_eq!(shard_power_of_two(4), 4);
+        assert_eq!(shard_power_of_two(128), 128);
+        assert_eq!(shard_power_of_two(1024), 1024);
+    }
+
+    #[test]
+    fn shard2_rounds_up() {
+        assert_eq!(shard_power_of_two(3), 4);
+        assert_eq!(shard_power_of_two(5), 8);
+        assert_eq!(shard_power_of_two(100), 128);
+        assert_eq!(shard_power_of_two(300), 512);
+        assert_eq!(shard_power_of_two(430), 512);
+        assert_eq!(shard_power_of_two(500), 512);
+        assert_eq!(shard_power_of_two(513), 1024);
+        assert_eq!(shard_power_of_two(1000), 1024);
+    }
+
+    #[test]
+    fn shard2_zero_returns_one() {
+        assert_eq!(shard_power_of_two(0), 1);
+    }
+
 
     // Try recv
 

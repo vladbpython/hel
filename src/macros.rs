@@ -25,6 +25,10 @@
 /// let (tx, rx) = mpmc!(u64, 256, ByKey); //num_shards = num_cpus
 /// let (tx, rx) = mpmc!(u64, 256, ByKey, 8); //ByKey, 8 shards
 /// ```
+#[deprecated(
+    since = "2.4.0",
+    note = "use the constructors directly: channel::mpmc::*. Will be removed in the next major release."
+)]
 #[macro_export]
 macro_rules! mpmc {
     // RoundRobin: auto shards (default)
@@ -32,9 +36,9 @@ macro_rules! mpmc {
         const __CAP: usize = {
             let c = $cap as usize;
             assert!(c > 0, "capacity must be > 0");
-            c.next_power_of_two()
+            $crate::channel::nearest_power_of_two(c)
         };
-        let num_shards = $crate::channel::nearest_power_of_two(::num_cpus::get());
+        let num_shards = $crate::channel::shard_power_of_two(::num_cpus::get());
         $crate::channel::mpmc::round_robin::<$t, __CAP>(num_shards)
     }};
 
@@ -43,9 +47,9 @@ macro_rules! mpmc {
         const __CAP: usize = {
             let c = $cap as usize;
             assert!(c > 0, "capacity must be > 0");
-            c.next_power_of_two()
+            $crate::channel::nearest_power_of_two(c)
         };
-        let num_shards = $crate::channel::nearest_power_of_two(::num_cpus::get());
+        let num_shards = $crate::channel::shard_power_of_two(::num_cpus::get());
         $crate::channel::mpmc::round_robin::<$t, __CAP>(num_shards)
     }};
 
@@ -54,9 +58,9 @@ macro_rules! mpmc {
         const __CAP: usize = {
             let c = $cap as usize;
             assert!(c > 0, "capacity must be > 0");
-            c.next_power_of_two()
+            $crate::channel::nearest_power_of_two(c)
         };
-        let num_shards = $crate::channel::nearest_power_of_two($shards as usize);
+        let num_shards = $crate::channel::shard_power_of_two($shards as usize);
         $crate::channel::mpmc::round_robin::<$t, __CAP>(num_shards)
     }};
 
@@ -65,9 +69,9 @@ macro_rules! mpmc {
         const __CAP: usize = {
             let c = $cap as usize;
             assert!(c > 0, "capacity must be > 0");
-            c.next_power_of_two()
+            $crate::channel::nearest_power_of_two(c)
         };
-        let num_shards = $crate::channel::nearest_power_of_two(::num_cpus::get());
+        let num_shards = $crate::channel::shard_power_of_two(::num_cpus::get());
         $crate::channel::mpmc::shard_key::<$t, __CAP>(num_shards)
     }};
 
@@ -76,9 +80,9 @@ macro_rules! mpmc {
         const __CAP: usize = {
             let c = $cap as usize;
             assert!(c > 0, "capacity must be > 0");
-            c.next_power_of_two()
+            $crate::channel::nearest_power_of_two(c)
         };
-        let num_shards = $crate::channel::nearest_power_of_two($shards as usize);
+        let num_shards = $crate::channel::shard_power_of_two($shards as usize);
         $crate::channel::mpmc::shard_key::<$t, __CAP>(num_shards)
     }};
 }
@@ -99,13 +103,17 @@ macro_rules! mpmc {
 /// let (tx0, rx0) = ch.take_pair(0).unwrap();
 /// let (tx1, rx1) = ch.take_pair(1).unwrap();
 /// ```
+#[deprecated(
+    since = "2.4.0",
+    note = "use the constructors directly: channel::spsc::shard_spsc. Will be removed in the next major release."
+)]
 #[macro_export]
 macro_rules! spsc {
     ($t:ty, $cap:expr) => {{
         const __CAP: usize = {
             let c = $cap as usize;
             assert!(c > 0, "capacity must be > 0");
-            c.next_power_of_two()
+            $crate::channel::nearest_power_of_two(c)
         };
         // sharded_spsc does not require power 2 num_cpus directly
         $crate::channel::spsc::SpscShard::<$t, __CAP>::new(::num_cpus::get())
@@ -114,44 +122,16 @@ macro_rules! spsc {
         const __CAP: usize = {
             let c = $cap as usize;
             assert!(c > 0, "capacity must be > 0");
-            c.next_power_of_two()
+            $crate::channel::nearest_power_of_two(c)
         };
         $crate::channel::spsc::SpscShard::<$t, __CAP>::new($shards as usize)
     }};
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
-    use crate::internal_channel::nearest_power_of_two;
-
-    // nearest_power_of_two
-
-    #[test]
-    fn pow2_exact() {
-        assert_eq!(nearest_power_of_two(1), 1);
-        assert_eq!(nearest_power_of_two(2), 2);
-        assert_eq!(nearest_power_of_two(4), 4);
-        assert_eq!(nearest_power_of_two(128), 128);
-        assert_eq!(nearest_power_of_two(1024), 1024);
-    }
-
-    #[test]
-    fn pow2_rounds_up() {
-        assert_eq!(nearest_power_of_two(3), 4);
-        assert_eq!(nearest_power_of_two(5), 8);
-        assert_eq!(nearest_power_of_two(100), 128);
-        assert_eq!(nearest_power_of_two(300), 512);
-        assert_eq!(nearest_power_of_two(430), 512);
-        assert_eq!(nearest_power_of_two(500), 512);
-        assert_eq!(nearest_power_of_two(513), 1024);
-        assert_eq!(nearest_power_of_two(1000), 1024);
-    }
-
-    #[test]
-    fn pow2_zero_returns_one() {
-        assert_eq!(nearest_power_of_two(0), 1);
-    }
-
+    
     // sharded! policy arms
 
     #[test]
@@ -309,5 +289,21 @@ mod tests {
         let shard = tx.shard_for("ETH");
         tx.try_send("ETH", 999u64).unwrap();
         assert_eq!(rx.receiver(shard).try_recv().unwrap(), 999);
+    }
+
+    #[test]
+    fn capacity_one_rounds_up_to_two() {
+        // mpmc: constructs and works.
+        let (tx, _rx) = mpmc!(u64, 1, RoundRobin, 2);
+        tx.send(7).unwrap();
+
+        // spsc: CAP = 2 means two sends fit before the ring is full.
+        let mut ch = spsc!(u64, 1, 1);
+        let (mut stx, mut srx) = ch.take_pair(0).unwrap();
+        stx.try_send(1).unwrap();
+        stx.try_send(2).unwrap(); // second slot exists -> CAP was rounded to 2
+        assert!(stx.try_send(3).is_err(), "CAP must be exactly 2");
+        assert_eq!(srx.try_recv().unwrap(), 1);
+        assert_eq!(srx.try_recv().unwrap(), 2);
     }
 }

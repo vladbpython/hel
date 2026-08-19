@@ -236,7 +236,7 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
     pub fn queued(&self) -> usize {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
-        tail.wrapping_sub(head)
+        tail.wrapping_sub(head).min(CAP)
     }
 }
 
@@ -993,6 +993,43 @@ mod core_init_tests {
         prod.join().unwrap();
         cons.join().unwrap();
         assert_eq!(fake, 0, "queued() underflowed and returned a wrapped value");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn queued_is_capped_by_cap_with_blocked_producers() {
+        const CAP: usize = 4;
+        let inner: Arc<SeqInner<u64, CAP>> = SeqInner::new();
+        for i in 0..CAP as u64 {
+            inner.push(i).unwrap(); // ring full: tail - head == CAP
+        }
+        // Two producers block inside push_fetch_add, each having already advanced `tail`,
+        // the raw difference is now CAP + 2.
+        let blocked: Vec<_> = (0..2)
+            .map(|_| {
+                let p = inner.clone();
+                thread::spawn(move || p.push_fetch_add(99).unwrap())
+            })
+            .collect();
+        // Wait until both reservations landed, then check the cap.
+        let t0 = Instant::now();
+        while inner.tail.load(Ordering::Relaxed) < CAP + 2 {
+            assert!(t0.elapsed().as_secs() < 5, "producers never reserved");
+            thread::yield_now();
+        }
+        assert_eq!(inner.queued(), CAP, "queued() must not exceed the capacity");
+        // Free two slots so both blocked producers finish, then drain fully.
+        for _ in 0..2 {
+            inner.pop().unwrap();
+        }
+        for b in blocked {
+            b.join().unwrap();
+        }
+        assert_eq!(inner.queued(), CAP, "full again after the blocked sends landed");
+        for _ in 0..CAP {
+            inner.pop().unwrap();
+        }
+        assert_eq!(inner.queued(), 0);
     }
 }
 

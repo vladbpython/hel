@@ -32,6 +32,7 @@
 //! let (tx2, rx2) = ch.take_pair(2).unwrap();  //shard 2 → core 2
 //! //shards 1, 3 — not used
 //! ```
+//! 
 
 use super::errors as shard_error;
 use crate::internal_channel::{core::SingleInner, receiver::SingleReceiver, sender::SingleSender};
@@ -234,6 +235,10 @@ impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
             })
     }
 
+    /// CAVEAT: the count alone cannot tell "all sent" from "the receiver is
+    /// gone". Do not retry in a `while !buf.is_empty()` loop: once the
+    /// receiver is dropped nothing can be sent, so that loop never ends.
+    /// If a call sent 0 and `buf` is still not empty - receiver is gone, stop.
     pub async fn send_batch_async(&mut self, buf: &mut Vec<T>) -> usize {
         self.inner.send_batch_async(buf).await
     }
@@ -332,6 +337,7 @@ pub fn shard_spsc<T: Send + 'static, const CAP: usize>(num_shards: usize) -> Sps
 // Tests
 
 #[cfg(test)]
+#[cfg_attr(miri, allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::internal_channel::errors::{AsyncRecvError, AsyncSendRefError, RecvError};

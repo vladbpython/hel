@@ -1,6 +1,6 @@
 [package]
 name = "hel-rs"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2024"
 authors = ["Bieliaiev Vladyslav <vladbpython@gmail.com>"]
 description = "High-performance lock-free sharded sync+async MPMC/SPSC channels with keyed routing"
@@ -15,7 +15,8 @@ exclude = [
 
 [dependencies]
 atomic-waker = "1"
-futures = "0.3.32"
+futures-core = "0.3.31"
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 num_cpus = "1.17.0"
 parking_lot = "0.12"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -27,6 +28,7 @@ loom = "0.7.2"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dev-dependencies]
+futures = "0.3.33"
 flume = "0.12"
 criterion = { version = "0.8.2", features = ["async_tokio","html_reports"] }
 crossbeam-channel = "0.5.15"

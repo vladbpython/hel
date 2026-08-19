@@ -4,11 +4,19 @@ use super::{
     receiver::ShardReceiver,
 };
 use crate::internal_channel::{
-    core::SeqInner, mpmc_bounded, nearest_power_of_two, sender::Sender, traits::InnerChannel,
+    core::SeqInner, mpmc_bounded, shard_power_of_two, sender::Sender, traits::InnerChannel,
 };
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::{Duration,Instant};
+use std::{
+    any::Any,
+    collections::HashMap,
+    panic::{
+        AssertUnwindSafe,
+        catch_unwind,
+        resume_unwind
+    },
+    sync::Arc,
+    time::{Duration,Instant},
+};
 
 // SymbolHandle
 
@@ -62,7 +70,7 @@ pub struct ShardGroup<
 impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
     /// Create from an explicit list of groups. Group i → shard i.
     pub fn from_groups(groups: &[&[&str]]) -> (Self, ShardReceiver<T, CAP>) {
-        let n = nearest_power_of_two(groups.len().max(1));
+        let n = shard_power_of_two(groups.len().max(1));
         let (senders, receivers): (Vec<_>, Vec<_>) =
             (0..n).map(|_| mpmc_bounded::<T, CAP>()).unzip();
 
@@ -87,7 +95,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         map: HashMap<String, usize>,
         num_groups: usize,
     ) -> (Self, ShardReceiver<T, CAP>) {
-        let n = nearest_power_of_two(num_groups.max(1));
+        let n = shard_power_of_two(num_groups.max(1));
         let (senders, receivers): (Vec<_>, Vec<_>) =
             (0..n).map(|_| mpmc_bounded::<T, CAP>()).unzip();
 
@@ -207,11 +215,27 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         let n = self.mask + 1;
         let mut groups: Vec<Vec<T>> = (0..n).map(|_| Vec::new()).collect();
         let mut unused: Vec<T> = Vec::new();
+        let mut poisoned: Option<(Box<dyn Any + Send>, Vec<T>)> = None;
         for item in buf.drain(..) {
-            match self.route.get(key_fn(&item)) {
-                Some(&shard) => groups[shard].push(item),
-                None => unused.push(item),
+            match &mut poisoned {
+                Some((_, rescue)) => rescue.push(item),
+                None => {
+                    match catch_unwind(AssertUnwindSafe(|| self.route.get(key_fn(&item)).copied()))
+                    {
+                        Ok(Some(shard)) => groups[shard].push(item),
+                        Ok(None) => unused.push(item),
+                        Err(p) => poisoned = Some((p, vec![item])),
+                    }
+                }
             }
+        }
+        if let Some((p, mut rescue)) = poisoned {
+            for g in &mut groups {
+                buf.append(g);
+            }
+            buf.append(&mut unused);
+            buf.append(&mut rescue);
+            resume_unwind(p);
         }
         (groups, unused)
     }
@@ -222,6 +246,12 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
     /// (stop on the first error.
     /// The output of `buf` contains ALL the raw data: unused (not in the map) and
     /// unsent (remainder of the fallen group + untouched groups) no losses.
+    /// CAVEAT: `Ok` does not mean `buf` is empty. Items whose key is not in the
+    /// route map cannot be sent by this channel at all, and they are handed back
+    /// in `buf`. So `Ok(0)` with a non empty `buf` is a normal result, and a
+    /// `while !buf.is_empty() { .. }` retry loop over it never ends. Retry on
+    /// `Err`, and treat `Ok(_)` with a non empty `buf` as orphan keys to route
+    /// elsewhere or drop.
     pub fn try_send_batch(
         &self,
         buf: &mut Vec<T>,
@@ -241,13 +271,13 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
                 Ok(sent) => total += sent,
                 Err(e) => {
                     total += e.sent;
-                    let first_key = group
+                    refill_on_error(buf, group, groups);
+                    buf.append(&mut unused); // unused too in buf
+                    let first_key = buf
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
                     // return the remainder of the fallen group + untouched groups
-                    refill_on_error(buf, group, groups);
-                    buf.append(&mut unused); // сирот тоже в buf
                     return Err(shard_error::ShardKeyTryBatchSendError {
                         key: first_key,
                         shard,
@@ -267,6 +297,12 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
     /// receiver unsent elements. Stores the FIFO within the group.
     /// Returns `Ok(sent)` if everything has been sent (except unused).
     /// Returns `Err(ShardKeyBatchSendError)` if the receiver is closed.
+    /// CAVEAT: `Ok` does not mean `buf` is empty. Items whose key is not in the
+    /// route map cannot be sent by this channel at all, and they are handed back
+    /// in `buf`. So `Ok(0)` with a non empty `buf` is a normal result, and a
+    /// `while !buf.is_empty() { .. }` retry loop over it never ends. Retry on
+    /// `Err`, and treat `Ok(_)` with a non empty `buf` as orphan keys to route
+    /// elsewhere or drop.
     pub fn send_batch(
         &self,
         buf: &mut Vec<T>,
@@ -286,12 +322,12 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
                 Ok(sent) => total += sent,
                 Err(e) => {
                     total += e.sent;
-                    let first_key = group
+                    refill_on_error(buf, group, groups);
+                    buf.append(&mut unused);
+                    let first_key = buf
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
-                    refill_on_error(buf, group, groups);
-                    buf.append(&mut unused);
                     return Err(shard_error::ShardKeyBatchSendError {
                         key: first_key,
                         shard,
@@ -310,6 +346,12 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
     /// On error (deadline or disconnect), `buf` contains unsent elements.
     /// Unused (the key is not in the map) are also placed in `buf`. Stores the FIFO within the group.
     /// Returns `Ok(sent)` if everything has been sent (except unused).
+    /// CAVEAT: `Ok` does not mean `buf` is empty. Items whose key is not in the
+    /// route map cannot be sent by this channel at all, and they are handed back
+    /// in `buf`. So `Ok(0)` with a non empty `buf` is a normal result, and a
+    /// `while !buf.is_empty() { .. }` retry loop over it never ends. Retry on
+    /// `Err`, and treat `Ok(_)` with a non empty `buf` as orphan keys to route
+    /// elsewhere or drop.
     pub fn send_batch_timeout(
         &self,
         buf: &mut Vec<T>,
@@ -332,12 +374,12 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
                 Ok(sent) => total += sent,
                 Err(e) => {
                     total += e.sent;
-                    let first_key = group
+                    refill_on_error(buf, group, groups);
+                    buf.append(&mut unused);
+                    let first_key = buf
                         .first()
                         .map(|item| key_fn(item).to_string())
                         .unwrap_or_default();
-                    refill_on_error(buf, group, groups);
-                    buf.append(&mut unused);
                     return Err(shard_error::ShardKeyBatchSendError {
                         key: first_key,
                         shard,
@@ -458,6 +500,7 @@ impl<T: Send + 'static, const CAP: usize> Clone for ShardGroup<T, CAP> {
 }
 
 #[cfg(test)]
+#[cfg_attr(miri, allow(unused_imports))]
 mod tests {
     use super::*;
     use crate::internal_channel::errors::AsyncSendRefError;
@@ -807,5 +850,44 @@ mod tests {
         assert_eq!(err.shard, a.shard());
         assert_eq!(err.err, AsyncSendRefError::Disconnected);
         assert_eq!(slot, Some(3));
+    }
+}
+
+
+#[cfg(all(test, not(loom)))]
+mod key_fn_panic_and_orphan_tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    #[test]
+    fn panic_key_fn_does_not_lose_the_batch() {
+        let (tx, _rx) = shard_group::<(String, u64), 8>(ShardGroupCase::Groups {
+            groups: &[&["A"], &["B"]],
+        });
+        let mut buf: Vec<(String, u64)> =
+            vec![("A".into(), 1), ("B".into(), 2), ("A".into(), 3)];
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            let _ = tx.try_send_batch(&mut buf, |(k, v)| {
+                if *v == 3 {
+                    panic!("malformed item");
+                }
+                k.as_str()
+            });
+        }));
+        assert!(r.is_err(), "key_fn must have panicked");
+        assert_eq!(buf.len(), 3, "batch lost on key_fn panic");
+    }
+
+    #[test]
+    fn unused_keys_return_ok_with_no_progress() {
+        let (tx, _rx) = shard_group::<(String, u64), 8>(ShardGroupCase::Groups {
+            groups: &[&["A"], &["B"]],
+        });
+        let mut buf: Vec<(String, u64)> = vec![("GHOST".into(), 1)];
+        for round in 0..3 {
+            let sent = tx.send_batch(&mut buf, |(k, _)| k.as_str()).unwrap();
+            assert_eq!(sent, 0, "round {round}: nothing is routable");
+            assert_eq!(buf.len(), 1, "round {round}: orphan stays in buf");
+        }
     }
 }

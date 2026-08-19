@@ -297,7 +297,7 @@ pub struct GenericSendFuture<'a, T: Send + 'static, const CAP: usize, I: SenderO
     _t: PhantomData<T>,
 }
 
-unsafe impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Send
+unsafe impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP> + Send + Sync> Send
     for GenericSendFuture<'_, T, CAP, I>
 {
 }
@@ -335,7 +335,7 @@ struct SendPending<'a, T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>
 
 // Same reason as GenericSendFuture: SenderOps does not require Sync, which
 // `&Arc<I>: Send` would otherwise want.
-unsafe impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Send
+unsafe impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP> + Send + Sync> Send
     for SendPending<'_, T, CAP, I>
 {
 }
@@ -507,6 +507,10 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
         self.send_ref_async(value).await.map_err(|_| ())
     }
 
+    /// CAVEAT: the count alone cannot tell "all sent" from "the receiver is
+    /// gone". Do not retry in a `while !buf.is_empty()` loop: once the
+    /// receiver is dropped nothing can be sent, so that loop never ends.
+    /// If a call sent 0 and `buf` is still not empty - receiver is gone, stop.
     #[cfg_attr(not(test), allow(dead_code))] 
     pub async fn send_batch_async(&self, buf: &mut Vec<T>) -> usize {
         let fast = self.inner.push_batch(buf); // one publication per batch

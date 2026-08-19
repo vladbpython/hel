@@ -11,7 +11,7 @@ use crate::{
     helper::panic::PanicReason,
     internal_channel::{receiver::Receiver, traits::InnerChannel},
 };
-use futures::FutureExt;
+use futures_util::FutureExt;
 use std::{panic::{AssertUnwindSafe,catch_unwind}, sync::Arc, thread, time::Duration};
 
 const MONITOR_TICK: Duration = Duration::from_millis(10);
@@ -35,6 +35,7 @@ where
     H: traits::AsyncSlotHandler<T>,
     D: Fn(T, PanicReason) + Send + Sync + 'static,
 {
+    let cfg = cfg.init();
     let shards = receivers.len();
     let state = instance::State::new(shards, cfg.min_consumers);
     let receivers = Arc::new(receivers);
@@ -61,7 +62,13 @@ where
                     let (n, dc) = receivers[shard].try_recv_batch(&mut buf, cfg.batch_size);
                     if n > 0 {
                         done = true;
-                        for item in buf.drain(..n) {
+                        debug_assert_eq!(
+                            buf.len(),
+                            n,
+                            "worker buffer must hold exactly the dequeued batch"
+                        );
+                        let mut batch = guard::CommitBatchGuard::new(&mut buf, &*dead_letter);
+                        while let Some(item) = batch.next()  {
                             let mut held = guard::CommitGuard::new(item, &*dead_letter);
                             let slot = held.slot();
                             let r = AssertUnwindSafe(async { handler.handle(slot).await })
@@ -165,6 +172,7 @@ where
     H: traits::SyncSlotHandler<T>,
     D: Fn(T, PanicReason) + Send + Sync + 'static,
 {
+    let cfg = cfg.init();
     let shards = receivers.len();
     let state = instance::State::new(shards, cfg.min_consumers);
     let receivers = Arc::new(receivers);
@@ -213,7 +221,8 @@ where
                                 }
                             }
                         }
-                    } else if dc {
+                    } 
+                    if dc {
                         state.mark_closed(shard);
                     }
                 }
@@ -942,6 +951,7 @@ mod panic_safety_tests {
         sync::{
             Arc,
             atomic::{AtomicU8, AtomicU64, Ordering},
+            Mutex,
         },
         thread,
     };
@@ -1405,4 +1415,77 @@ mod panic_safety_tests {
         assert_eq!(cancelled.load(Ordering::Relaxed), 1, "reason should say cancelled, not panic");
     }
 
+    #[cfg(not(miri))]
+    #[test]
+    fn cancelled_worker_hands_back_the_whole_batch() {
+        const N: u64 = 8;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let dead: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(AtomicU64::new(0));
+        let (d, c) = (dead.clone(), cancelled.clone());
+
+        rt.block_on(async move {
+            let (tx, rx) = round_robin::<u64, 64>(1);
+            for i in 0..N {
+                tx.try_send(i).unwrap();
+            }
+            let _pool = async_pool_slot(
+                tests::TokioRuntime,
+                instance::Config::new(1, 1),
+                rx.into_receivers(),
+                CommitsAfterAwait,
+                move |poison: u64, reason: PanicReason| {
+                    if reason.is_cancelled() {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    }
+                    d.lock().unwrap().push(poison);
+                },
+            );
+            // let the worker take the batch and park inside the first handler.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        // cancel the worker while it awaits with N - 1 items still in its buffer.
+        rt.shutdown_timeout(Duration::from_millis(100));
+        let got = dead.lock().unwrap().clone();
+        let mut sorted = got.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted,
+            (0..N).collect::<Vec<_>>(),
+            "the batch tail was dropped on cancellation"
+        );
+        assert_eq!(cancelled.load(Ordering::Relaxed), N, "reason should say cancelled, not panic");
+        assert_eq!(got, (0..N).collect::<Vec<_>>(), "batch handed back out of order");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn broken_config_fields_are_repaired() {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (std_tx, std_rx) = round_robin::<u64, CAP>(6);
+            let mut cfg = instance::Config::new(1, 2).batch_size(0);
+            cfg.min_consumers = 10;
+            let count = Arc::new(AtomicU64::new(0));
+            let c = count.clone();
+            let pool = sync_pool_slot(
+                cfg,
+                std_rx.into_receivers(),
+                handler::PerItem(move |_v: &u64| {
+                    c.fetch_add(1, Ordering::Relaxed);
+                }),
+                |_poison, _panic_info| {},
+            );
+            for i in 0..600u64 {
+                std_tx.send(i).unwrap();
+            }
+            drop(std_tx); // autodrain: the pool stops once every shard drains and closes
+            pool.wait_stopping();
+            done_tx.send(count.load(Ordering::Relaxed)).unwrap();
+        });
+        let processed = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("pool wedged: unserviced shards or a zero batch_size");
+        assert_eq!(processed, 600, "loss on a repaired config");
+    }
 }
