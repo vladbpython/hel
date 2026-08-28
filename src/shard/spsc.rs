@@ -32,7 +32,7 @@
 //! let (tx2, rx2) = ch.take_pair(2).unwrap();  //shard 2 → core 2
 //! //shards 1, 3 — not used
 //! ```
-//! 
+//!
 
 use super::errors as shard_error;
 use crate::internal_channel::{core::SingleInner, receiver::SingleReceiver, sender::SingleSender};
@@ -211,7 +211,10 @@ impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
             })
     }
     /// Blocking batch send: waits until everything is sent.
-    pub fn send_batch(&mut self, buf: &mut Vec<T>) -> Result<usize, shard_error::ShardBatchSendError> {
+    pub fn send_batch(
+        &mut self,
+        buf: &mut Vec<T>,
+    ) -> Result<usize, shard_error::ShardBatchSendError> {
         self.inner
             .send_batch(buf)
             .map_err(|e| shard_error::ShardBatchSendError {
@@ -242,7 +245,6 @@ impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
     pub async fn send_batch_async(&mut self, buf: &mut Vec<T>) -> usize {
         self.inner.send_batch_async(buf).await
     }
-
 }
 
 impl<T: Send + 'static, const CAP: usize> SpscReceiver<T, CAP> {

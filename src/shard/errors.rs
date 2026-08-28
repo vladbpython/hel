@@ -1,5 +1,8 @@
 use crate::internal_channel::errors;
-use std::fmt::{Debug, Display, Formatter, Result};
+use std::{
+    error::Error as StdError,
+    fmt::{Debug, Display, Formatter, Result},
+};
 
 /// `try_send` error in `Shard` (RoundRobin) Full or Disconnected.
 pub struct ShardTrySendError<T> {
@@ -167,12 +170,28 @@ pub struct ShardAsyncSendRefError {
     pub err: errors::AsyncSendRefError,
 }
 
+impl Display for ShardAsyncSendRefError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(f, "shard {}: {}", self.shard, self.err)
+    }
+}
+
 /// Borrow send by key failed. The value is NOT lost: it remains in the caller's slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShardKeyAsyncSendRefError {
     pub key: String,
     pub shard: usize,
     pub err: errors::AsyncSendRefError,
+}
+
+impl Display for ShardKeyAsyncSendRefError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(
+            f,
+            "key {:?} -> shard {}: {}",
+            self.key, self.shard, self.err
+        )
+    }
 }
 
 /// `try_recv` error from `ShardReceiver` is Empty or Disconnected.
@@ -360,3 +379,22 @@ impl Display for ShardRecvAnyError {
         )
     }
 }
+
+impl<T: Debug> StdError for ShardTrySendError<T> {}
+impl<T: Debug> StdError for ShardSendError<T> {}
+impl<T: Debug> StdError for ShardKeyTrySendError<T> {}
+impl<T: Debug> StdError for ShardKeySendError<T> {}
+impl<T: Debug> StdError for ShardAsyncSendError<T> {}
+impl<T: Debug> StdError for ShardKeyAsyncSendError<T> {}
+impl StdError for ShardAsyncSendRefError {}
+impl StdError for ShardKeyAsyncSendRefError {}
+impl StdError for ShardTryRecvError {}
+impl StdError for ShardRecvError {}
+impl StdError for ShardAsyncRecvError {}
+impl StdError for ShardTryBatchSendError {}
+impl StdError for ShardBatchSendError {}
+impl StdError for ShardAsyncBatchSendError {}
+impl StdError for ShardKeyTryBatchSendError {}
+impl StdError for ShardKeyBatchSendError {}
+impl StdError for ShardKeyAsyncBatchSendError {}
+impl StdError for ShardRecvAnyError {}

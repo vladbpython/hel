@@ -72,42 +72,69 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardReceiver
         hash_key(key) & self.mask
     }
 
+    #[inline]
+    #[track_caller]
+    fn check_shard(&self, shard: usize) -> usize {
+        assert!(
+            shard < self.receivers.len(),
+            "shard index {shard} out of range: this channel has {} shards",
+            self.receivers.len()
+        );
+        shard
+    }
+
     pub fn try_recv(&mut self, shard: usize) -> Result<T, shard_error::ShardTryRecvError> {
-        let idx = shard % self.receivers.len();
+        let idx = self.check_shard(shard);
         self.receivers[idx]
             .try_recv()
             .map_err(|err| shard_error::ShardTryRecvError { shard: idx, err })
     }
 
     pub fn recv(&self, shard: usize) -> Result<T, shard_error::ShardRecvError> {
-        let idx = shard % self.receivers.len();
+        let idx = self.check_shard(shard);
         self.receivers[idx]
             .recv()
             .map_err(|err| shard_error::ShardRecvError { shard: idx, err })
     }
 
     pub async fn recv_async(&self, shard: usize) -> Result<T, shard_error::ShardAsyncRecvError> {
-        let idx = shard % self.receivers.len();
+        let idx = self.check_shard(shard);
         self.receivers[idx]
             .recv_async()
             .await
             .map_err(|err| shard_error::ShardAsyncRecvError { shard: idx, err })
     }
 
-    pub fn try_recv_any(&mut self) -> Option<(usize, T)> {
+    /// Non-blocking receive from any shard.
+    /// `Ok(None)` means "nothing available right now", `Err` means every
+    /// sender of every shard is gone and nothing is left to drain,
+    /// documented `while let` polling loop must stop instead of spinning
+    /// core forever (the old `Option` return could not tell the two apart).
+    pub fn try_recv_any(&mut self) -> Result<Option<(usize, T)>, shard_error::ShardRecvAnyError> {
         let n = self.receivers.len();
+        let mut disconnected = 0usize;
         for i in 0..n {
             let idx = (self.cursor + i) % n;
-            if let Ok(v) = self.receivers[idx].try_recv() {
-                self.cursor = (idx + 1) % n;
-                return Some((idx, v));
+            match self.receivers[idx].try_recv() {
+                Ok(v) => {
+                    self.cursor = (idx + 1) % n;
+                    return Ok(Some((idx, v)));
+                }
+                Err(TryRecvError::Disconnected) => disconnected += 1,
+                Err(TryRecvError::Empty) => {}
             }
         }
-        None
+        if disconnected == n {
+            return Err(shard_error::ShardRecvAnyError {
+                disconnected_shards: disconnected,
+                err: AsyncRecvError::Disconnected,
+            });
+        }
+        Ok(None)
     }
 
     pub fn recv_batch(&mut self, shard: usize, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
-        self.receivers[shard % self.receivers.len()].recv_batch(buf, max)
+        self.receivers[self.check_shard(shard)].recv_batch(buf, max)
     }
 
     /// Async batch recv from a specific shard.
@@ -118,23 +145,31 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardReceiver
         buf: &mut Vec<T>,
         max: usize,
     ) -> (usize, bool) {
-        let idx = shard % self.receivers.len();
+        let idx = self.check_shard(shard);
         self.receivers[idx].recv_batch_async(buf, max).await
     }
 
-    pub fn try_recv_batch_any(&mut self, buf: &mut Vec<T>, max_per_shard: usize) -> usize {
+    /// Non-blocking batch receive across all shards.
+    /// Returns `(count, disconnected)`; same convention as `pop_batch`:
+    /// `disconnected` is true only when nothing was received and every shard is closed and drained,
+    /// so a polling loop knows when to stop instead of spinning core forever.
+    pub fn try_recv_batch_any(&mut self, buf: &mut Vec<T>, max_per_shard: usize) -> (usize, bool) {
         let n = self.receivers.len();
         let start = self.cursor;
         let mut total = 0usize;
+        let mut disconnected = 0usize;
         for i in 0..n {
             let idx = (start + i) % n;
-            let (count, _) = self.receivers[idx].try_recv_batch(buf, max_per_shard);
+            let (count, dc) = self.receivers[idx].try_recv_batch(buf, max_per_shard);
             total += count;
+            if dc {
+                disconnected += 1;
+            }
         }
         if total > 0 {
             self.cursor = (self.cursor + 1) % n;
         }
-        total
+        (total, total == 0 && disconnected == n)
     }
 
     pub fn recv_any(&mut self) -> RecvAnyFuture<'_, T, CAP, I> {
@@ -150,7 +185,18 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardReceiver
     }
 
     pub fn receiver(&self, shard: usize) -> &Receiver<T, CAP, I> {
-        &self.receivers[shard % self.receivers.len()]
+        &self.receivers[self.check_shard(shard)]
+    }
+
+    /// No panic access to a shard, `slice::get` style: `None` for an out of range index.
+    ///
+    /// ```ignore
+    /// let v = rx.get_receiver(i).ok_or("no such shard")?.try_recv()?;
+    /// ```
+    ///
+    #[inline]
+    pub fn get_receiver(&self, shard: usize) -> Option<&Receiver<T, CAP, I>> {
+        self.receivers.get(shard)
     }
 }
 
@@ -183,6 +229,10 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Future
                                 .inner_ref()
                                 .receiver_waiters()
                                 .cancel_async_slot(&s);
+                            this.rx.receivers[i]
+                                .inner_ref()
+                                .receiver_waiters()
+                                .notify_one();
                         }
                     }
                     return Poll::Ready(Ok((idx, v)));
@@ -240,10 +290,45 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Future
                             .inner_ref()
                             .receiver_waiters()
                             .cancel_async_slot(&s);
+                        this.rx.receivers[i]
+                            .inner_ref()
+                            .receiver_waiters()
+                            .notify_one();
                     }
                 }
                 return Poll::Ready(Ok((idx, v)));
             }
+        }
+
+        // Re-check disconnect after registration, mirroring the single shard future.
+        // close racing with this poll fires `wake_all` on every shard before our slots exist,
+        // pre registration check above has already passed,
+        // so without this recheck nobody ever wakes the slots
+        // and the future parks forever instead of returning `AsyncRecvError::Disconnected`.
+        let disconnected = this
+            .rx
+            .receivers
+            .iter()
+            .filter(|r| r.inner_ref().is_tx_closed() && r.inner_ref().is_empty())
+            .count();
+        if disconnected == n {
+            for (i, slot) in this.slots.iter_mut().enumerate() {
+                if let Some(s) = slot.take() {
+                    this.rx.receivers[i]
+                        .inner_ref()
+                        .receiver_waiters()
+                        .cancel_async_slot(&s);
+                    // Same baton pass as on the Ready paths and in Drop.
+                    this.rx.receivers[i]
+                        .inner_ref()
+                        .receiver_waiters()
+                        .notify_one();
+                }
+            }
+            return Poll::Ready(Err(shard_error::ShardRecvAnyError {
+                disconnected_shards: disconnected,
+                err: AsyncRecvError::Disconnected,
+            }));
         }
 
         Poll::Pending
@@ -274,7 +359,10 @@ mod recv_any_tests {
     use crate::{channel::mpmc::round_robin, internal_channel::traits::InnerChannel};
     use std::{
         future::Future,
-        sync::{Arc, atomic::{AtomicBool,Ordering}},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
         task::{Context, Waker},
         time::Duration,
     };
@@ -321,13 +409,13 @@ mod recv_any_tests {
         tx.try_send(2).unwrap(); // шард 1
         let mut srx = rx;
         // Empty shard 0 directly, keeping its sender alive.
-        let _ = srx.receiver(0).try_recv().unwrap();
+        let _ = srx.get_receiver(0).unwrap().try_recv().unwrap();
 
         let done = Arc::new(AtomicBool::new(false));
         let d2 = done.clone();
         let h = std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let n = srx.try_recv_batch_any(&mut buf, 8);
+            let (n, _) = srx.try_recv_batch_any(&mut buf, 8);
             d2.store(true, Ordering::Release);
             (n, buf)
         });

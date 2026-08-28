@@ -12,9 +12,107 @@ use crate::{
     internal_channel::{receiver::Receiver, traits::InnerChannel},
 };
 use futures_util::FutureExt;
-use std::{panic::{AssertUnwindSafe,catch_unwind}, sync::Arc, thread, time::Duration};
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 const MONITOR_TICK: Duration = Duration::from_millis(10);
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_async_worker<AR, T, const CAP: usize, I, H, D>(
+    async_runtime: &AR,
+    id: usize,
+    cfg: instance::Config,
+    shards: usize,
+    state: Arc<instance::State>,
+    receivers: Arc<Vec<Receiver<T, CAP, I>>>,
+    handler: Arc<H>,
+    dead_letter: Arc<D>,
+) -> AR::JoinHandle
+where
+    AR: traits::AsyncRuntime,
+    T: Send + 'static,
+    I: InnerChannel<T, CAP> + Send + Sync + 'static,
+    Receiver<T, CAP, I>: Send + Sync,
+    H: traits::AsyncSlotHandler<T>,
+    D: Fn(T, PanicReason) + Send + Sync + 'static,
+{
+    let ar = async_runtime.clone();
+    async_runtime.spawn(async move {
+        let _guard = guard::OwnerGuard::new(&state, id);
+        let mut buf: Vec<T> = Vec::with_capacity(cfg.batch_size);
+        let mut idle_streak: u32 = 0;
+        while !state.is_stopped() {
+            let mut done = false;
+            for shard in 0..shards {
+                if !instance::claim_or_release(&state, id, shard) {
+                    continue;
+                }
+                let (n, dc) = receivers[shard].try_recv_batch(&mut buf, cfg.batch_size);
+                if n > 0 {
+                    done = true;
+                    debug_assert_eq!(
+                        buf.len(),
+                        n,
+                        "worker buffer must hold exactly the dequeued batch"
+                    );
+                    let mut batch = guard::CommitBatchGuard::new(&mut buf, &*dead_letter);
+                    while let Some(item) = batch.next() {
+                        let mut held = guard::CommitGuard::new(item, &*dead_letter);
+                        let slot = held.slot();
+                        let r = AssertUnwindSafe(async { handler.handle(slot).await })
+                            .catch_unwind()
+                            .await;
+                        let mut slot = held.disarm();
+                        match r {
+                            Ok(()) => {
+                                // slot (taken or not) drops here: the item is committed/consumed.
+                                _ = state.processed_add(1);
+                            }
+                            Err(err) => {
+                                _ = state.note_handler_panic();
+                                if let Some(poison) = slot.take() {
+                                    // panic before take(): item is ours, hand it back zero loss.
+                                    // A panicking  sink must not kill the worker.
+                                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                                        dead_letter(poison, PanicReason(err))
+                                    }));
+                                }
+                                // panic after take(): handler owned it.
+                            }
+                        }
+                        // The item's own Drop is user code too: a panicking
+                        // Drop must not unwind the worker (it killed the
+                        // task and orphaned its shards forever).
+                        let _ = catch_unwind(AssertUnwindSafe(move || drop(slot)));
+                    }
+                }
+                if dc {
+                    state.mark_closed(shard);
+                }
+            }
+            if done {
+                idle_streak = 0;
+            } else {
+                idle_streak = idle_streak.saturating_add(1);
+                if id >= state.active() {
+                    ar.sleep(MONITOR_TICK).await;
+                } else {
+                    match instance::idle_phase(idle_streak) {
+                        instance::IdlePhase::Spin => std::hint::spin_loop(),
+                        // Give the runtime thread back to other tasks instead
+                        // of blocking it. See YieldNow.
+                        instance::IdlePhase::Yield => util::YieldNow::default().await,
+                        instance::IdlePhase::Sleep => ar.sleep(instance::IDLE_SLEEP).await,
+                    }
+                }
+            }
+        }
+    })
+}
 
 /// The worker owns each item until the handler commits (`slot.take()`).
 /// On a handler panic:
@@ -36,99 +134,75 @@ where
     D: Fn(T, PanicReason) + Send + Sync + 'static,
 {
     let cfg = cfg.init();
+    assert!(
+        !receivers.is_empty(),
+        "pool needs at least one shard receiver, with zero shards autodrain never fires and wait_stopping() hangs forever"
+    );
     let shards = receivers.len();
+    let cfg = {
+        let mut cfg = cfg;
+        cfg.max_consumers = cfg.max_consumers.min(shards);
+        cfg.min_consumers = cfg.min_consumers.min(cfg.max_consumers);
+        cfg
+    };
     let state = instance::State::new(shards, cfg.min_consumers);
     let receivers = Arc::new(receivers);
     let handler = Arc::new(handler);
     let dead_letter: Arc<D> = Arc::new(dead_letter);
-    let mut workers = Vec::with_capacity(cfg.max_consumers + 1);
+    let workers = Arc::new(Mutex::new(Vec::with_capacity(
+        cfg.min_consumers.saturating_add(1),
+    )));
 
-    for id in 0..cfg.max_consumers {
-        let state = state.clone();
-        let receivers = receivers.clone();
-        let handler = handler.clone();
-        let dead_letter = dead_letter.clone();
-        let ar = async_runtime.clone();
-        let h = ar.clone().spawn(async move {
-            let _guard = guard::OwnerGuard::new(&state, id);
-            let mut buf: Vec<T> = Vec::with_capacity(cfg.batch_size);
-            let mut idle_streak: u32 = 0;
-            while !state.is_stopped() {
-                let mut done = false;
-                for shard in 0..shards {
-                    if !instance::claim_or_release(&state, id, shard) {
-                        continue;
-                    }
-                    let (n, dc) = receivers[shard].try_recv_batch(&mut buf, cfg.batch_size);
-                    if n > 0 {
-                        done = true;
-                        debug_assert_eq!(
-                            buf.len(),
-                            n,
-                            "worker buffer must hold exactly the dequeued batch"
-                        );
-                        let mut batch = guard::CommitBatchGuard::new(&mut buf, &*dead_letter);
-                        while let Some(item) = batch.next()  {
-                            let mut held = guard::CommitGuard::new(item, &*dead_letter);
-                            let slot = held.slot();
-                            let r = AssertUnwindSafe(async { handler.handle(slot).await })
-                                .catch_unwind()
-                                .await;
-                            let mut slot = held.disarm();
-                            match r {
-                                Ok(()) => {
-                                    // slot (taken or not) drops here: the item is committed/consumed.
-                                    _ = state.processed_add(1);
-                                }
-                                Err(err) => {
-                                    _ = state.note_handler_panic();
-                                    if let Some(poison) = slot.take() {
-                                        // panic before take(): item is ours, hand it back zero loss.
-                                        // A panicking  sink must not kill the worker.
-                                        let _ = catch_unwind(AssertUnwindSafe(|| {
-                                            dead_letter(poison, PanicReason(err))
-                                        }));
-                                    }
-                                    // panic after take(): handler owned it.
-                                }
-                            }
-                        }
-                    }
-                    if dc {
-                        state.mark_closed(shard);
-                    }
-                }
-                if done {
-                    idle_streak = 0;
-                } else {
-                    idle_streak = idle_streak.saturating_add(1);
-                    match instance::idle_phase(idle_streak) {
-                        instance::IdlePhase::Spin => std::hint::spin_loop(),
-                        // Give the runtime thread back to other tasks instead
-                        // of blocking it. See YieldNow.
-                        instance::IdlePhase::Yield => util::YieldNow::default().await,
-                        instance::IdlePhase::Sleep => ar.sleep(instance::IDLE_SLEEP).await,
-                    }
-                }
-            }
-        });
-        workers.push(h);
+    for id in 0..cfg.min_consumers {
+        let h = spawn_async_worker(
+            &async_runtime,
+            id,
+            cfg,
+            shards,
+            state.clone(),
+            receivers.clone(),
+            handler.clone(),
+            dead_letter.clone(),
+        );
+        sync::lock_workers(&workers).push(h);
     }
 
     // monitor worker (same as async_pool)
     {
         let state = state.clone();
         let receivers = receivers.clone();
+        let handler = handler.clone();
+        let dead_letter = dead_letter.clone();
         let ar = async_runtime.clone();
+        let workers_store = workers.clone();
         let h = async_runtime.spawn(async move {
+            let mut spawned = cfg.min_consumers;
             while !state.is_stopped() {
                 if sleep_interruptible_async(&ar, &state, cfg.sample_interval).await {
                     break;
                 }
                 instance::monitor(&cfg, &state, &receivers);
+                // Top up to the new active target, `spawned` only grows,
+                // so later scale down keeps the tasks (they park at the monitor tick cadence)
+                // and re scale up is free.
+                let want = state.active().min(cfg.max_consumers);
+                while spawned < want && !state.is_stopped() {
+                    let h = spawn_async_worker(
+                        &ar,
+                        spawned,
+                        cfg,
+                        shards,
+                        state.clone(),
+                        receivers.clone(),
+                        handler.clone(),
+                        dead_letter.clone(),
+                    );
+                    sync::lock_workers(&workers_store).push(h);
+                    spawned += 1;
+                }
             }
         });
-        workers.push(h);
+        sync::lock_workers(&workers).push(h);
     }
 
     sync::AsyncPool::new(state, workers)
@@ -152,6 +226,80 @@ async fn sleep_interruptible_async<AR: traits::AsyncRuntime>(
     state.is_stopped()
 }
 
+fn spawn_sync_worker<T, const CAP: usize, I, H, D>(
+    id: usize,
+    cfg: instance::Config,
+    shards: usize,
+    state: Arc<instance::State>,
+    receivers: Arc<Vec<Receiver<T, CAP, I>>>,
+    handler: Arc<H>,
+    dead_letter: Arc<D>,
+) -> thread::JoinHandle<()>
+where
+    T: Send + 'static,
+    I: InnerChannel<T, CAP> + Send + Sync + 'static,
+    Receiver<T, CAP, I>: Send + Sync,
+    H: traits::SyncSlotHandler<T>,
+    D: Fn(T, PanicReason) + Send + Sync + 'static,
+{
+    thread::spawn(move || {
+        let _guard = guard::OwnerGuard::new(&state, id);
+        let mut buf: Vec<T> = Vec::with_capacity(cfg.batch_size);
+        let mut idle_streak: u32 = 0;
+        while !state.is_stopped() {
+            let mut done = false;
+            for shard in 0..shards {
+                if !instance::claim_or_release(&state, id, shard) {
+                    continue;
+                }
+                let (n, dc) = receivers[shard].try_recv_batch(&mut buf, cfg.batch_size);
+                if n > 0 {
+                    done = true;
+                    for item in buf.drain(..n) {
+                        let mut slot = Some(item);
+                        let r = catch_unwind(AssertUnwindSafe(|| handler.handle(&mut slot)));
+                        match r {
+                            Ok(()) => {
+                                // slot (taken or not) drops here: the item is committed/consumed.
+                                _ = state.processed_add(1);
+                            }
+                            Err(err) => {
+                                _ = state.note_handler_panic();
+                                if let Some(poison) = slot.take() {
+                                    // panic before take(): item is ours, hand it back zero loss.
+                                    // A panicking sink must not kill the worker.
+                                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                                        dead_letter(poison, PanicReason(err))
+                                    }));
+                                }
+                                // panic after take(): handler owned it.
+                            }
+                        }
+                        let _ = catch_unwind(AssertUnwindSafe(move || drop(slot)));
+                    }
+                }
+                if dc {
+                    state.mark_closed(shard);
+                }
+            }
+            if done {
+                idle_streak = 0;
+            } else {
+                idle_streak = idle_streak.saturating_add(1);
+                if id >= state.active() {
+                    thread::sleep(MONITOR_TICK);
+                } else {
+                    match instance::idle_phase(idle_streak) {
+                        instance::IdlePhase::Spin => std::hint::spin_loop(),
+                        instance::IdlePhase::Yield => thread::yield_now(),
+                        instance::IdlePhase::Sleep => thread::sleep(instance::IDLE_SLEEP),
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Sync twin of [`async_pool_slot`]: zero loss pool over the slot-based handler contract.
 /// Same failure hierarchy:
 /// - handler panic before `take()` -> item delivered to `dead_letter`,
@@ -173,86 +321,71 @@ where
     D: Fn(T, PanicReason) + Send + Sync + 'static,
 {
     let cfg = cfg.init();
+    assert!(
+        !receivers.is_empty(),
+        "pool needs at least one shard receiver, with zero shards autodrain never fires and wait_stopping() hangs forever"
+    );
     let shards = receivers.len();
+    let cfg = {
+        let mut cfg = cfg;
+        cfg.max_consumers = cfg.max_consumers.min(shards);
+        cfg.min_consumers = cfg.min_consumers.min(cfg.max_consumers);
+        cfg
+    };
     let state = instance::State::new(shards, cfg.min_consumers);
     let receivers = Arc::new(receivers);
     let handler = Arc::new(handler);
     let dead_letter = Arc::new(dead_letter);
-    let mut workers = Vec::with_capacity(cfg.max_consumers + 1);
+    let workers = Arc::new(Mutex::new(Vec::with_capacity(
+        cfg.min_consumers.saturating_add(1),
+    )));
 
-    for id in 0..cfg.max_consumers {
-        let state = state.clone();
-        let receivers = receivers.clone();
-        let handler = handler.clone();
-        let dead_letter = dead_letter.clone();
-        let h = thread::spawn(move || {
-            let _guard = guard::OwnerGuard::new(&state, id);
-            let mut buf: Vec<T> = Vec::with_capacity(cfg.batch_size);
-            let mut idle_streak: u32 = 0;
-            while !state.is_stopped() {
-                let mut done = false;
-                for shard in 0..shards {
-                    if !instance::claim_or_release(&state, id, shard) {
-                        continue;
-                    }
-                    let (n, dc) = receivers[shard].try_recv_batch(&mut buf, cfg.batch_size);
-                    if n > 0 {
-                        done = true;
-                        for item in buf.drain(..n) {
-                            let mut slot = Some(item);
-                            let r = catch_unwind(AssertUnwindSafe(|| {
-                                handler.handle(&mut slot)
-                            }));
-                            match r {
-                                Ok(()) => {
-                                    // slot (taken or not) drops here: the item is committed/consumed.
-                                    _ = state.processed_add(1);
-                                }
-                                Err(err) => {
-                                    _ = state.note_handler_panic();
-                                    if let Some(poison) = slot.take() {
-                                        // panic before take(): item is ours, hand it back zero loss.
-                                        // A panicking sink must not kill the worker.
-                                        let _ = catch_unwind(AssertUnwindSafe(|| {
-                                            dead_letter(poison, PanicReason(err))
-                                        }));
-                                    }
-                                    // panic after take(): handler owned it.
-                                }
-                            }
-                        }
-                    } 
-                    if dc {
-                        state.mark_closed(shard);
-                    }
-                }
-                if done {
-                    idle_streak = 0;
-                } else {
-                    idle_streak = idle_streak.saturating_add(1);
-                    match instance::idle_phase(idle_streak) {
-                        instance::IdlePhase::Spin => std::hint::spin_loop(),
-                        instance::IdlePhase::Yield => thread::yield_now(),
-                        instance::IdlePhase::Sleep => thread::sleep(instance::IDLE_SLEEP),
-                    }
-                }
-            }
-        });
-        workers.push(h);
+    for id in 0..cfg.min_consumers {
+        let h = spawn_sync_worker(
+            id,
+            cfg,
+            shards,
+            state.clone(),
+            receivers.clone(),
+            handler.clone(),
+            dead_letter.clone(),
+        );
+        sync::lock_workers(&workers).push(h);
     }
 
     {
         let state = state.clone();
         let receivers = receivers.clone();
+        let handler = handler.clone();
+        let dead_letter = dead_letter.clone();
+        let workers_store = workers.clone();
         let h = thread::spawn(move || {
+            let mut spawned = cfg.min_consumers;
             while !state.is_stopped() {
                 if sleep_interruptible_sync(&state, cfg.sample_interval) {
                     break;
                 }
                 instance::monitor(&cfg, &state, &receivers);
+                // Top up to the new active target, `spawned` only grows,
+                // so later scale down keeps the tasks (they park at the monitor tick cadence)
+                // and re scale up is free.
+                let want = state.active().min(cfg.max_consumers);
+                while spawned < want && !state.is_stopped() {
+                    let h = spawn_sync_worker(
+                        spawned,
+                        cfg,
+                        shards,
+                        state.clone(),
+                        receivers.clone(),
+                        handler.clone(),
+                        dead_letter.clone(),
+                    );
+                    sync::lock_workers(&workers_store).push(h);
+                    spawned += 1;
+                }
             }
         });
-        workers.push(h);
+        sync::lock_workers(&workers).push(h);
     }
 
     sync::SyncPool::new(state, workers)
@@ -940,6 +1073,80 @@ mod tests {
         let expected = keys.len() as u64 * (0..PER_KEY).sum::<u64>();
         assert_eq!(sum.load(Ordering::Relaxed), expected);
     }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn lazy_spawn_starts_at_min_and_grows_under_load() {
+        let (tx, rx) = round_robin::<u64, CAP>(4);
+        let cfg = instance::Config::new(1, 4).sample_interval(Duration::from_millis(1));
+        let pool = sync_pool_slot(
+            cfg,
+            rx.into_receivers(),
+            handler::PerItem(move |_v: &u64| {
+                std::thread::sleep(Duration::from_micros(500));
+            }),
+            |_poison, _panic_info| {},
+        );
+        assert_eq!(
+            pool.worker_handles(),
+            2,
+            "min=1: one worker plus the monitor; max is a ceiling, not a bill"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut i = 0u64;
+        while pool.worker_handles() < 3 {
+            let _ = tx.try_send(i);
+            i += 1;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "monitor never spawned beyond min under saturation"
+            );
+            if i % 64 == 0 {
+                std::thread::yield_now();
+            }
+        }
+        drop(tx);
+        pool.wait_stopping();
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lazy_spawn_async_starts_at_min_and_grows_under_load() {
+        use super::tests::TokioRuntime;
+        let (tx, rx) = round_robin::<u64, CAP>(4);
+        let cfg = instance::Config::new(1, 4).sample_interval(Duration::from_millis(1));
+        let pool = async_pool_slot(
+            TokioRuntime,
+            cfg,
+            rx.into_receivers(),
+            handler::PerItem(move |_v: &u64| async {
+                tokio::time::sleep(Duration::from_micros(500)).await;
+            }),
+            |_poison, _panic_info| {},
+        );
+        assert_eq!(
+            pool.worker_handles(),
+            2,
+            "min=1: one worker task plus the monitor"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut i = 0u64;
+        while pool.worker_handles() < 3 {
+            let _ = tx.try_send(i);
+            i += 1;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "monitor never spawned beyond min under saturation"
+            );
+            if i % 64 == 0 {
+                tokio::task::yield_now().await;
+            }
+        }
+        drop(tx);
+        pool.wait_stopping().await;
+    }
 }
 
 #[cfg(test)]
@@ -949,9 +1156,8 @@ mod panic_safety_tests {
     use std::{
         panic,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicU8, AtomicU64, Ordering},
-            Mutex,
         },
         thread,
     };
@@ -1309,7 +1515,7 @@ mod panic_safety_tests {
     }
 
     /// `AsyncSlotHandler::handle` returns `impl Future`, not `async fn`,
-    /// so an implementor may run code before the future exists. 
+    /// so an implementor may run code before the future exists.
     /// That code must be covered by the same panic net as the future.
     struct PanicsBeforeTheFuture;
     impl traits::AsyncSlotHandler<u64> for PanicsBeforeTheFuture {
@@ -1411,8 +1617,16 @@ mod panic_safety_tests {
         // Cancel every worker task while the handler is mid await.
         rt.shutdown_timeout(Duration::from_millis(100));
 
-        assert_eq!(dead.load(Ordering::Relaxed), 1, "the inflight item was lost on cancellation");
-        assert_eq!(cancelled.load(Ordering::Relaxed), 1, "reason should say cancelled, not panic");
+        assert_eq!(
+            dead.load(Ordering::Relaxed),
+            1,
+            "the inflight item was lost on cancellation"
+        );
+        assert_eq!(
+            cancelled.load(Ordering::Relaxed),
+            1,
+            "reason should say cancelled, not panic"
+        );
     }
 
     #[cfg(not(miri))]
@@ -1454,8 +1668,16 @@ mod panic_safety_tests {
             (0..N).collect::<Vec<_>>(),
             "the batch tail was dropped on cancellation"
         );
-        assert_eq!(cancelled.load(Ordering::Relaxed), N, "reason should say cancelled, not panic");
-        assert_eq!(got, (0..N).collect::<Vec<_>>(), "batch handed back out of order");
+        assert_eq!(
+            cancelled.load(Ordering::Relaxed),
+            N,
+            "reason should say cancelled, not panic"
+        );
+        assert_eq!(
+            got,
+            (0..N).collect::<Vec<_>>(),
+            "batch handed back out of order"
+        );
     }
 
     #[cfg(not(miri))]

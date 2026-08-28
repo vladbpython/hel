@@ -4,10 +4,11 @@ use super::{
         AsyncSendError, AsyncSendRefError, BatchSendError, SendBatchError, SendError,
         TrySendBatchError, TrySendError,
     },
+    helper::deadline_after,
     sync::{AsyncSlot, SyncList, SyncNode},
     traits::{MultiProducer, SenderOps},
 };
-use crate::shim::loom::{park,park_timeout};
+use crate::shim::loom::{park, park_timeout};
 use std::{
     future::Future,
     marker::PhantomData,
@@ -134,9 +135,7 @@ pub fn send_batch_impl<T: Send + 'static, const CAP: usize>(
     }
     // Fast path: push entire batch if space available.
     let fast = inner.push_batch(buf);
-    if fast > 0 {
-        inner.notify_receivers();
-    }
+    inner.notify_receivers_n(fast);
     if buf.is_empty() {
         return Ok(fast);
     }
@@ -181,9 +180,7 @@ pub fn try_send_batch<T: Send + 'static, const CAP: usize>(
         });
     }
     let sent = inner.push_batch(buf);
-    if sent > 0 {
-        inner.notify_receivers();
-    }
+    inner.notify_receivers_n(sent);
     if buf.is_empty() {
         Ok(sent)
     } else {
@@ -425,7 +422,7 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
     }
 
     pub fn send_timeout(&self, value: T, d: Duration) -> Result<(), SendError<T>> {
-        send_impl(self.inner.as_ref(), value, Some(Instant::now() + d))
+        send_impl(self.inner.as_ref(), value, deadline_after(d))
     }
 
     /// Non blocking batch send: fast path only, no blocking fallback.
@@ -446,7 +443,7 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
         buf: &mut Vec<T>,
         d: Duration,
     ) -> Result<usize, BatchSendError<SendBatchError>> {
-        send_batch_impl(self.inner.as_ref(), buf, Some(Instant::now() + d))
+        send_batch_impl(self.inner.as_ref(), buf, deadline_after(d))
     }
 
     pub fn send_async(&self, value: T) -> SenderFuture<'_, T, CAP, I> {
@@ -511,12 +508,10 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
     /// gone". Do not retry in a `while !buf.is_empty()` loop: once the
     /// receiver is dropped nothing can be sent, so that loop never ends.
     /// If a call sent 0 and `buf` is still not empty - receiver is gone, stop.
-    #[cfg_attr(not(test), allow(dead_code))] 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn send_batch_async(&self, buf: &mut Vec<T>) -> usize {
         let fast = self.inner.push_batch(buf); // one publication per batch
-        if fast > 0 {
-            self.inner.notify_receivers();
-        }
+        self.inner.notify_receivers_n(fast);
         if buf.is_empty() {
             return fast;
         } // the entire buffer is gone exit without a loop
@@ -566,7 +561,6 @@ impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Drop for Sender<
     }
 }
 
-
 /// SPSC sender: exactly one producer, enforced by the compiler.
 pub struct SingleSender<T: Send + 'static, const CAP: usize> {
     inner: Arc<SingleInner<T, CAP>>,
@@ -590,7 +584,7 @@ impl<T: Send + 'static, const CAP: usize> SingleSender<T, CAP> {
     }
 
     pub fn send_timeout(&mut self, value: T, d: Duration) -> Result<(), SendError<T>> {
-        send_impl(self.inner.as_ref(), value, Some(Instant::now() + d))
+        send_impl(self.inner.as_ref(), value, deadline_after(d))
     }
 
     /// Non blocking batch send: fast path only, no blocking fallback.
@@ -614,13 +608,10 @@ impl<T: Send + 'static, const CAP: usize> SingleSender<T, CAP> {
         buf: &mut Vec<T>,
         d: Duration,
     ) -> Result<usize, BatchSendError<SendBatchError>> {
-        send_batch_impl(self.inner.as_ref(), buf, Some(Instant::now() + d))
+        send_batch_impl(self.inner.as_ref(), buf, deadline_after(d))
     }
 
-    pub fn send_async(
-        &mut self,
-        value: T,
-    ) -> SenderFuture<'_, T, CAP, SingleInner<T, CAP>> {
+    pub fn send_async(&mut self, value: T) -> SenderFuture<'_, T, CAP, SingleInner<T, CAP>> {
         GenericSendFuture {
             inner: &self.inner,
             value: Some(value),
@@ -630,10 +621,7 @@ impl<T: Send + 'static, const CAP: usize> SingleSender<T, CAP> {
     }
 
     /// Cancel safe async send that never loses the value
-    pub async fn send_ref_async(
-        &mut self,
-        slot: &mut Option<T>,
-    ) -> Result<(), AsyncSendRefError> {
+    pub async fn send_ref_async(&mut self, slot: &mut Option<T>) -> Result<(), AsyncSendRefError> {
         SendPending {
             inner: &self.inner,
             value: slot,
@@ -645,9 +633,7 @@ impl<T: Send + 'static, const CAP: usize> SingleSender<T, CAP> {
 
     pub async fn send_batch_async(&mut self, buf: &mut Vec<T>) -> usize {
         let fast = self.inner.push_batch(buf); // one publication per batch
-        if fast > 0 {
-            self.inner.notify_receivers();
-        }
+        self.inner.notify_receivers_n(fast);
         if buf.is_empty() {
             return fast;
         }

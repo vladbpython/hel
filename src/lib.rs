@@ -2,13 +2,21 @@ pub(crate) mod cache;
 pub mod helper;
 pub(crate) mod internal_channel;
 pub mod macros;
-//[cfg(feature = "pool")]
+#[cfg(feature = "pool")]
 pub mod pool;
 pub(crate) mod shard;
 pub(crate) mod shim;
 
+#[doc(hidden)]
+pub use num_cpus as _num_cpus;
+
 pub mod channel {
-    pub use super::internal_channel::{errors, nearest_power_of_two, receiver::Receiver, shard_power_of_two};
+    pub use super::internal_channel::{
+        errors, nearest_power_of_two,
+        receiver::{Receiver, SingleReceiver},
+        sender::SingleSender,
+        shard_power_of_two,
+    };
     pub mod mpmc {
         pub use super::super::shard::mpmc::{
             receiver::ShardReceiver, sender_group::*, sender_key::*, sender_round_robin::*,

@@ -4,16 +4,15 @@ use super::{
     hash::hash_key,
     receiver::ShardReceiver,
 };
-use crate::internal_channel::{mpmc_bounded, shard_power_of_two, sender::Sender};
+use crate::internal_channel::{
+    errors as internal_errors, helper::deadline_after, mpmc_bounded, sender::Sender,
+    shard_power_of_two,
+};
 use std::{
     any::Any,
-    panic::{
-        AssertUnwindSafe,
-        catch_unwind,
-        resume_unwind
-    },
-    sync::Arc, 
-    time::{Duration,Instant}
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 // ShardedKey (ByKey)
@@ -121,10 +120,12 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
         let mut poisoned: Option<(Box<dyn Any + Send>, Vec<T>)> = None;
         for item in buf.drain(..) {
             match &mut poisoned {
-                Some((_,data)) => data.push(item),
-                None => match catch_unwind(AssertUnwindSafe(|| hash_key(key_fn(&item)) & self.mask))  {
-                    Ok(shard) => groups[shard].push(item),
-                    Err(p) => poisoned = Some((p, vec![item]))
+                Some((_, data)) => data.push(item),
+                None => {
+                    match catch_unwind(AssertUnwindSafe(|| hash_key(key_fn(&item)) & self.mask)) {
+                        Ok(shard) => groups[shard].push(item),
+                        Err(p) => poisoned = Some((p, vec![item])),
+                    }
                 }
             }
         }
@@ -139,9 +140,11 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
     }
 
     /// Non blocking batch by hash(key_fn).
-    /// Returns `Ok(sent)` if all elements have been sent.
-    /// Returns `Err(sent)` if at least one shard was full or closed.
-    /// `buf` contains all unsent elements (grouped by shard; per key order kept).
+    /// every shard is attempted, full shard no longer aborts the whole call
+    /// one slow consumer used to starve every other key group.
+    /// Returns `Ok(sent)` when everything went out, or the first error with `sent`
+    /// counting successes across all shards; `buf` then holds only the
+    /// leftovers of the failed shards (grouped by shard, per key order kept).
     pub fn try_send_batch(
         &self,
         buf: &mut Vec<T>,
@@ -151,8 +154,8 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
             return Ok(0);
         }
         let mut total = 0usize;
-        let mut groups = self.group_by_shard(buf, &key_fn).into_iter().enumerate();
-        while let Some((shard, mut group)) = groups.next() {
+        let mut first_err: Option<(usize, internal_errors::TrySendBatchError)> = None;
+        for (shard, mut group) in self.group_by_shard(buf, &key_fn).into_iter().enumerate() {
             if group.is_empty() {
                 continue;
             }
@@ -160,19 +163,26 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
                 Ok(sent) => total += sent,
                 Err(e) => {
                     total += e.sent;
-                    refill_on_error(buf, group, groups);
-                    let first_key = buf
-                        .first()
-                        .map(|item| key_fn(item).to_string())
-                        .unwrap_or_default();
-                    return Err(shard_error::ShardKeyTryBatchSendError {
-                        key: first_key,
-                        shard,
-                        sent: total,
-                        reason: e.err,
-                    });
+                    if first_err.is_none() {
+                        first_err = Some((shard, e.err));
+                    }
+                    // Leftovers go straight back; the FIRST failed group lands first,
+                    // so buf[0] keys the error below.
+                    buf.append(&mut group);
                 }
             }
+        }
+        if let Some((shard, reason)) = first_err {
+            let first_key = buf
+                .first()
+                .map(|item| key_fn(item).to_string())
+                .unwrap_or_default();
+            return Err(shard_error::ShardKeyTryBatchSendError {
+                key: first_key,
+                shard,
+                sent: total,
+                reason,
+            });
         }
         Ok(total)
     }
@@ -229,14 +239,16 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let deadline = Instant::now() + d;
+        let deadline = deadline_after(d);
         let mut total = 0usize;
         let mut groups = self.group_by_shard(buf, &key_fn).into_iter().enumerate();
         while let Some((shard, mut group)) = groups.next() {
             if group.is_empty() {
                 continue;
             }
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.map_or(Duration::MAX, |dl| {
+                dl.saturating_duration_since(Instant::now())
+            });
             match self.senders[shard].send_batch_timeout(&mut group, left) {
                 Ok(sent) => total += sent,
                 Err(e) => {
@@ -391,7 +403,7 @@ mod tests {
         let (tx, rx) = shard_key::<u64, 8>(4);
         let shard = tx.shard_for("AAPL");
         tx.try_send("AAPL", 42).unwrap();
-        assert_eq!(rx.receiver(shard).try_recv().unwrap(), 42);
+        assert_eq!(rx.get_receiver(shard).unwrap().try_recv().unwrap(), 42);
     }
 
     #[test]
@@ -402,7 +414,7 @@ mod tests {
             tx.try_send("AAPL", i).unwrap();
         }
         let mut buf = Vec::new();
-        rx.receiver(shard).recv_batch(&mut buf, 10);
+        rx.get_receiver(shard).unwrap().recv_batch(&mut buf, 10);
         assert_eq!(buf, (0..10u64).collect::<Vec<_>>());
     }
 
@@ -416,9 +428,9 @@ mod tests {
         }
         tx.try_send("AAPL", "a".to_string()).unwrap();
         tx.try_send("MSFT", "b".to_string()).unwrap();
-        assert_eq!(rx.receiver(sa).try_recv().unwrap(), "a");
-        assert_eq!(rx.receiver(sb).try_recv().unwrap(), "b");
-        assert!(rx.receiver(sa).try_recv().is_err());
+        assert_eq!(rx.get_receiver(sa).unwrap().try_recv().unwrap(), "a");
+        assert_eq!(rx.get_receiver(sb).unwrap().try_recv().unwrap(), "b");
+        assert!(rx.get_receiver(sa).unwrap().try_recv().is_err());
     }
 
     #[test]
@@ -583,7 +595,10 @@ mod tests {
         let (tx, rx) = shard_key::<String, 8>(4);
         let shard = tx.shard_for("AAPL");
         tx.send_async("AAPL", "trade".to_string()).await.unwrap();
-        assert_eq!(rx.receiver(shard).recv_async().await.unwrap(), "trade");
+        assert_eq!(
+            rx.get_receiver(shard).unwrap().recv_async().await.unwrap(),
+            "trade"
+        );
     }
 
     #[cfg(not(miri))]
@@ -651,7 +666,7 @@ mod tests {
         }
         drop(tx);
         let mut buf = Vec::new();
-        let r = rx.receiver(shard);
+        let r = rx.get_receiver(shard).unwrap();
         loop {
             let (n, dc) = r.recv_batch(&mut buf, 8);
             if dc || n == 0 {
@@ -759,7 +774,10 @@ mod tests {
         let mut slot = Some(99u64);
         tx.send_ref_async("AAPL", &mut slot).await.unwrap();
         assert_eq!(slot, None);
-        assert_eq!(rx.receiver(shard).recv_async().await.unwrap(), 99);
+        assert_eq!(
+            rx.get_receiver(shard).unwrap().recv_async().await.unwrap(),
+            99
+        );
     }
 
     // Cancellation keeps the value; deterministic hash routing means a retry
@@ -789,9 +807,12 @@ mod tests {
 
         // Only the fill items are in the shard.
         for i in 0..CAP as u64 {
-            assert_eq!(rx.receiver(shard).recv_async().await.unwrap(), i);
+            assert_eq!(
+                rx.get_receiver(shard).unwrap().recv_async().await.unwrap(),
+                i
+            );
         }
-        assert!(rx.receiver(shard).try_recv().is_err());
+        assert!(rx.get_receiver(shard).unwrap().try_recv().is_err());
     }
 
     #[cfg(not(miri))]
@@ -876,7 +897,9 @@ mod tests {
 
         let mut keys: Vec<&'static str> = Vec::new();
         let mut seen = vec![false; SHARDS];
-        for k in ["k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9", "kA", "kB"] {
+        for k in [
+            "k0", "k1", "k2", "k3", "k4", "k5", "k6", "k7", "k8", "k9", "kA", "kB",
+        ] {
             let sh = tx.shard_for(k);
             if !seen[sh] {
                 seen[sh] = true;
@@ -913,7 +936,6 @@ mod tests {
             "took {took:?} for a {d:?} budget over {SHARDS} shards: the timeout is being spent per shard"
         );
     }
-    
 }
 
 #[cfg(all(test, not(loom)))]

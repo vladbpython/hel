@@ -1,14 +1,11 @@
 use crate::shim::loom::{
     AtomicBool, AtomicUsize, AtomicWaker, Lock, Mutex, Ordering, PLMutex, Thread, UnsafeCell,
-    thread_current, fence,
+    fence, thread_current,
 };
 
 use std::{
     collections::VecDeque,
-    marker::{
-        PhantomData,
-        PhantomPinned
-    },
+    marker::{PhantomData, PhantomPinned},
     mem::MaybeUninit,
     ptr::null_mut,
     sync::Arc,
@@ -40,6 +37,7 @@ pub struct AsyncSlot {
     pub(crate) waker: AtomicWaker,
     pub(crate) in_queue: AtomicBool,
     pub(crate) cancelled: AtomicBool,
+    counted: AtomicBool,
 }
 impl AsyncSlot {
     fn new(waker: Waker) -> Arc<Self> {
@@ -47,6 +45,7 @@ impl AsyncSlot {
             waker: AtomicWaker::new(),
             in_queue: AtomicBool::new(true),
             cancelled: AtomicBool::new(false),
+            counted: AtomicBool::new(false),
         });
         s.waker.register(&waker);
         s
@@ -186,6 +185,7 @@ pub struct SyncList {
     blocking_count: AtomicUsize,
     async_waiters: PLMutex<VecDeque<Arc<AsyncSlot>>>,
     async_count: AtomicUsize,
+    cancelled_in_queue: AtomicUsize,
 }
 
 impl SyncList {
@@ -195,6 +195,7 @@ impl SyncList {
             blocking_count: AtomicUsize::new(0),
             async_waiters: PLMutex::new(VecDeque::new()),
             async_count: AtomicUsize::new(0),
+            cancelled_in_queue: AtomicUsize::new(0),
         }
     }
 
@@ -244,15 +245,42 @@ impl SyncList {
         // Lazy sweep: pop already cancelled slots from the FRONT only.
         // O(k) for k dead heads, no mid queue removal, FIFO intact.
         let mut guard = self.async_waiters.lock_();
+        if slot.in_queue.load(Ordering::Acquire) && !slot.counted.swap(true, Ordering::AcqRel) {
+            self.cancelled_in_queue.fetch_add(1, Ordering::Relaxed);
+        }
         while let Some(head) = guard.front() {
             if head.cancelled.load(Ordering::Acquire) {
                 let s = guard.pop_front().unwrap();
                 s.in_queue.store(false, Ordering::Release);
                 self.async_count.fetch_sub(1, Ordering::Relaxed);
+                if s.counted.swap(false, Ordering::AcqRel) {
+                    self.cancelled_in_queue.fetch_sub(1, Ordering::Relaxed);
+                }
             } else {
                 break;
             }
         }
+
+        let dead = self.cancelled_in_queue.load(Ordering::Relaxed);
+        if dead > 0 && dead * 2 >= guard.len() {
+            guard.retain(|s| {
+                if s.cancelled.load(Ordering::Acquire) {
+                    s.in_queue.store(false, Ordering::Release);
+                    self.async_count.fetch_sub(1, Ordering::Relaxed);
+                    if s.counted.swap(false, Ordering::AcqRel) {
+                        self.cancelled_in_queue.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn debug_async_queue_len(&self) -> usize {
+        self.async_waiters.lock_().len()
     }
 
     /// Called after SeqCst load in Inner::notify*.
@@ -278,6 +306,18 @@ impl SyncList {
             if let Some(k) = kind {
                 k.wake();
             }
+        }
+    }
+
+    /// Wake up to `n` waiters (async first, then blocking).
+    pub fn notify_n(&self, n: usize) {
+        for _ in 0..n {
+            let a = self.async_count.load(Ordering::Acquire);
+            let b = self.blocking_count.load(Ordering::Acquire);
+            if a == 0 && b == 0 {
+                return;
+            }
+            self.notify_one_if(a, b);
         }
     }
 
@@ -308,6 +348,9 @@ impl SyncList {
                 s
             }; // PLMutex released before wake()
             if slot.cancelled.load(Ordering::Acquire) {
+                if slot.counted.swap(false, Ordering::AcqRel) {
+                    self.cancelled_in_queue.fetch_sub(1, Ordering::Relaxed);
+                }
                 continue;
             }
             // The waker can be gone even though `cancelled` read false a moment
@@ -341,6 +384,9 @@ impl SyncList {
             while let Some(slot) = q.pop_front() {
                 slot.in_queue.store(false, Ordering::Release);
                 self.async_count.fetch_sub(1, Ordering::Relaxed);
+                if slot.counted.swap(false, Ordering::AcqRel) {
+                    self.cancelled_in_queue.fetch_sub(1, Ordering::Relaxed);
+                }
                 if !slot.cancelled.load(Ordering::Acquire)
                     && let Some(w) = slot.waker.take()
                 {
@@ -446,10 +492,10 @@ mod loom_tests {
     }
 }
 
-
 #[cfg(all(not(loom), test))]
 mod sync_guard_tests {
     use super::*;
+    use futures::task::noop_waker;
     use std::panic;
 
     #[test]
@@ -484,5 +530,26 @@ mod sync_guard_tests {
         }
         assert_eq!(list.blocking_count_acquire(), 0);
         assert!(!list.has_waiters());
+    }
+
+    #[test]
+    fn cancelled_slots_behind_a_live_waiter_are_swept() {
+        let list = SyncList::new();
+        let live = list.push_async_slot(noop_waker());
+        let dead: Vec<_> = (0..64)
+            .map(|_| list.push_async_slot(noop_waker()))
+            .collect();
+        for s in &dead {
+            list.cancel_async_slot(s);
+        }
+        // Ratio only trigger: after every cancel at most the live waiter
+        // remains is nothing accumulates at all.
+        assert_eq!(
+            list.debug_async_queue_len(),
+            1,
+            "tombstones piled up behind the live head"
+        );
+        list.cancel_async_slot(&live);
+        assert_eq!(list.debug_async_queue_len(), 0);
     }
 }

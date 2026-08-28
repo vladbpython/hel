@@ -1,11 +1,8 @@
 use super::instance::{NONE, State};
 use crate::helper::panic::PanicReason;
 use std::{
-    panic::{
-        AssertUnwindSafe,
-        catch_unwind,
-    },
-    sync::atomic::Ordering
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::atomic::Ordering,
 };
 
 pub struct OwnerGuard<'a> {
@@ -34,10 +31,9 @@ impl Drop for OwnerGuard<'_> {
     }
 }
 
-
 /// Holds the item while the handler runs, so it is never dropped on the floor.
 /// The worker owns the item until the handler commits it `slot.take()`,
-/// which for an async handler happens on the far side of an `.await`. 
+/// which for an async handler happens on the far side of an `.await`.
 /// If the runtime cancels the worker task at that await, the whole frame is dropped,
 /// without this guard the item went with it, counted by nothing and delivered nowhere.
 /// A panic is already handled by the worker, which is why the guard is `disarm`ed as soon as the handler's future resolves,
@@ -85,14 +81,12 @@ impl<T, D: Fn(T, PanicReason)> Drop for CommitGuard<'_, T, D> {
     }
 }
 
-
 pub(crate) struct CommitBatchGuard<'a, T, D: Fn(T, PanicReason)> {
     buf: &'a mut Vec<T>,
     dead_letter: &'a D,
 }
 
 impl<'a, T, D: Fn(T, PanicReason)> CommitBatchGuard<'a, T, D> {
-
     /// Takes ownership of every item currently in `buf`.
     pub(crate) fn new(buf: &'a mut Vec<T>, dead_letter: &'a D) -> Self {
         buf.reverse();

@@ -2,15 +2,11 @@ pub mod errors;
 pub mod mpmc;
 pub mod spsc;
 
-
-
 #[cfg(all(test, not(miri), not(loom)))]
-mod double_registration{
+mod double_registration {
     use super::*;
     use mpmc::sender_round_robin::round_robin;
-    use std::{
-        sync::mpsc as std_mpsc, thread, time::Duration,
-    };
+    use std::{sync::mpsc as std_mpsc, thread, time::Duration};
 
     /// Two receivers park on the same shard, two items arrive. Both must wake.
     #[test]
@@ -38,6 +34,10 @@ mod double_registration{
         let got = done_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("a receiver was left parked: the notify landed on a duplicate node");
-        assert_eq!(got, vec![1, 2], "both parked receivers must get one item each");
+        assert_eq!(
+            got,
+            vec![1, 2],
+            "both parked receivers must get one item each"
+        );
     }
 }

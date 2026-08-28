@@ -60,21 +60,69 @@ pub use atomic_waker::AtomicWaker;
 
 #[cfg(loom)]
 pub struct AtomicWaker {
-    inner: loom::sync::Mutex<Option<std::task::Waker>>,
+    state: loom::sync::atomic::AtomicUsize,
+    waker: loom::cell::UnsafeCell<Option<std::task::Waker>>,
 }
 
 #[cfg(loom)]
 impl AtomicWaker {
+    const WAITING: usize = 0;
+    const REGISTERING: usize = 0b01;
+    const WAKING: usize = 0b10;
+
     pub fn new() -> Self {
         Self {
-            inner: loom::sync::Mutex::new(None),
+            state: loom::sync::atomic::AtomicUsize::new(Self::WAITING),
+            waker: loom::cell::UnsafeCell::new(None),
         }
     }
+
     pub fn register(&self, waker: &std::task::Waker) {
-        *self.inner.lock().unwrap() = Some(waker.clone());
+        match self.state.compare_exchange(
+            Self::WAITING,
+            Self::REGISTERING,
+            Ordering::Acquire,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.waker.with_mut(|w| unsafe { *w = Some(waker.clone()) });
+                // Try to release the registration; failure means a taker set waking
+                // while we held the cell - wakeup is ours to deliver:
+                // take the fresh waker and wake it ourselves.
+                match self.state.compare_exchange(
+                    Self::REGISTERING,
+                    Self::WAITING,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {}
+                    Err(actual) => {
+                        debug_assert_eq!(actual, Self::REGISTERING | Self::WAKING);
+                        let w = self.waker.with_mut(|w| unsafe { (*w).take() }).unwrap();
+                        self.state.swap(Self::WAITING, Ordering::AcqRel);
+                        w.wake();
+                    }
+                }
+            }
+            // A take() is mid-flight: equivalent to being woken right after
+            // registering, so deliver a wakeup to new waker ourselves.
+            Err(actual) if actual == Self::WAKING => waker.wake_by_ref(),
+            // Concurrent register: the protocol drops this registration.
+            Err(_) => {}
+        }
     }
+
     pub fn take(&self) -> Option<std::task::Waker> {
-        self.inner.lock().unwrap().take()
+        match self.state.fetch_or(Self::WAKING, Ordering::AcqRel) {
+            Self::WAITING => {
+                let w = self.waker.with_mut(|w| unsafe { (*w).take() });
+                self.state.fetch_and(!Self::WAKING, Ordering::Release);
+                w
+            }
+            // Registration in flight (it will self wake) or another taker
+            // holds the waking lock: nothing for us to deliver.
+            _ => None,
+        }
     }
 }
 
@@ -98,11 +146,11 @@ pub(crate) fn park_timeout(_d: std::time::Duration) {
 
 #[cfg(loom)]
 pub(crate) use loom::cell::UnsafeCell;
- 
+
 #[cfg(not(loom))]
 #[derive(Debug)]
 pub(crate) struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
- 
+
 #[cfg(not(loom))]
 impl<T> UnsafeCell<T> {
     #[inline(always)]

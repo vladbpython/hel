@@ -38,7 +38,7 @@ macro_rules! mpmc {
             assert!(c > 0, "capacity must be > 0");
             $crate::channel::nearest_power_of_two(c)
         };
-        let num_shards = $crate::channel::shard_power_of_two(::num_cpus::get());
+        let num_shards = $crate::channel::shard_power_of_two($crate::_num_cpus::get());
         $crate::channel::mpmc::round_robin::<$t, __CAP>(num_shards)
     }};
 
@@ -49,7 +49,7 @@ macro_rules! mpmc {
             assert!(c > 0, "capacity must be > 0");
             $crate::channel::nearest_power_of_two(c)
         };
-        let num_shards = $crate::channel::shard_power_of_two(::num_cpus::get());
+        let num_shards = $crate::channel::shard_power_of_two($crate::_num_cpus::get());
         $crate::channel::mpmc::round_robin::<$t, __CAP>(num_shards)
     }};
 
@@ -71,7 +71,7 @@ macro_rules! mpmc {
             assert!(c > 0, "capacity must be > 0");
             $crate::channel::nearest_power_of_two(c)
         };
-        let num_shards = $crate::channel::shard_power_of_two(::num_cpus::get());
+        let num_shards = $crate::channel::shard_power_of_two($crate::_num_cpus::get());
         $crate::channel::mpmc::shard_key::<$t, __CAP>(num_shards)
     }};
 
@@ -116,7 +116,7 @@ macro_rules! spsc {
             $crate::channel::nearest_power_of_two(c)
         };
         // sharded_spsc does not require power 2 num_cpus directly
-        $crate::channel::spsc::SpscShard::<$t, __CAP>::new(::num_cpus::get())
+        $crate::channel::spsc::SpscShard::<$t, __CAP>::new($crate::_num_cpus::get())
     }};
     ($t:ty, $cap:expr, $shards:expr) => {{
         const __CAP: usize = {
@@ -131,7 +131,7 @@ macro_rules! spsc {
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
-    
+
     // sharded! policy arms
 
     #[test]
@@ -169,7 +169,7 @@ mod tests {
         assert_eq!(tx.shards(), 4);
         let shard = tx.shard_for("AAPL");
         tx.try_send("AAPL", 42).unwrap();
-        assert_eq!(rx.receiver(shard).try_recv().unwrap(), 42);
+        assert_eq!(rx.get_receiver(shard).unwrap().try_recv().unwrap(), 42);
     }
 
     #[test]
@@ -180,7 +180,7 @@ mod tests {
             tx.try_send("ETH", i).unwrap();
         }
         let mut buf = Vec::new();
-        rx.receiver(s).recv_batch(&mut buf, 5);
+        rx.get_receiver(s).unwrap().recv_batch(&mut buf, 5);
         assert_eq!(buf, vec![0, 1, 2, 3, 4]);
     }
 
@@ -208,7 +208,7 @@ mod tests {
         let (tx, rx) = mpmc!(u64, 64, ByKey, 4);
         let shard = tx.shard_for("AAPL");
         tx.try_send("AAPL", 42).unwrap();
-        assert_eq!(rx.receiver(shard).try_recv().unwrap(), 42);
+        assert_eq!(rx.get_receiver(shard).unwrap().try_recv().unwrap(), 42);
     }
 
     #[test]
@@ -288,7 +288,7 @@ mod tests {
         let (tx, rx) = mpmc!(u64, 100, ByKey, 4);
         let shard = tx.shard_for("ETH");
         tx.try_send("ETH", 999u64).unwrap();
-        assert_eq!(rx.receiver(shard).try_recv().unwrap(), 999);
+        assert_eq!(rx.get_receiver(shard).unwrap().try_recv().unwrap(), 999);
     }
 
     #[test]

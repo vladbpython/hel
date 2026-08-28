@@ -1,5 +1,5 @@
 use super::sync::SyncList;
-use std::sync::atomic::Ordering;
+use crate::shim::loom::{Ordering, fence};
 
 /// Trait for all channel inner state implementations.
 /// T: 'static is required for async channels (tasks require 'static bounds)
@@ -13,7 +13,22 @@ pub trait InnerChannel<T: Send + 'static, const CAP: usize>: Send + Sync {
     fn is_tx_closed(&self) -> bool;
     fn is_rx_closed(&self) -> bool;
     fn notify_receivers(&self);
+    fn notify_receivers_n(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        fence(Ordering::SeqCst);
+        self.receiver_waiters().notify_n(n);
+    }
     fn notify_senders(&self);
+    #[inline]
+    fn notify_senders_n(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        fence(Ordering::SeqCst);
+        self.sender_waiters().notify_n(n);
+    }
     fn notify_all_on_tx_close(&self);
     fn notify_all_on_rx_close(&self);
     fn receiver_add(&self, o: Ordering) -> usize;
@@ -45,6 +60,7 @@ pub trait SenderOps<T: Send + 'static, const CAP: usize>: Send + 'static {
     fn push_blocking(&self, value: T) -> Result<(), T>;
     fn push_batch(&self, buf: &mut Vec<T>) -> usize;
     fn notify_receivers(&self);
+    fn notify_receivers_n(&self, n: usize);
     fn sender_waiters(&self) -> &SyncList;
     fn sender_add(&self, o: Ordering) -> usize;
     fn sender_sub(&self, o: Ordering) -> usize;
@@ -77,6 +93,10 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + Send + 'stat
         self.notify_receivers()
     }
 
+    fn notify_receivers_n(&self, n: usize) {
+        self.notify_receivers_n(n)
+    }
+
     fn sender_waiters(&self) -> &SyncList {
         self.sender_waiters()
     }
@@ -97,7 +117,7 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + Send + 'stat
         self.notify_all_on_tx_close()
     }
 
-    fn queued(&self) -> usize{
+    fn queued(&self) -> usize {
         InnerChannel::queued(self)
     }
 }
@@ -111,6 +131,7 @@ pub trait ReceiverOps<T, const CAP: usize>: Send + 'static {
     fn is_tx_closed(&self) -> bool;
     fn is_empty(&self) -> bool;
     fn notify_senders(&self);
+    fn notify_senders_n(&self, n: usize);
     fn receiver_waiters(&self) -> &SyncList;
     fn receiver_add(&self, o: Ordering) -> usize;
     fn receiver_sub(&self, o: Ordering) -> usize;
@@ -140,6 +161,10 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + Send + 'stat
 
     fn notify_senders(&self) {
         self.notify_senders()
+    }
+
+    fn notify_senders_n(&self, n: usize) {
+        self.notify_senders_n(n)
     }
 
     fn receiver_waiters(&self) -> &SyncList {

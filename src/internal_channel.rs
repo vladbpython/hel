@@ -1,5 +1,6 @@
 pub mod core;
 pub mod errors;
+pub mod helper;
 pub(crate) mod loom_tests;
 pub mod receiver;
 pub mod sender;
@@ -58,8 +59,7 @@ mod tests {
     use super::{
         core::SeqInner,
         errors::{AsyncRecvError, AsyncSendRefError, RecvError, TryRecvError},
-        mpmc_bounded, scsp_bounded,
-        nearest_power_of_two,
+        mpmc_bounded, nearest_power_of_two, scsp_bounded,
         sender::Sender,
         shard_power_of_two,
         traits::InnerChannel,
@@ -123,7 +123,6 @@ mod tests {
     fn shard2_zero_returns_one() {
         assert_eq!(shard_power_of_two(0), 1);
     }
-
 
     // Try recv
 

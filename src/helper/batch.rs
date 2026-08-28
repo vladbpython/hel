@@ -1,8 +1,12 @@
-/// BATCH DRAIN: Safe stop all 6 sync/async \u00d7 shard_key/round_robin/spsc combinations.
+//! BATCH DRAIN: safe stop for all 6 sync/async x shard_key/round_robin/spsc combinations.
+//! CANCELLATION: the async drains in this module are not cancel safe.
+//! Wrapping a whole drain in `timeout`/`select!` and cancelling it drops items already pulled out of the ring,
+//! together with the accumulator.
+//! Use them for run to completion consumption, put timeouts around per-item work inside the handler, not around the drain.
 use std::mem;
 
 /// SYNC batch drain for all 3 channels.
-/// The correct order is sewn: drain buf \u2192 check dc. `handler` for each element;
+/// The correct order is sewn: drain buf check dc. `handler` for each element;
 /// `acc` accumulates Output. Only comes out when the channel is closed and
 /// empty without losing the last batch.
 pub fn drain_batch<T, F, H, O>(max: usize, mut recv: F, mut handler: H, init: O) -> O
@@ -36,7 +40,7 @@ where
 ///   },
 /// init)
 ///```
-/// The drain \u2192 check invariant is preserved: the last nonempty batch (with dc) too
+/// The drain check invariant is preserved: the last nonempty batch (with dc) too
 /// goes to sink. For an empty final (n=0, dc=true) sink is not called.
 pub fn drain_batch_sink<T, F, S, O>(max: usize, mut recv: F, mut sink: S, init: O) -> O
 where
@@ -51,6 +55,13 @@ where
         if n > 0 {
             let batch = mem::take(&mut buf); // take possession of the entire batch
             buf = sink(batch, &mut acc); // process at once, return empty Vec
+            // The returned Vec is the REUSED ALLOCATION, not a retry channel:
+            // items left in it would be re-fed to the sink next round together
+            // with fresh ones, i.e. processed twice.
+            debug_assert!(
+                buf.is_empty(),
+                "drain_batch_sink: the sink must return an EMPTY vec (allocation reuse only)"
+            );
         }
         if dc {
             break;
@@ -60,6 +71,12 @@ where
 }
 
 /// ASYNC batch drain for all 3 channels.
+///
+/// NOT cancel safe. The batch lives inside this future's frame while
+/// the handler runs; cancelling the drain (timeout/select) drops items that
+/// were already pulled out of the ring, and the accumulator with them. Use it
+/// for run-to-completion consumption; wrap per-item work, not the whole
+/// drain, in timeouts.
 /// Reception: `recv` owns both receiver and buffer (takes by value, returns
 /// `(rx, buf, n, dc)`). future does not borrow external `&mut` \u2192 lifetime is clean,
 /// Send is intact. Both resources are reused via back and forth.
@@ -109,7 +126,11 @@ where
 /// `O` accumulator (as in sync drain_batch_sink), but passed by OWNERSHIP
 /// `(Vec<T>, O) -> Future<(Vec<T>, O)>`: async closure cannot hold
 /// `&mut O` via .await (lifetime), so acc leaves and returns.
-/// The drain \u2192 check invariant is preserved: the last non empty batch also goes to sink.
+/// The drain check invariant is preserved: the last non empty batch also goes to sink.
+/// NOT cancel safe. `sink(batch, acc)` owns both the batch and the
+/// accumulator across an await; cancelling the drain there drops both the
+/// items are already out of the ring and are lost. Use for run-to-completion
+/// consumption only.
 pub async fn drain_batch_async_sink<R, F, Fut, T, S, SFut, O>(
     mut rx: R,
     max: usize,
@@ -394,5 +415,4 @@ mod tests {
             .expect("drain_batch(0, ..) spun forever");
         assert_eq!(got, 5, "zero max lost elements or changed semantics");
     }
-
 }

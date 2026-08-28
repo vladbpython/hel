@@ -66,7 +66,7 @@ impl<T> Drop for RestoreOne<'_, T> {
 // so `Drop` can pour the leftovers back into it.
 pub struct RestoreGroups<'a, T> {
     buf: &'a mut Vec<T>,
-    // Per shard FIFO queues; index = shard. A deque, not a Vec, 
+    // Per shard FIFO queues; index = shard. A deque, not a Vec,
     // because backpressure path takes the head one item at a time: `Vec::remove(0)`
     groups: Vec<VecDeque<T>>,
     // Reusable staging area for the bulk path. `try_send_batch` needs `&mut Vec<T>`,
@@ -103,7 +103,7 @@ impl<'a, T> RestoreGroups<'a, T> {
         self.groups[shard].is_empty()
     }
 
-     /// The FIFO head. Callers read the key off it before it moves into pending.
+    /// The FIFO head. Callers read the key off it before it moves into pending.
     pub fn head(&self, shard: usize) -> &T {
         self.groups[shard].front().expect("group is empty")
     }
@@ -128,7 +128,7 @@ impl<'a, T> RestoreGroups<'a, T> {
     }
 
     // Moves the FIFO head of `shard` into the pending slot and hands the slot to `send_async_from`.
-    // The item never leaves the guard, so cancellation at the `.await` cannot swallow it. 
+    // The item never leaves the guard, so cancellation at the `.await` cannot swallow it.
     // O(1).
     pub fn take_head(&mut self, shard: usize) -> &mut Option<T> {
         debug_assert!(self.pending.is_none(), "pending slot must be free");

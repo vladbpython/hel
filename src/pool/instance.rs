@@ -16,7 +16,8 @@ pub const NONE: usize = usize::MAX;
 pub struct Config {
     /// Never fewer than this many active consumers.
     pub min_consumers: usize,
-    /// Never more than this. For CPU work ≈ cores; for I/O it can be large.
+    /// Never more than this. Value above the shard count is silently capped to it:
+    /// hard has exactly one owner at a time, so an extra worker could never receive work anyway.
     pub max_consumers: usize,
     /// Grow when average queue fill exceeds this fraction (0.0..=1.0).
     pub scale_up_fill: f64,
@@ -45,9 +46,10 @@ pub struct Config {
 impl Config {
     /// Config with sensible defaults (fill thresholds 0.80/0.20).
     pub fn new(min: usize, max: usize) -> Self {
+        let max = max.max(1);
         Self {
-            min_consumers: min.max(1),
-            max_consumers: max.max(min).max(1),
+            min_consumers: min.clamp(1, max),
+            max_consumers: max,
             scale_up_fill: 0.80,
             scale_down_fill: 0.20,
             sample_interval: Duration::from_millis(100),
@@ -62,6 +64,7 @@ impl Config {
         self.max_consumers = self.max_consumers.max(1);
         self.min_consumers = self.min_consumers.clamp(1, self.max_consumers);
         self.batch_size = self.batch_size.max(1);
+        self.sample_interval = self.sample_interval.max(Duration::from_millis(1));
         self
     }
 
@@ -115,7 +118,9 @@ impl Config {
         if fill > self.scale_up_fill {
             // UP: jump to target
             let target = (fill * self.max_consumers as f64).ceil() as usize;
-            target.min(self.max_consumers).max(current.min(self.max_consumers))
+            target
+                .min(self.max_consumers)
+                .max(current.min(self.max_consumers))
         } else if fill < self.scale_down_fill {
             // DOWN: STRICTLY one at a time, NOT a jump!
             current.saturating_sub(1).max(self.min_consumers)

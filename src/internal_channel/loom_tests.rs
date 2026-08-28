@@ -1,7 +1,7 @@
 // Loom tests for the Vyukov ring
 #![cfg(all(test, loom))]
 
-use super::core::{SeqInner,SingleInner};
+use super::core::{SeqInner, SingleInner};
 use super::traits::InnerChannel;
 use loom::thread;
 use std::sync::{
@@ -294,9 +294,6 @@ fn loom_blocking_receiver_is_never_left_parked() {
         assert!(ch.push(7).is_ok());
         ch.notify_receivers();
 
-        assert_eq!(
-            cons.join().unwrap().expect("receiver did not complete"),
-            7
-        );
+        assert_eq!(cons.join().unwrap().expect("receiver did not complete"), 7);
     });
 }

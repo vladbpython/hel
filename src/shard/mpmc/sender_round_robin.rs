@@ -28,13 +28,13 @@
 use super::super::errors as shard_error;
 use super::{buf::RestoreOne, receiver::ShardReceiver};
 
-use crate::internal_channel::{
-    core::SeqInner, mpmc_bounded, shard_power_of_two, sender::Sender, traits::InnerChannel
+use crate::{
+    internal_channel::{
+        core::SeqInner, mpmc_bounded, sender::Sender, shard_power_of_two, traits::InnerChannel,
+    },
+    shim::loom::{AtomicUsize, Ordering},
 };
-use std::{
-    sync::{Arc, atomic::AtomicUsize, atomic::Ordering},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 /// Sharded channel with round robin routing.
 /// Each `push` goes to the next shard in sequence.
@@ -284,7 +284,7 @@ mod tests {
         let (tx, mut rx) = round_robin::<u64, 8>(4);
         tx.try_send(42).unwrap();
         // try_recv_any non blocking poll all shards
-        let (_, v) = rx.try_recv_any().unwrap();
+        let (_, v) = rx.try_recv_any().unwrap().unwrap();
         assert_eq!(v, 42);
     }
 
@@ -293,7 +293,7 @@ mod tests {
     async fn rr_async_push() {
         let (tx, mut rx) = round_robin::<u64, 8>(4);
         tx.send_async(42).await.unwrap();
-        let (_, v) = rx.try_recv_any().unwrap();
+        let (_, v) = rx.try_recv_any().unwrap().unwrap();
         assert_eq!(v, 42);
     }
 
@@ -370,8 +370,8 @@ mod tests {
         let (tx, mut rx) = round_robin::<u64, 8>(4);
         tx.try_send(1).unwrap();
         tx.try_send(2).unwrap();
-        let (_, v1) = rx.try_recv_any().unwrap();
-        let (_, v2) = rx.try_recv_any().unwrap();
+        let (_, v1) = rx.try_recv_any().unwrap().unwrap();
+        let (_, v2) = rx.try_recv_any().unwrap().unwrap();
         let mut vals = [v1, v2];
         vals.sort();
         assert_eq!(vals, [1, 2]);
@@ -444,7 +444,7 @@ mod tests {
         drop(tx);
         // receivers are alive, data is available
         let mut buf = Vec::new();
-        rx.receiver(0).recv_batch(&mut buf, 8);
+        rx.get_receiver(0).unwrap().recv_batch(&mut buf, 8);
         // rx drops last correct order
     }
 
@@ -478,9 +478,9 @@ mod tests {
     fn miri_receiver_try_recv_any_empty() {
         let (tx, mut rx) = round_robin::<u64, 8>(4);
         // Empty channel try_recv_any should return None without UB
-        assert!(rx.try_recv_any().is_none());
+        assert!(rx.try_recv_any().unwrap().is_none());
         tx.try_send(42).unwrap();
-        let (shard, v) = rx.try_recv_any().unwrap();
+        let (shard, v) = rx.try_recv_any().unwrap().unwrap();
         assert!(shard < 4);
         assert_eq!(v, 42);
         drop(tx);
@@ -492,8 +492,8 @@ mod tests {
         // receiver() returns &Receiver clone and use
         tx.try_send(1).unwrap();
         tx.try_send(2).unwrap();
-        let r0 = rx.receiver(0).clone();
-        let r1 = rx.receiver(1).clone();
+        let r0 = rx.get_receiver(0).unwrap().clone();
+        let r1 = rx.get_receiver(1).unwrap().clone();
         // One of them contains data
         let got = r0.try_recv().ok().or_else(|| r1.try_recv().ok());
         assert!(got.is_some());
@@ -554,7 +554,7 @@ mod tests {
 
         // Drain everything: only the fill items exist, 100 never entered.
         let mut got = Vec::new();
-        while let Some((_, v)) = rx.try_recv_any() {
+        while let Some((_, v)) = rx.try_recv_any().unwrap() {
             got.push(v);
         }
         got.sort_unstable();
@@ -586,17 +586,17 @@ mod tests {
 
         // Drain both shards completely: only fill items, no 42 anywhere.
         for s in 0..SHARDS {
-            while rx.receiver(s).try_recv().is_ok() {}
+            while rx.get_receiver(s).unwrap().try_recv().is_ok() {}
         }
 
         // Retry takes the NEXT tick (5) -> shard 1, not shard 0.
         tx.send_ref_async(&mut slot).await.unwrap();
         assert_eq!(slot, None);
         assert!(
-            rx.receiver(0).try_recv().is_err(),
+            rx.get_receiver(0).unwrap().try_recv().is_err(),
             "shard 0 must stay empty: the cancelled send consumed its tick"
         );
-        assert_eq!(rx.receiver(1).try_recv().unwrap(), 42);
+        assert_eq!(rx.get_receiver(1).unwrap().try_recv().unwrap(), 42);
     }
 
     #[cfg(not(miri))]

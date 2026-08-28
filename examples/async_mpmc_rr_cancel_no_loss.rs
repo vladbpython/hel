@@ -26,7 +26,7 @@ fn main() {
         // shard alive after the multi receiver is dropped.
         let mut consumers = Vec::new();
         for shard_id in 0..SHARDS {
-            let rx_s = rx.receiver(shard_id).clone();
+            let rx_s = rx.get_receiver(shard_id).unwrap().clone();
             consumers.push(tokio::spawn(async move {
                 let mut total = 0u64;
                 loop {

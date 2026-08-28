@@ -1,12 +1,8 @@
-use super::marker::{
-    WorkerCancelled,
-    WORKER_CANCELLED,
-};
+use super::marker::{WORKER_CANCELLED, WorkerCancelled};
 use std::{any::Any, fmt::Debug};
 pub struct PanicReason(pub Box<dyn Any + Send + 'static>);
 
 impl PanicReason {
-
     pub fn cancelled() -> Self {
         Self(Box::new(WorkerCancelled))
     }
@@ -44,7 +40,7 @@ impl Debug for PanicReason {
 }
 
 #[cfg(test)]
-mod tests{
+mod tests {
     use super::*;
 
     #[test]

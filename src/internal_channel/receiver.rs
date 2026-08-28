@@ -1,6 +1,7 @@
 use super::{
     core::{SeqInner, SingleInner},
     errors::{AsyncRecvError, RecvError, TryRecvError},
+    helper::deadline_after,
     sync::{AsyncSlot, SyncNode},
     traits::{InnerChannel, MultiConsumer, ReceiverOps},
 };
@@ -108,9 +109,7 @@ pub fn batch<T, const CAP: usize>(
     max: usize,
 ) -> (usize, bool) {
     let (n, dc) = inner.pop_batch(buf, max);
-    if n > 0 {
-        inner.notify_senders();
-    }
+    inner.notify_senders_n(n);
     (n, dc)
 }
 
@@ -214,7 +213,7 @@ pub struct GenericRecvStream<'a, T: Send + 'static, const CAP: usize, I: Receive
     _t: PhantomData<T>,
 }
 
-unsafe impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Send
+unsafe impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP> + Send + Sync> Send
     for GenericRecvStream<'_, T, CAP, I>
 {
 }
@@ -318,7 +317,7 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
     }
 
     pub fn recv_timeout(&self, d: Duration) -> Result<T, RecvError> {
-        recv_impl(self.inner.as_ref(), Some(Instant::now() + d))
+        recv_impl(self.inner.as_ref(), deadline_after(d))
     }
 
     #[inline]
@@ -328,7 +327,7 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
         }
         let (n, dc) = self.inner.pop_batch(buf, max);
         if n > 0 {
-            self.inner.notify_senders();
+            self.inner.notify_senders_n(n);
             (n, false)
         } else {
             (0, dc)
@@ -340,7 +339,7 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
     }
 
     pub fn recv_batch_timeout(&self, buf: &mut Vec<T>, max: usize, d: Duration) -> (usize, bool) {
-        recv_batch(self.inner.as_ref(), buf, max, Some(Instant::now() + d))
+        recv_batch(self.inner.as_ref(), buf, max, deadline_after(d))
     }
 
     pub fn recv_async(&self) -> ReceiverFuture<'_, T, CAP, I> {
@@ -489,15 +488,20 @@ impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
     }
 
     pub fn recv_timeout(&mut self, d: Duration) -> Result<T, RecvError> {
-        recv_impl(self.inner.as_ref(), Some(Instant::now() + d))
+        recv_impl(self.inner.as_ref(), deadline_after(d))
     }
 
     pub fn recv_batch(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         recv_batch(self.inner.as_ref(), buf, max, None)
     }
 
-    pub fn recv_batch_timeout(&mut self, buf: &mut Vec<T>, max: usize, d: Duration) -> (usize, bool) {
-        recv_batch(self.inner.as_ref(), buf, max, Some(Instant::now() + d))
+    pub fn recv_batch_timeout(
+        &mut self,
+        buf: &mut Vec<T>,
+        max: usize,
+        d: Duration,
+    ) -> (usize, bool) {
+        recv_batch(self.inner.as_ref(), buf, max, deadline_after(d))
     }
 
     pub fn recv_async(&mut self) -> SingleRecvFuture<'_, T, CAP> {

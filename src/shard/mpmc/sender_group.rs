@@ -4,18 +4,15 @@ use super::{
     receiver::ShardReceiver,
 };
 use crate::internal_channel::{
-    core::SeqInner, mpmc_bounded, shard_power_of_two, sender::Sender, traits::InnerChannel,
+    core::SeqInner, helper::deadline_after, mpmc_bounded, sender::Sender, shard_power_of_two,
+    traits::InnerChannel,
 };
 use std::{
     any::Any,
     collections::HashMap,
-    panic::{
-        AssertUnwindSafe,
-        catch_unwind,
-        resume_unwind
-    },
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::Arc,
-    time::{Duration,Instant},
+    time::{Duration, Instant},
 };
 
 // SymbolHandle
@@ -262,8 +259,14 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         }
         let (groups, mut unused) = self.group_by_route(buf, &key_fn);
         let mut total = 0usize;
-        let mut groups = groups.into_iter().enumerate();
-        while let Some((shard, mut group)) = groups.next() {
+        // EVERY shard is attempted: a full shard no longer aborts the whole
+        // call — one slow consumer used to starve every other key group. The
+        // FIRST error is reported after all shards were tried; `buf` then
+        // holds the failed shards' leftovers (first failed group first, so
+        // buf[0] keys the error) plus the orphans.
+        let mut first_err: Option<(usize, crate::internal_channel::errors::TrySendBatchError)> =
+            None;
+        for (shard, mut group) in groups.into_iter().enumerate() {
             if group.is_empty() {
                 continue;
             }
@@ -271,23 +274,26 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
                 Ok(sent) => total += sent,
                 Err(e) => {
                     total += e.sent;
-                    refill_on_error(buf, group, groups);
-                    buf.append(&mut unused); // unused too in buf
-                    let first_key = buf
-                        .first()
-                        .map(|item| key_fn(item).to_string())
-                        .unwrap_or_default();
-                    // return the remainder of the fallen group + untouched groups
-                    return Err(shard_error::ShardKeyTryBatchSendError {
-                        key: first_key,
-                        shard,
-                        sent: total,
-                        reason: e.err,
-                    });
+                    if first_err.is_none() {
+                        first_err = Some((shard, e.err));
+                    }
+                    buf.append(&mut group);
                 }
             }
         }
         buf.append(&mut unused);
+        if let Some((shard, reason)) = first_err {
+            let first_key = buf
+                .first()
+                .map(|item| key_fn(item).to_string())
+                .unwrap_or_default();
+            return Err(shard_error::ShardKeyTryBatchSendError {
+                key: first_key,
+                shard,
+                sent: total,
+                reason,
+            });
+        }
         Ok(total)
     }
 
@@ -361,15 +367,17 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         if buf.is_empty() {
             return Ok(0);
         }
+        let deadline = deadline_after(d);
         let (groups, mut unused) = self.group_by_route(buf, &key_fn);
-        let deadline = Instant::now() + d;
         let mut total = 0usize;
         let mut groups = groups.into_iter().enumerate();
         while let Some((shard, mut group)) = groups.next() {
             if group.is_empty() {
                 continue;
             }
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.map_or(Duration::MAX, |dl| {
+                dl.saturating_duration_since(Instant::now())
+            });
             match self.senders[shard].send_batch_timeout(&mut group, left) {
                 Ok(sent) => total += sent,
                 Err(e) => {
@@ -400,7 +408,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
     /// Unlike shard_key (fast path retry via try_send_batch): here
     /// layout ONCE, because unused cannot be driven through hash to retry
     /// Strict routing control requires one time grouping by map.
-     pub async fn send_batch_async(
+    pub async fn send_batch_async(
         &self,
         buf: &mut Vec<T>,
         key_fn: impl for<'k> Fn(&'k T) -> &'k str,
@@ -446,10 +454,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
                 if disconnected {
                     // `g` drops here: groups, orphans and the pending
                     // item all go back into `buf`.
-                    return Err(shard_error::ShardAsyncBatchSendError {
-                        shard,
-                        sent: total,
-                    });
+                    return Err(shard_error::ShardAsyncBatchSendError { shard, sent: total });
                 }
                 total += 1;
             }
@@ -554,7 +559,7 @@ mod tests {
         });
         let a = tx.handle("AAA").unwrap();
         tx.try_send(a, 42).unwrap();
-        assert_eq!(rx.receiver(a.shard()).try_recv().unwrap(), 42);
+        assert_eq!(rx.get_receiver(a.shard()).unwrap().try_recv().unwrap(), 42);
     }
 
     #[test]
@@ -573,7 +578,7 @@ mod tests {
         assert_eq!(sent, 4);
         assert!(buf.is_empty());
         let mut out = Vec::new();
-        rx.receiver(a.shard()).recv_batch(&mut out, 8);
+        rx.get_receiver(a.shard()).unwrap().recv_batch(&mut out, 8);
         assert_eq!(
             out,
             vec![
@@ -680,7 +685,14 @@ mod tests {
         });
         let a = tx.handle("AAA").unwrap();
         tx.send_async(a, 7).await.unwrap();
-        assert_eq!(rx.receiver(a.shard()).recv_async().await.unwrap(), 7);
+        assert_eq!(
+            rx.get_receiver(a.shard())
+                .unwrap()
+                .recv_async()
+                .await
+                .unwrap(),
+            7
+        );
     }
 
     // Disconnected should NOT lose groups that the loop has not reached.
@@ -800,7 +812,14 @@ mod tests {
         let mut slot = Some(7u64);
         tx.send_ref_async(a, &mut slot).await.unwrap();
         assert_eq!(slot, None);
-        assert_eq!(rx.receiver(a.shard()).recv_async().await.unwrap(), 7);
+        assert_eq!(
+            rx.get_receiver(a.shard())
+                .unwrap()
+                .recv_async()
+                .await
+                .unwrap(),
+            7
+        );
     }
 
     // Deterministic routing: cancellation keeps the value, a retry with the
@@ -827,14 +846,14 @@ mod tests {
         );
 
         // Drain the shard completely: only fill items, 42 never entered.
-        while let Ok(v) = rx.receiver(a.shard()).try_recv() {
+        while let Ok(v) = rx.get_receiver(a.shard()).unwrap().try_recv() {
             assert_eq!(v, 10, "only fill items may be in the shard");
         }
 
         // Retry: same handle -> same shard, deterministic routing.
         tx.send_ref_async(a, &mut slot).await.unwrap();
         assert_eq!(slot, None);
-        assert_eq!(rx.receiver(a.shard()).try_recv().unwrap(), 42);
+        assert_eq!(rx.get_receiver(a.shard()).unwrap().try_recv().unwrap(), 42);
     }
 
     #[cfg(not(miri))]
@@ -853,7 +872,6 @@ mod tests {
     }
 }
 
-
 #[cfg(all(test, not(loom)))]
 mod key_fn_panic_and_orphan_tests {
     use super::*;
@@ -864,8 +882,7 @@ mod key_fn_panic_and_orphan_tests {
         let (tx, _rx) = shard_group::<(String, u64), 8>(ShardGroupCase::Groups {
             groups: &[&["A"], &["B"]],
         });
-        let mut buf: Vec<(String, u64)> =
-            vec![("A".into(), 1), ("B".into(), 2), ("A".into(), 3)];
+        let mut buf: Vec<(String, u64)> = vec![("A".into(), 1), ("B".into(), 2), ("A".into(), 3)];
         let r = catch_unwind(AssertUnwindSafe(|| {
             let _ = tx.try_send_batch(&mut buf, |(k, v)| {
                 if *v == 3 {

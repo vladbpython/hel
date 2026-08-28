@@ -92,7 +92,10 @@ fn make_pools(producers: u64, n: u64) -> Pools {
 }
 
 fn keys_one_per_shard(shards: usize) -> Vec<&'static str> {
-    assert!(shards.is_power_of_two(), "shard count must be a power of two");
+    assert!(
+        shards.is_power_of_two(),
+        "shard count must be a power of two"
+    );
     let (tx, _rx) = shard_key::<Trade, 2>(shards);
     let mut by_shard: Vec<Option<&'static str>> = vec![None; shards];
     let mut i = 0u64;

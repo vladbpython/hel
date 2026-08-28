@@ -2,24 +2,14 @@ use super::{
     sync::{Slot, SyncList},
     traits::{InnerChannel, MultiConsumer, MultiProducer},
 };
-use crate::{
-    cache::Padding,
-    shim,
-};
-use shim::loom::{
-    AtomicBool, AtomicUsize, Ordering
-};
+use crate::{cache::Padding, shim};
+use shim::loom::{AtomicBool, AtomicUsize, Ordering};
 
 #[cfg(not(loom))]
 use std::hint;
 #[cfg(not(loom))]
 use std::time;
-use std::{
-    mem::MaybeUninit,
-    ptr::addr_of_mut,
-    sync::Arc,
-    thread,
-};
+use std::{mem::MaybeUninit, ptr::addr_of_mut, sync::Arc, thread};
 
 /// Waiting phases push_fetch_add (escalation spin → yield → sleep)
 /// Spin budget ≈ cost of the yield stage (~0.5 µs): 64 × ~20 ns ≈ 1.3 µs.
@@ -703,7 +693,10 @@ unsafe impl<T: Send, const CAP: usize> Sync for SingleInner<T, CAP> {}
 #[cfg(test)]
 mod core_init_tests {
     use super::*;
-    use std::{sync::atomic::Ordering, time::{Duration,Instant}};
+    use std::{
+        sync::atomic::Ordering,
+        time::{Duration, Instant},
+    };
 
     // Basic: fields are correct
     #[test]
@@ -1025,7 +1018,11 @@ mod core_init_tests {
         for b in blocked {
             b.join().unwrap();
         }
-        assert_eq!(inner.queued(), CAP, "full again after the blocked sends landed");
+        assert_eq!(
+            inner.queued(),
+            CAP,
+            "full again after the blocked sends landed"
+        );
         for _ in 0..CAP {
             inner.pop().unwrap();
         }
@@ -1042,7 +1039,9 @@ mod core_wrap_tests {
         inner.tail.store(start, Ordering::Relaxed);
         for i in 0..CAP {
             let pos = start.wrapping_add(i);
-            inner.slots[pos & (CAP - 1)].sequence.store(pos, Ordering::Relaxed);
+            inner.slots[pos & (CAP - 1)]
+                .sequence
+                .store(pos, Ordering::Relaxed);
         }
     }
 
@@ -1051,7 +1050,9 @@ mod core_wrap_tests {
         inner.tail.store(start, Ordering::Relaxed);
         for i in 0..CAP {
             let pos = start.wrapping_add(i);
-            inner.slots[pos & (CAP - 1)].sequence.store(pos, Ordering::Relaxed);
+            inner.slots[pos & (CAP - 1)]
+                .sequence
+                .store(pos, Ordering::Relaxed);
         }
     }
 
@@ -1071,7 +1072,11 @@ mod core_wrap_tests {
         while let Some(v) = inner.pop() {
             got.push(v);
         }
-        assert_eq!(got, (1..=10).collect::<Vec<u64>>(), "FIFO broken across the wrap");
+        assert_eq!(
+            got,
+            (1..=10).collect::<Vec<u64>>(),
+            "FIFO broken across the wrap"
+        );
     }
 
     #[test]
@@ -1090,7 +1095,11 @@ mod core_wrap_tests {
         while let Some(v) = inner.pop() {
             got.push(v);
         }
-        assert_eq!(got, (1..=10).collect::<Vec<u64>>(), "FIFO broken across the wrap");
+        assert_eq!(
+            got,
+            (1..=10).collect::<Vec<u64>>(),
+            "FIFO broken across the wrap"
+        );
     }
 
     #[test]
@@ -1108,7 +1117,11 @@ mod core_wrap_tests {
             assert!(inner.push(Tracked(drops.clone())).is_ok());
             assert!(inner.push(Tracked(drops.clone())).is_ok()); // tail wraps to 1
         }
-        assert_eq!(drops.load(Ordering::Relaxed), 2, "SeqInner leaked at the wrap");
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            2,
+            "SeqInner leaked at the wrap"
+        );
 
         let drops2 = Arc::new(AtomicUsize::new(0));
         {
@@ -1117,7 +1130,11 @@ mod core_wrap_tests {
             assert!(inner.push(Tracked(drops2.clone())).is_ok());
             assert!(inner.push(Tracked(drops2.clone())).is_ok());
         }
-        assert_eq!(drops2.load(Ordering::Relaxed), 2, "SingleInner leaked at the wrap");
+        assert_eq!(
+            drops2.load(Ordering::Relaxed),
+            2,
+            "SingleInner leaked at the wrap"
+        );
     }
 
     #[test]
@@ -1159,7 +1176,14 @@ mod core_wrap_tests {
             n
         });
         thread::sleep(std::time::Duration::from_millis(300));
-        assert!(done.load(Ordering::Acquire), "push_batch livelocked at the wrap");
-        assert_eq!(h.join().unwrap(), 0, "over-reserved ring must accept nothing");
+        assert!(
+            done.load(Ordering::Acquire),
+            "push_batch livelocked at the wrap"
+        );
+        assert_eq!(
+            h.join().unwrap(),
+            0,
+            "over-reserved ring must accept nothing"
+        );
     }
 }
