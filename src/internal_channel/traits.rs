@@ -4,6 +4,7 @@ use crate::shim::loom::{Ordering, fence};
 /// Trait for all channel inner state implementations.
 /// T: 'static is required for async channels (tasks require 'static bounds)
 pub trait InnerChannel<T: Send + 'static, const CAP: usize>: Send + Sync {
+    const MULTI_CONSUMER: bool = false;
     fn push(&self, v: T) -> Result<(), T>;
     fn push_blocking(&self, v: T) -> Result<(), T>;
     fn pop(&self) -> Option<T>;

@@ -239,7 +239,7 @@ impl<T: Send + 'static, const CAP: usize> ShardKey<T, CAP> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let deadline = deadline_after(d);
+        let deadline = Some(deadline_after(d));
         let mut total = 0usize;
         let mut groups = self.group_by_shard(buf, &key_fn).into_iter().enumerate();
         while let Some((shard, mut group)) = groups.next() {

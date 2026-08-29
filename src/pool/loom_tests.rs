@@ -4,7 +4,9 @@
 use super::guard::OwnerGuard;
 use super::instance::{self, NONE, State};
 use loom::thread;
-use std::sync::atomic::Ordering;
+use std::{
+    sync::atomic::Ordering as StdOrdering
+};
 
 #[test]
 fn loom_pool_claim_never_double_owns() {
@@ -34,7 +36,7 @@ fn loom_pool_claim_never_double_owns() {
             h.join().unwrap();
         }
         for s in 0..2 {
-            let o = state.owner(s).load(Ordering::Acquire);
+            let o = state.owner(s).load(StdOrdering::Acquire);
             assert_eq!(o, s, "shard {s} not owned by its desired worker");
         }
     });

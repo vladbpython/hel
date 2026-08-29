@@ -297,3 +297,30 @@ fn loom_blocking_receiver_is_never_left_parked() {
         assert_eq!(cons.join().unwrap().expect("receiver did not complete"), 7);
     });
 }
+
+#[test]
+fn loom_spsc_drained_ring_reads_empty() {
+    loom::model(|| {
+        let ch: Arc<SingleInner<usize, 2>> = SingleInner::new();
+
+        let prod = {
+            let ch = ch.clone();
+            thread::spawn(move || {
+                assert!(ch.push(7).is_ok());
+            })
+        };
+
+        // Single consumer: spin until the one item arrives.
+        let got = loop {
+            if let Some(v) = ch.pop() {
+                break v;
+            }
+            thread::yield_now();
+        };
+        assert_eq!(got, 7);
+        assert_eq!(ch.queued(), 0, "drained ring must report zero depth");
+        assert!(ch.is_empty(), "drained ring must read as empty");
+
+        prod.join().unwrap();
+    });
+}

@@ -13,8 +13,14 @@ pub use num_cpus as _num_cpus;
 pub mod channel {
     pub use super::internal_channel::{
         errors, nearest_power_of_two,
-        receiver::{Receiver, SingleReceiver},
-        sender::SingleSender,
+        receiver::{
+            GenericRecvFuture, GenericRecvStream, IntoIter, Iter, Receiver,
+            ReceiverFuture, ReceiverStream, SingleIntoIter, SingleIter,
+            SingleReceiver, SingleRecvFuture, SingleRecvStream,
+        },
+        sender::{
+            GenericSendFuture, Sender, SenderFuture, SingleSender
+        },
         shard_power_of_two,
     };
     pub mod mpmc {

@@ -105,8 +105,13 @@ impl AtomicWaker {
                 }
             }
             // A take() is mid-flight: equivalent to being woken right after
-            // registering, so deliver a wakeup to new waker ourselves.
-            Err(actual) if actual == Self::WAKING => waker.wake_by_ref(),
+            // registering, so deliver a wakeup to the NEW waker ourselves.
+            // The SeqCst fence mirrors the real crate; without it the model
+            // is WEAKER than production (false positives only, but noisy).
+            Err(actual) if actual == Self::WAKING => {
+                waker.wake_by_ref();
+                fence(Ordering::SeqCst);
+            }
             // Concurrent register: the protocol drops this registration.
             Err(_) => {}
         }

@@ -1,3 +1,4 @@
+pub mod errors;
 pub(crate) mod guard;
 pub mod handler;
 pub mod instance;
@@ -54,15 +55,17 @@ where
                 let (n, dc) = receivers[shard].try_recv_batch(&mut buf, cfg.batch_size);
                 if n > 0 {
                     done = true;
-                    debug_assert_eq!(
+                    assert_eq!(
                         buf.len(),
                         n,
                         "worker buffer must hold exactly the dequeued batch"
                     );
+                    state.set_current_shard(id, shard);
                     let mut batch = guard::CommitBatchGuard::new(&mut buf, &*dead_letter);
                     while let Some(item) = batch.next() {
                         let mut held = guard::CommitGuard::new(item, &*dead_letter);
                         let slot = held.slot();
+                        state.set_worker_busy(id, true);
                         let r = AssertUnwindSafe(async { handler.handle(slot).await })
                             .catch_unwind()
                             .await;
@@ -85,10 +88,13 @@ where
                             }
                         }
                         // The item's own Drop is user code too: a panicking
-                        // Drop must not unwind the worker (it killed the
-                        // task and orphaned its shards forever).
+                        // Drop must not unwind the worker (it killed the task and its shards forever).
                         let _ = catch_unwind(AssertUnwindSafe(move || drop(slot)));
+                        // Stall-takeover heartbeat: one completed item.
+                        state.beat(id);
+                        state.set_worker_busy(id, false);
                     }
+                    state.set_current_shard(id, instance::NONE);
                 }
                 if dc {
                     state.mark_closed(shard);
@@ -124,7 +130,7 @@ pub fn async_pool_slot<AR, T, const CAP: usize, I, H, D>(
     receivers: Vec<Receiver<T, CAP, I>>,
     handler: H,
     dead_letter: D,
-) -> sync::AsyncPool<AR>
+) -> Result<sync::AsyncPool<AR>,errors::PoolError>
 where
     AR: traits::AsyncRuntime,
     T: Send + 'static,
@@ -134,10 +140,9 @@ where
     D: Fn(T, PanicReason) + Send + Sync + 'static,
 {
     let cfg = cfg.init();
-    assert!(
-        !receivers.is_empty(),
-        "pool needs at least one shard receiver, with zero shards autodrain never fires and wait_stopping() hangs forever"
-    );
+    if receivers.is_empty(){
+        return Err(errors::PoolError::ReceiverEmpty)
+    }
     let shards = receivers.len();
     let cfg = {
         let mut cfg = cfg;
@@ -145,6 +150,15 @@ where
         cfg.min_consumers = cfg.min_consumers.min(cfg.max_consumers);
         cfg
     };
+    if cfg.stall_takeover.is_some() && cfg.max_consumers < 2 {
+        return Err(
+            errors::PoolError::Config(errors::ConfigError::StallTakeoverNeedsSpareWorker 
+                { 
+                    effective_max: cfg.max_consumers 
+                }
+            )
+        );
+    }
     let state = instance::State::new(shards, cfg.min_consumers);
     let receivers = Arc::new(receivers);
     let handler = Arc::new(handler);
@@ -177,11 +191,21 @@ where
         let workers_store = workers.clone();
         let h = async_runtime.spawn(async move {
             let mut spawned = cfg.min_consumers;
+            let mut beat_prev = vec![0u64; cfg.max_consumers];
+            let mut stall_ticks = vec![0u32; cfg.max_consumers];
             while !state.is_stopped() {
                 if sleep_interruptible_async(&ar, &state, cfg.sample_interval).await {
                     break;
                 }
                 instance::monitor(&cfg, &state, &receivers);
+                let _ = instance::stall_takeover_pass(
+                    &cfg,
+                    &state,
+                    &receivers,
+                    &mut beat_prev,
+                    &mut stall_ticks,
+                    spawned,
+                );
                 // Top up to the new active target, `spawned` only grows,
                 // so later scale down keeps the tasks (they park at the monitor tick cadence)
                 // and re scale up is free.
@@ -205,7 +229,7 @@ where
         sync::lock_workers(&workers).push(h);
     }
 
-    sync::AsyncPool::new(state, workers)
+    Ok(sync::AsyncPool::new(state, workers))
 }
 
 /// Interruptible async sleep: the same via AsyncRuntime::sleep (runtime parks the task).
@@ -255,8 +279,10 @@ where
                 let (n, dc) = receivers[shard].try_recv_batch(&mut buf, cfg.batch_size);
                 if n > 0 {
                     done = true;
+                    state.set_current_shard(id, shard);
                     for item in buf.drain(..n) {
                         let mut slot = Some(item);
+                        state.set_worker_busy(id, true);
                         let r = catch_unwind(AssertUnwindSafe(|| handler.handle(&mut slot)));
                         match r {
                             Ok(()) => {
@@ -276,7 +302,11 @@ where
                             }
                         }
                         let _ = catch_unwind(AssertUnwindSafe(move || drop(slot)));
+                        // Stall-takeover heartbeat: one completed item.
+                        state.beat(id);
+                        state.set_worker_busy(id, false);
                     }
+                    state.set_current_shard(id, instance::NONE);
                 }
                 if dc {
                     state.mark_closed(shard);
@@ -312,7 +342,7 @@ pub fn sync_pool_slot<T, const CAP: usize, I, H, D>(
     receivers: Vec<Receiver<T, CAP, I>>,
     handler: H,
     dead_letter: D,
-) -> sync::SyncPool
+) -> Result<sync::SyncPool,errors::PoolError>
 where
     T: Send + 'static,
     I: InnerChannel<T, CAP> + Send + Sync + 'static,
@@ -321,10 +351,9 @@ where
     D: Fn(T, PanicReason) + Send + Sync + 'static,
 {
     let cfg = cfg.init();
-    assert!(
-        !receivers.is_empty(),
-        "pool needs at least one shard receiver, with zero shards autodrain never fires and wait_stopping() hangs forever"
-    );
+    if receivers.is_empty(){
+        return Err(errors::PoolError::ReceiverEmpty)
+    }
     let shards = receivers.len();
     let cfg = {
         let mut cfg = cfg;
@@ -332,6 +361,15 @@ where
         cfg.min_consumers = cfg.min_consumers.min(cfg.max_consumers);
         cfg
     };
+    if cfg.stall_takeover.is_some() && cfg.max_consumers < 2 {
+        return Err(
+            errors::PoolError::Config(errors::ConfigError::StallTakeoverNeedsSpareWorker 
+                { 
+                    effective_max: cfg.max_consumers 
+                }
+            )
+        );
+    }
     let state = instance::State::new(shards, cfg.min_consumers);
     let receivers = Arc::new(receivers);
     let handler = Arc::new(handler);
@@ -361,11 +399,21 @@ where
         let workers_store = workers.clone();
         let h = thread::spawn(move || {
             let mut spawned = cfg.min_consumers;
+            let mut beat_prev = vec![0u64; cfg.max_consumers];
+            let mut stall_ticks = vec![0u32; cfg.max_consumers];
             while !state.is_stopped() {
                 if sleep_interruptible_sync(&state, cfg.sample_interval) {
                     break;
                 }
                 instance::monitor(&cfg, &state, &receivers);
+                let _ = instance::stall_takeover_pass(
+                    &cfg,
+                    &state,
+                    &receivers,
+                    &mut beat_prev,
+                    &mut stall_ticks,
+                    spawned,
+                );
                 // Top up to the new active target, `spawned` only grows,
                 // so later scale down keeps the tasks (they park at the monitor tick cadence)
                 // and re scale up is free.
@@ -388,7 +436,7 @@ where
         sync::lock_workers(&workers).push(h);
     }
 
-    sync::SyncPool::new(state, workers)
+    Ok(sync::SyncPool::new(state, workers))
 }
 
 /// Interruptible sleep: sleeps total, but wakes up, check is_stopped every MONITOR_TICK.
@@ -414,12 +462,14 @@ mod tests {
         nearest_power_of_two,
     };
     use std::{
+        mem,
         collections::HashMap,
         sync::{
             Arc, Mutex, OnceLock,
             atomic::{AtomicU64, Ordering},
         },
-        time::Duration,
+        time::{Duration,Instant},
+        thread,
     };
 
     const CAP: usize = nearest_power_of_two(16);
@@ -446,7 +496,7 @@ mod tests {
                 s.fetch_add(*v, Ordering::Relaxed);
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         let per = 10 * SCALE;
         let producers: Vec<_> = (0..2u64)
@@ -506,7 +556,7 @@ mod tests {
                 proc_c.fetch_add(1, Ordering::Relaxed);
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         let producers: Vec<_> = (0..KEYS)
             .map(|k| {
@@ -578,7 +628,7 @@ mod tests {
                 c.fetch_add(1, Ordering::Relaxed);
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         let per = 8 * SCALE;
         let keys = ["a", "b", "c", "d"];
@@ -635,7 +685,7 @@ mod tests {
                 c.fetch_add(1, Ordering::Relaxed);
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         // fill the elements (do not drop tx, the pool will NOT end on its own)
         for i in 0..(100 * SCALE) {
@@ -666,7 +716,7 @@ mod tests {
                 c.fetch_add(1, Ordering::Relaxed);
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         // cancellation signal
         let stop = pool.get_signal_stop();
@@ -745,7 +795,7 @@ mod tests {
                 }
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
         // producers in blocking streams (send synchronous)
         let producers: Vec<_> = (0..8)
             .map(|_| {
@@ -792,7 +842,7 @@ mod tests {
                 }
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         for i in 0..10_000u64 {
             tx.send_async(i).await.unwrap();
@@ -840,7 +890,7 @@ mod tests {
                 }
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         let producers: Vec<_> = (0..KEYS)
             .map(|k| {
@@ -946,7 +996,7 @@ mod tests {
                 }
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         let producers: Vec<_> = (0..KEYS)
             .map(|k| {
@@ -1027,7 +1077,7 @@ mod tests {
                 }
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         const PER_KEY: u64 = 2500;
         let keys = ["AAA", "BBB", "CCC", "DDD"];
@@ -1076,6 +1126,128 @@ mod tests {
 
     #[cfg(not(miri))]
     #[test]
+    fn stall_takeover_rescues_shards_from_a_stuck_owner() {
+        let (tx, rx) = shard_key::<(u64, u64), 64>(4);
+        // One key per shard, by probing.
+        let mut keys: Vec<Option<String>> = vec![None; 4];
+        let mut i = 0u32;
+        while keys.iter().any(|k| k.is_none()) {
+            let k = format!("k{i}");
+            i += 1;
+            let s = tx.shard_for(&k);
+            if keys[s].is_none() {
+                keys[s] = Some(k);
+            }
+        }
+        let keys: Vec<String> = keys.into_iter().map(Option::unwrap).collect();
+
+        // batch_size(1): the poison is taken alone, the items behind it stay
+        // in the ring of the stuck shard - exactly the state the takeover
+        // must refuse to steal (non empty current shard).
+        let cfg = instance::Config::new(1, 4)
+            .sample_interval(Duration::from_millis(1))
+            .batch_size(1)
+            .stall_takeover(Duration::from_millis(20));
+        let processed = Arc::new(AtomicU64::new(0));
+        let inversions = Arc::new(AtomicU64::new(0));
+        let last: Arc<Vec<AtomicU64>> = Arc::new((0..4).map(|_| AtomicU64::new(0)).collect());
+        let (p, inv, l) = (processed.clone(), inversions.clone(), last.clone());
+        let pool = sync_pool_slot(
+            cfg,
+            rx.into_receivers(),
+            handler::PerItem(move |&(key, seq): &(u64, u64)| {
+                if seq == u64::MAX {
+                    loop {
+                        thread::sleep(Duration::from_secs(3600));
+                    }
+                }
+                let prev = l[key as usize].swap(seq, Ordering::Relaxed);
+                if seq != 0 && seq <= prev {
+                    inv.fetch_add(1, Ordering::Relaxed);
+                }
+                p.fetch_add(1, Ordering::Relaxed);
+            }),
+            |_poison, _panic_info| {},
+        ).unwrap();
+        mem::forget(pool); // stuck worker: joining would hang
+
+        // Poison key 0 plus a tail behind it, all queued before the worker
+        // claims: the worker takes the poison alone (batch_size = 1) and
+        // tail stays in the frozen shard's ring - it must not be stolen, lost, or reordered.
+        tx.try_send(&keys[0], (0, u64::MAX)).unwrap();
+        for seq in 1..=5u64 {
+            tx.try_send(&keys[0], (0, seq)).unwrap();
+        }
+        thread::sleep(Duration::from_millis(30));
+        // Load on the three healthy keys.
+        let mut sent = 0u64;
+        for seq in 1..=50u64 {
+            for key in 1..4u64 {
+                if tx.try_send(&keys[key as usize], (key, seq)).is_ok() {
+                    sent += 1;
+                }
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while processed.load(Ordering::Relaxed) < sent {
+            assert!(
+                Instant::now() < deadline,
+                "stall takeover never rescued the healthy shards: {}/{}",
+                processed.load(Ordering::Relaxed),
+                sent
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(inversions.load(Ordering::Relaxed), 0, "per-key FIFO broke");
+        // The stuck shard stays frozen: nothing behind the poison leaks out.
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            processed.load(Ordering::Relaxed),
+            sent,
+            "items behind the poison escaped the frozen shard out of order"
+        );
+        mem::forget(tx);
+    }
+
+    /// default stays strict ownership: per-shard FIFO is never traded silently,
+    /// so without an explicit stall budget the freeze from forever blocking handler is the documented behavior.
+    #[cfg(not(miri))]
+    #[test]
+    fn no_takeover_by_default_strict_ownership_holds() {
+        let (tx, rx) = round_robin::<u64, 64>(4);
+        let cfg = instance::Config::new(1, 4).sample_interval(Duration::from_millis(1));
+        let processed = Arc::new(AtomicU64::new(0));
+        let p = processed.clone();
+        let pool = sync_pool_slot(
+            cfg,
+            rx.into_receivers(),
+            handler::PerItem(move |v: &u64| {
+                if *v == u64::MAX {
+                    loop {
+                        thread::sleep(Duration::from_secs(3600));
+                    }
+                }
+                p.fetch_add(1, Ordering::Relaxed);
+            }),
+            |_poison, _panic_info| {},
+        ).unwrap();
+        mem::forget(pool); // stuck worker: joining would hang
+        tx.try_send(u64::MAX).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        for i in 0..50u64 {
+            let _ = tx.try_send(i);
+        }
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            processed.load(Ordering::Relaxed),
+            0,
+            "no stall budget configured: ownership must stay strict"
+        );
+        mem::forget(tx);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
     fn lazy_spawn_starts_at_min_and_grows_under_load() {
         let (tx, rx) = round_robin::<u64, CAP>(4);
         let cfg = instance::Config::new(1, 4).sample_interval(Duration::from_millis(1));
@@ -1086,7 +1258,7 @@ mod tests {
                 std::thread::sleep(Duration::from_micros(500));
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
         assert_eq!(
             pool.worker_handles(),
             2,
@@ -1124,7 +1296,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_micros(500)).await;
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
         assert_eq!(
             pool.worker_handles(),
             2,
@@ -1154,12 +1326,14 @@ mod panic_safety_tests {
     use super::*;
     use crate::channel::mpmc::{ShardGroupCase, round_robin, shard_group, shard_key};
     use std::{
+        collections::HashSet,
         panic,
         sync::{
             Arc, Mutex,
             atomic::{AtomicU8, AtomicU64, Ordering},
         },
         thread,
+        time,
     };
 
     const CAP: usize = 64;
@@ -1272,7 +1446,7 @@ mod panic_safety_tests {
             move |poison: u64, _panic_info| {
                 td.dead_lettered(poison);
             },
-        );
+        ).unwrap();
         let producer = std::thread::spawn(move || {
             for i in 1..=N {
                 tx.send(i).unwrap();
@@ -1302,7 +1476,7 @@ mod panic_safety_tests {
                 c.fetch_add(1, Ordering::Relaxed);
             }),
             |_poison: u64, _panic_info| panic!("sink is broken too"),
-        );
+        ).unwrap();
         let producer = std::thread::spawn(move || {
             for i in 1..=N {
                 tx.send(i).unwrap();
@@ -1341,7 +1515,7 @@ mod panic_safety_tests {
                 move |poison: u64, _panic_info| {
                     td.dead_lettered(poison);
                 },
-            );
+            ).unwrap();
             let sender = tokio::task::spawn(async move {
                 for i in 1..=N {
                     tx.send_async(i).await.unwrap();
@@ -1375,7 +1549,7 @@ mod panic_safety_tests {
             move |poison: u64, _panic_info| {
                 td.dead_lettered(poison);
             },
-        );
+        ).unwrap();
         const KEYS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
         let producer = std::thread::spawn(move || {
             for i in 1..=N {
@@ -1415,7 +1589,7 @@ mod panic_safety_tests {
                 move |poison: u64, _panic_info| {
                     td.dead_lettered(poison);
                 },
-            );
+            ).unwrap();
             const KEYS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
             let sender = tokio::task::spawn(async move {
                 for i in 1..=N {
@@ -1453,7 +1627,7 @@ mod panic_safety_tests {
             move |poison: u64, _panic_info| {
                 td.dead_lettered(poison);
             },
-        );
+        ).unwrap();
         const SYMS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
         let handles: Vec<_> = SYMS.iter().map(|s| tx.handle(s).unwrap()).collect();
         let producer = std::thread::spawn(move || {
@@ -1495,7 +1669,7 @@ mod panic_safety_tests {
                 move |poison: u64, _panic_info| {
                     td.dead_lettered(poison);
                 },
-            );
+            ).unwrap();
             const SYMS: [&str; 4] = ["AAA", "BBB", "CCC", "DDD"];
             let handles: Vec<_> = SYMS.iter().map(|s| tx.handle(s).unwrap()).collect();
             let sender = tokio::task::spawn(async move {
@@ -1547,7 +1721,7 @@ mod panic_safety_tests {
                 move |_poison: u64, _p| {
                     d.fetch_add(1, Ordering::Relaxed);
                 },
-            );
+            ).unwrap();
             for i in 1..=N {
                 while tx.try_send(i).is_err() {
                     tokio::task::yield_now().await;
@@ -1654,7 +1828,7 @@ mod panic_safety_tests {
                     }
                     d.lock().unwrap().push(poison);
                 },
-            );
+            ).unwrap();
             // let the worker take the batch and park inside the first handler.
             tokio::time::sleep(Duration::from_millis(100)).await;
         });
@@ -1697,7 +1871,7 @@ mod panic_safety_tests {
                     c.fetch_add(1, Ordering::Relaxed);
                 }),
                 |_poison, _panic_info| {},
-            );
+            ).unwrap();
             for i in 0..600u64 {
                 std_tx.send(i).unwrap();
             }
@@ -1709,5 +1883,130 @@ mod panic_safety_tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("pool wedged: unserviced shards or a zero batch_size");
         assert_eq!(processed, 600, "loss on a repaired config");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn idle_workers_are_never_marked_stalled() {
+        let (tx, rx) = shard_key::<(u64, u64), 64>(4);
+        let mut keys: Vec<Option<String>> = vec![None; 4];
+        let mut i = 0u32;
+        while keys.iter().any(|k| k.is_none()) {
+            let k = format!("k{i}");
+            i += 1;
+            let s = tx.shard_for(&k);
+            if keys[s].is_none() {
+                keys[s] = Some(k);
+            }
+        }
+        let keys: Vec<String> = keys.into_iter().map(Option::unwrap).collect();
+
+        let cfg = instance::Config::new(4, 4)
+            .sample_interval(Duration::from_millis(1))
+            .stall_takeover(Duration::from_millis(20));
+        let threads: Arc<Mutex<HashSet<std::thread::ThreadId>>> =
+            Arc::new(Mutex::new(HashSet::new()));
+        let done = Arc::new(AtomicU64::new(0));
+        let (t, d) = (threads.clone(), done.clone());
+        let pool = sync_pool_slot(
+            cfg,
+            rx.into_receivers(),
+            handler::PerItem(move |_v: &(u64, u64)| {
+                thread::sleep(Duration::from_millis(1));
+                t.lock().unwrap().insert(thread::current().id());
+                d.fetch_add(1, Ordering::Relaxed);
+            }),
+            |_poison, _panic_info| {},
+        ).unwrap();
+        for seq in 0..40u64 {
+            let _ = tx.try_send(&keys[0], (0, seq));
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Burst over every key: with the latch only the trickle worker would
+        // still be fed, and the whole burst would run on one thread.
+        threads.lock().unwrap().clear();
+        let before = done.load(Ordering::Relaxed);
+        for seq in 0..50u64 {
+            for key in 0..4u64 {
+                while tx.try_send(&keys[key as usize], (key, seq + 100)).is_err() {
+                    thread::yield_now();
+                }
+            }
+        }
+        let deadline = time::Instant::now() + Duration::from_secs(10);
+        while done.load(Ordering::Relaxed) < before + 200 {
+            assert!(time::Instant::now() < deadline, "burst never drained");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            threads.lock().unwrap().len() >= 2,
+            "idle workers were latched as stalled: the burst ran on one thread"
+        );
+        drop(tx);
+        pool.wait_stopping();
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn autodrain_completes_despite_a_stuck_worker() {
+        let (tx, rx) = shard_key::<(u64, u64), 64>(2);
+        let mut keys: Vec<Option<String>> = vec![None; 2];
+        let mut i = 0u32;
+        while keys.iter().any(|k| k.is_none()) {
+            let k = format!("k{i}");
+            i += 1;
+            let s = tx.shard_for(&k);
+            if keys[s].is_none() {
+                keys[s] = Some(k);
+            }
+        }
+        let keys: Vec<String> = keys.into_iter().map(Option::unwrap).collect();
+        let cfg = instance::Config::new(1, 2)
+            .sample_interval(Duration::from_millis(1))
+            .stall_takeover(Duration::from_millis(20));
+        let processed = Arc::new(AtomicU64::new(0));
+        let p = processed.clone();
+        let pool = sync_pool_slot(
+            cfg,
+            rx.into_receivers(),
+            handler::PerItem(move |&(_, seq): &(u64, u64)| {
+                if seq == u64::MAX {
+                    loop {
+                        thread::sleep(Duration::from_secs(3600));
+                    }
+                }
+                p.fetch_add(1, Ordering::Relaxed);
+            }),
+            |_poison, _panic_info| {},
+        ).unwrap();
+        // Poison is shard 0's only item: once taken, the shard is empty,
+        // so the takeover may steal it and observe the disconnect.
+        tx.try_send(&keys[0], (0, u64::MAX)).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        for seq in 1..=20u64 {
+            tx.try_send(&keys[1], (1, seq)).unwrap();
+        }
+        drop(tx); // all senders gone -> every drained shard can close
+        let deadline = time::Instant::now() + Duration::from_secs(5);
+        let mut drained = false;
+        while std::time::Instant::now() < deadline {
+            if pool.is_stopped() {
+                drained = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let got = processed.load(Ordering::Relaxed);
+        // The shutdown path that can never hang - taken vefore any assert,
+        // so a failure unwinds past an already detached pool instead of join hanging on the stuck worker in Drop.
+        let t0 = time::Instant::now();
+        pool.stop_and_detach();
+        assert!(t0.elapsed() < Duration::from_secs(1), "stop_and_detach must not join");
+        assert!(
+            drained,
+            "autodrain never completed: the stuck owner's empty shard was not closed \
+             (processed {got})"
+        );
+        assert_eq!(got, 20);
     }
 }

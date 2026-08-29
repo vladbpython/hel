@@ -9,11 +9,11 @@ use shim::loom::{AtomicBool, AtomicUsize, Ordering};
 use std::hint;
 #[cfg(not(loom))]
 use std::time;
-use std::{mem::MaybeUninit, ptr::addr_of_mut, sync::Arc, thread};
+use std::{mem::MaybeUninit,panic, ptr::addr_of_mut, sync::Arc, thread};
 
-/// Waiting phases push_fetch_add (escalation spin → yield → sleep)
+/// Waiting phases push_fetch_add (escalation spin -> yield -> sleep)
 /// Spin budget ≈ cost of the yield stage (~0.5 µs): 64 × ~20 ns ≈ 1.3 µs.
-/// Covers the “CAS head → seq.store” window of the consumer (instruction units)
+/// Covers the “CAS head -> seq.store” window of the consumer (instruction units)
 /// and pop happening right now.
 pub const SENDER_SPIN_COUNT: u32 = 64;
 /// The Yield phase covers a short plug (~tens-hundreds of µs polite
@@ -104,7 +104,7 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
             addr_of_mut!((*ptr).receivers).write(AtomicUsize::new(1));
             addr_of_mut!((*ptr).tx_closed).write(AtomicBool::new(false));
             addr_of_mut!((*ptr).rx_closed).write(AtomicBool::new(false));
-            // everything is initialized → assume_init
+            // everything is initialized -> assume_init
             uninit.assume_init()
         }
     }
@@ -164,14 +164,14 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
                 //its label p_old+1 and will be dropped correctly.
                 return Err(value);
             }
-            //Escalate: spin(hotpath, wait=ns) → yield
-            //(short silence) → sleep (long silence of the consumer:
+            //Escalate: spin(hotpath, wait=ns) -> yield
+            //(short silence) -> sleep (long silence of the consumer:
             //do not burn the core, which it itself needs otherwise everything will
             //blocked producers eat up the CPU of the one they are waiting for).
             //Park is not possible: notify_senders wakes up ONE arbitrary
             //waiting, and we are waiting for our specific position woke up
             //if it weren't for the owner, the owner would continue to sleep.
-            waits += 1;
+            waits = waits.saturating_add(1);
             #[cfg(loom)]
             {
                 let _ = waits;
@@ -231,6 +231,8 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
 }
 
 impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, CAP> {
+    const MULTI_CONSUMER: bool = true;
+    
     #[inline]
     fn push(&self, v: T) -> Result<(), T> {
         self.push_inner(v)
@@ -253,7 +255,7 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
         let (pos, k) = loop {
             let head = self.head.load(Ordering::Acquire);
             // The tail snapshot could have gone bad: another producer moved tail,
-            // the consumer sent head FOR our snapshot → used "negative"
+            // the consumer sent head FOR our snapshot -> used "negative"
             // (wrap in huge usize). Without guard CAP used panics in debug
             // (caught by Miri) and gives garbage free in release. Let's re-read it.
             let dist = tail.wrapping_sub(head) as isize;
@@ -287,7 +289,7 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
                     // buf is not touched. Without seal (see push_fetch_add).
                     return 0;
                 }
-                // Window “CAS head → seq.store” for the consumer. yield_now, as in
+                // Window “CAS head -> seq.store” for the consumer. yield_now, as in
                 // push_fetch_add: gives the scheduler (and Miri) a switch point;
                 // pure spin_loop here livelock under Miri with preemption rate=0.
                 shim::loom::yield_now();
@@ -395,8 +397,11 @@ impl<T, const CAP: usize> Drop for SeqInner<T, CAP> {
             let pos = head.wrapping_add(n);
             let slot = &self.slots[pos & mask];
             if slot.sequence.load(Ordering::Relaxed) == pos.wrapping_add(1) {
-                slot.data.with_mut(|p| unsafe { (*p).assume_init_drop() });
+                let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    slot.data.with_mut(|p| unsafe { (*p).assume_init_drop() });
+                }));
             }
+            
         }
     }
 }
@@ -448,9 +453,9 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
         let tail = self.tail.load(Ordering::Relaxed);
         let slot = &self.slots[tail & mask];
         if slot.sequence.load(Ordering::Acquire) == tail {
+            self.tail.store(tail.wrapping_add(1), Ordering::Relaxed);
             slot.data.with_mut(|p| unsafe { (*p).write(v) });
             slot.sequence.store(tail.wrapping_add(1), Ordering::Release);
-            self.tail.store(tail.wrapping_add(1), Ordering::Relaxed);
             Ok(())
         } else {
             Err(v)
@@ -509,13 +514,13 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
                 shim::loom::yield_now();
             }
         }
+        self.tail.store(pos.wrapping_add(k), Ordering::Relaxed);
         for (i, value) in buf.drain(..k).enumerate() {
             let p = pos.wrapping_add(i);
             let slot = &self.slots[p & mask];
             slot.data.with_mut(|p| unsafe { (*p).write(value) });
             slot.sequence.store(p.wrapping_add(1), Ordering::Release);
         }
-        self.tail.store(pos.wrapping_add(k), Ordering::Relaxed);
         k
     }
 
@@ -569,7 +574,7 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
     pub fn queued(&self) -> usize {
         let head = self.head.load(Ordering::Acquire);
         let tail = self.tail.load(Ordering::Acquire);
-        tail.wrapping_sub(head)
+        tail.wrapping_sub(head).min(CAP)
     }
 }
 
@@ -680,9 +685,12 @@ impl<T, const CAP: usize> Drop for SingleInner<T, CAP> {
         for n in 0..count {
             let pos = head.wrapping_add(n);
             let slot = &self.slots[pos & mask];
-            if slot.sequence.load(Ordering::Relaxed) == pos.wrapping_add(1) {
-                slot.data.with_mut(|p| unsafe { (*p).assume_init_drop() });
+            if slot.sequence.load(Ordering::Relaxed) == pos.wrapping_add(1){
+                let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    slot.data.with_mut(|p| unsafe { (*p).assume_init_drop() });
+                }));
             }
+            
         }
     }
 }
@@ -694,7 +702,11 @@ unsafe impl<T: Send, const CAP: usize> Sync for SingleInner<T, CAP> {}
 mod core_init_tests {
     use super::*;
     use std::{
-        sync::atomic::Ordering,
+        panic,
+        sync::{
+            atomic::{AtomicU32,Ordering},
+            Once,
+        },
         time::{Duration, Instant},
     };
 
@@ -741,7 +753,7 @@ mod core_init_tests {
         let _ = inner.push("hello".to_string());
         let _ = inner.push("world".to_string());
         assert_eq!(inner.pop(), Some("hello".to_string()));
-        // "world" remains → Drop must drop, otherwise Miri: leak
+        // "world" remains -> Drop must drop, otherwise Miri: leak
         drop(inner);
     }
 
@@ -803,7 +815,7 @@ mod core_init_tests {
         let inner: Arc<SingleInner<u64, 2>> = SingleInner::new();
         assert!(inner.push(1).is_ok());
         assert!(inner.push(2).is_ok());
-        // channel is full (CAP=2) → push will return Err
+        // channel is full (CAP=2) -> push will return Err
         assert_eq!(inner.push(3), Err(3));
         // release and push again
         assert_eq!(inner.pop(), Some(1));
@@ -816,7 +828,7 @@ mod core_init_tests {
         let inner: Arc<SingleInner<String, 8>> = SingleInner::new();
         let _ = inner.push("hello".to_string());
         let _ = inner.push("world".to_string());
-        // pop one, the second REMAINS in the channel → Drop should drop it
+        // pop one, the second REMAINS in the channel -> Drop should drop it
         assert_eq!(inner.pop(), Some("hello".to_string()));
         drop(inner); // Miri: "world" (unread) dropped? Otherwise leaked
     }
@@ -1027,6 +1039,95 @@ mod core_init_tests {
             inner.pop().unwrap();
         }
         assert_eq!(inner.queued(), 0);
+    }
+
+    #[test]
+    fn drop_skips_sealed_and_reserved_slots() {
+        use std::sync::atomic::AtomicU32;
+
+        struct Counted(#[allow(dead_code)] u64, Arc<AtomicU32>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicU32::new(0));
+        let inner: Arc<SeqInner<Counted, 4>> = SeqInner::new();
+        for i in 0..4 {
+            assert!(inner.push(Counted(i, drops.clone())).is_ok());
+        }
+        let t = {
+            let inner = inner.clone();
+            let drops = drops.clone();
+            std::thread::spawn(move || inner.push_fetch_add(Counted(99, drops)))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        inner.rx_close();
+        inner.notify_senders();
+        let r = t.join().unwrap();
+        assert!(r.is_err(), "sealed abort must return the value");
+        drop(r); // +1 drop: the returned value
+
+        drop(inner); // ring reclaim: exactly the 4 recorded slots
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            5,
+            "sealed/reserved slot was dropped (UB) or a recorded one leaked"
+        );
+    }
+
+    #[test]
+    fn panic_item_drop_does_not_leak_the_rest() {
+        struct Boom(u32, Arc<AtomicU32>);
+        impl Drop for Boom {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                if self.0 == 2 {
+                    panic!("boom in ring drop");
+                }
+            }
+        }
+
+        {
+            static ONCE: Once = Once::new();
+            ONCE.call_once(|| {
+                let prev = panic::take_hook();
+                panic::set_hook(Box::new(move |info| {
+                    let injected = info
+                        .payload()
+                        .downcast_ref::<&str>()
+                        .is_some_and(|s| *s == "boom in ring drop");
+                    if !injected {
+                        prev(info);
+                    }
+                }));
+            });
+        }
+
+        let drops = Arc::new(AtomicU32::new(0));
+        let seq: Arc<SeqInner<Boom, 8>> = SeqInner::new();
+        for i in 0..5 {
+            assert!(seq.push(Boom(i, drops.clone())).is_ok());
+        }
+        drop(seq);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            5,
+            "SeqInner leaked items behind a panicking Drop"
+        );
+
+        drops.store(0, Ordering::SeqCst);
+        let single: Arc<SingleInner<Boom, 8>> = SingleInner::new();
+        for i in 0..5 {
+            assert!(single.push(Boom(i, drops.clone())).is_ok());
+        }
+        drop(single);
+        assert_eq!(
+            drops.load(Ordering::SeqCst),
+            5,
+            "SingleInner leaked items behind a panicking Drop"
+        );
     }
 }
 

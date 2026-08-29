@@ -58,9 +58,9 @@ where
             // The returned Vec is the REUSED ALLOCATION, not a retry channel:
             // items left in it would be re-fed to the sink next round together
             // with fresh ones, i.e. processed twice.
-            debug_assert!(
+            assert!(
                 buf.is_empty(),
-                "drain_batch_sink: the sink must return an EMPTY vec (allocation reuse only)"
+                "drain_batch_sink: the sink must return an empty vec (allocation reuse only)"
             );
         }
         if dc {
@@ -154,6 +154,10 @@ where
             let (empty, a) = sink(b, acc).await; //whole batch + acc \u2192 sink, (empty Vec, acc) back
             buf = empty;
             acc = a;
+            assert!(
+                buf.is_empty(),
+                "drain_batch_async_sink: the sink must return an empty vec (allocation reuse only)"
+            );
         } else {
             buf = b;
         }
@@ -414,5 +418,30 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("drain_batch(0, ..) spun forever");
         assert_eq!(got, 5, "zero max lost elements or changed semantics");
+    }
+
+    #[cfg(not(miri))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "empty vec")]
+    async fn async_sink_keeping_items_trips_the_contract() {
+        let ch = shard_spsc::<u64, 256>(1);
+        let (mut tx, rx) = ch.into_wrapped_pairs().next().unwrap();
+        for i in 0..4u64 {
+            tx.try_send(i).unwrap();
+        }
+        drop(tx);
+        let _ = drain_batch_async_sink(
+            rx,
+            2,
+            |mut rx, mut buf, max| async move {
+                let (n, dc) = rx.recv_batch_async(&mut buf, max).await;
+                (rx, buf, n, dc)
+            },
+            |batch: Vec<u64>, acc: u64| async move {
+                (batch, acc) // not cleared: "give them back"
+            },
+            0u64,
+        )
+        .await;
     }
 }

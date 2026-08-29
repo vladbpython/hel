@@ -111,7 +111,7 @@ impl<'a, T> RestoreGroups<'a, T> {
     /// Move up to max items from the head of `shard` into the staging buffer and hand it to `try_send_batch`.
     /// Must be followed by `bulk_return`, with no await in between.
     pub fn bulk_stage(&mut self, shard: usize, max: usize) -> &mut Vec<T> {
-        debug_assert!(self.scratch.is_empty(), "staging buffer was not returned");
+        assert!(self.scratch.is_empty(), "staging buffer was not returned");
         let take = max.min(self.groups[shard].len());
         self.scratch.extend(self.groups[shard].drain(..take));
         self.scratch_shard = shard;
@@ -131,7 +131,7 @@ impl<'a, T> RestoreGroups<'a, T> {
     // The item never leaves the guard, so cancellation at the `.await` cannot swallow it.
     // O(1).
     pub fn take_head(&mut self, shard: usize) -> &mut Option<T> {
-        debug_assert!(self.pending.is_none(), "pending slot must be free");
+        assert!(self.pending.is_none(), "pending slot must be free");
         self.pending = Some(self.groups[shard].pop_front().expect("group is empty"));
         self.pending_shard = shard;
         &mut self.pending

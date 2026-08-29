@@ -107,7 +107,7 @@ impl SyncRawList {
     }
     fn push_back(&mut self, node: *mut SyncNode) {
         unsafe {
-            debug_assert!(!(*node).is_in_list());
+            assert!(!(*node).is_in_list());
             (*node).next = null_mut();
             (*node).prev = self.tail;
             if self.tail.is_null() {
@@ -232,9 +232,10 @@ impl SyncList {
         let slot = AsyncSlot::new(waker);
         let for_queue = Arc::clone(&slot);
         {
-            self.async_waiters.lock_().push_back(for_queue);
+            let mut q = self.async_waiters.lock_();
+            q.push_back(for_queue);
+            self.async_count.fetch_add(1, Ordering::SeqCst);
         }
-        self.async_count.fetch_add(1, Ordering::SeqCst);
         slot
     }
 
@@ -488,6 +489,29 @@ mod loom_tests {
                 "async_count drifted from real queue length after racing cancels"
             );
             assert!(qlen <= 2, "queue grew beyond the slots ever pushed");
+        });
+    }
+
+    #[test]
+    fn reregister_racing_notify_never_loses_the_wakeup() {
+        loom::model(|| {
+            let list = StdArc::new(SyncList::new());
+            let (w_old, waker_old) = counting();
+            let (w_new, waker_new) = counting();
+            let slot = list.push_async_slot(waker_old);
+
+            let s = StdArc::clone(&slot);
+            let t = loom::thread::spawn(move || {
+                s.waker.register(&waker_new); // the re-poll path
+            });
+
+            list.notify_one(); // pop_async -> waker.take()
+            t.join().unwrap();
+
+            assert!(
+                w_old.0.load(O::Relaxed) + w_new.0.load(O::Relaxed) >= 1,
+                "wakeup lost in the register/take race"
+            );
         });
     }
 }

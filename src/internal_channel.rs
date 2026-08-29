@@ -34,6 +34,9 @@ pub fn scsp_bounded<T: Send, const CAP: usize>() -> (
 /// [`shard_power_of_two`].
 #[inline]
 pub const fn nearest_power_of_two(n: usize) -> usize {
+    if n > 1usize << (usize::BITS - 1) {
+        return 1usize << (usize::BITS - 1);
+    }
     let p = n.next_power_of_two();
     if p < 2 { 2 } else { p }
 }
@@ -43,6 +46,9 @@ pub const fn nearest_power_of_two(n: usize) -> usize {
 pub const fn shard_power_of_two(n: usize) -> usize {
     if n == 0 {
         return 1;
+    }
+    if n > 1usize << (usize::BITS - 1) {
+        return 1usize << (usize::BITS - 1);
     }
     n.next_power_of_two()
 }

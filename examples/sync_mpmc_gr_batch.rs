@@ -52,7 +52,7 @@ fn main() {
         .map(|&sym| {
             let tx = tx.clone();
             thread::spawn(move || {
-                debug_assert!(tx.shard_for(sym).is_some(), "symbol must be registered");
+                assert!(tx.shard_for(sym).is_some(), "symbol must be registered");
 
                 let mut buf: Vec<Tick> = Vec::with_capacity(BATCH);
                 for i in 0..100_000u64 {

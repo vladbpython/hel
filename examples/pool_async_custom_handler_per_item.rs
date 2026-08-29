@@ -114,7 +114,7 @@ fn main() {
                 eprintln!("dead letter: id={} panic_info={panic_info:?}", poison.id);
                 dl_shared.failed.lock().unwrap().push(poison);
             },
-        );
+        ).unwrap();
 
         const TOTAL: u64 = 10_000;
         let producers: Vec<_> = (0..4)

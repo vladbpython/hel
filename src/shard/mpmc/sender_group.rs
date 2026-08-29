@@ -367,7 +367,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let deadline = deadline_after(d);
+        let deadline = Some(deadline_after(d));
         let (groups, mut unused) = self.group_by_route(buf, &key_fn);
         let mut total = 0usize;
         let mut groups = groups.into_iter().enumerate();

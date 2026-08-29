@@ -66,7 +66,7 @@ fn main() {
                 }
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         //  PRODUCERS: biased select! - cancel stops sending immediately.
         //  What has already been sent (i increments) is NOT lost. tx clone is dropped at the end of each task.

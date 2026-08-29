@@ -1,7 +1,7 @@
 #![cfg(feature = "pool")]
 use hel::{
     channel::mpmc::round_robin,
-    pool::{handler::PerItem, instance::Config, sync_pool_slot},
+    pool::{errors,handler::PerItem, instance::Config, sync_pool_slot},
 };
 use std::{
     panic,
@@ -25,7 +25,7 @@ fn dropping_the_pool_handle_must_stop_workers() {
             c.fetch_add(1, Ordering::Relaxed);
         }),
         |_p: u64, _r| {},
-    );
+    ).unwrap();
     drop(pool);
     assert!(tx.try_send(7).is_err(), "receivers must be gone after drop");
     std::thread::sleep(Duration::from_millis(100));
@@ -37,14 +37,18 @@ fn dropping_the_pool_handle_must_stop_workers() {
 }
 
 #[test]
-#[should_panic(expected = "at least one shard receiver")]
 fn azero_shards_is_rejected_loudly() {
-    let _ = sync_pool_slot(
+    let err = sync_pool_slot(
         Config::new(1, 1),
         Vec::<hel::channel::Receiver<u64, 8>>::new(),
         PerItem(|_v: &u64| {}),
         |_p: u64, _r| {},
-    );
+    ).err();
+    assert!(err.is_some(),"UB");
+    if let Some(err) = err  {
+       assert_eq!(err, errors::PoolError::ReceiverEmpty, "wrong error")  
+    } else {
+    }
 }
 
 #[test]
@@ -86,7 +90,7 @@ fn panic_item_drop_does_not_kill_the_worker() {
                 c.fetch_add(1, Ordering::Relaxed);
             }),
             |_p: Boom, _r| {},
-        );
+        ).unwrap();
         for i in 0..20u64 {
             tx.send(Boom(i)).unwrap();
         }
@@ -108,7 +112,7 @@ fn worker_count_is_capped_by_shard_count() {
         rx.into_receivers(),
         PerItem(|_v: &u64| {}),
         |_p: u64, _r| {},
-    );
+    ).unwrap();
     assert!(
         pool.active() <= 2,
         "workers must never exceed the shard count"

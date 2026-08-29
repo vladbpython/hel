@@ -14,6 +14,14 @@ pub(crate) fn lock_workers<H>(m: &Mutex<Vec<H>>) -> MutexGuard<'_, Vec<H>> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Handle to a running sync pool.
+/// Dropping the handle stops the pool and join worker threads, 
+/// so `drop(pool)` blocks until every worker exits its loop - wedged handler  wedges the drop with it. 
+/// Batch already in flight is always finished (zero loss), batch: up to `batch_size` handler calls per worker.
+/// so the drop waits at least the remainder of the current.
+/// Use
+/// [`Self::wait_stopping`] or [`Self::stop_and_wait`] when you want that wait to be explicit,
+/// and beware of handlers that block on something the dropping thread itself must release - that is a deadlock.
 pub struct SyncPool {
     state: Arc<State>,
     workers: WorkerHandles<JoinHandle<()>>,
@@ -60,6 +68,20 @@ impl SyncPool {
         }
     }
 
+    pub fn is_stopped(&self) -> bool {
+        self.state.is_stopped()
+    }
+
+    /// Stop without joining: sets the stop flag and abandons the handles.
+    /// Live workers exit within one idle cycle on their own; a worker stuck forever inside a handler stays stuck,
+    /// its thread abandoned to the OS - exactly what tokio's `shutdown_timeout(0)` does with blocking tasks.
+    /// This is the shutdown path that can never hang;
+    /// prefer [`Self::stop_and_wait`] when the handlers are known to terminate.
+    pub fn stop_and_detach(self) {
+        self.state.stop();
+        lock_workers(&self.workers).clear();
+    }
+
     pub fn wait_stopping(self) {
         self.join_all();
     }
@@ -93,6 +115,11 @@ impl Drop for SyncPool {
     }
 }
 
+/// Handle to a running async pool.
+/// Dropping the handle only sets the stop flag and gives no synchronous guarantee (`Drop` cannot `.await`):
+/// task notices the flag between items and idle cycles, but a handler already inside `handler.handle(..).await` runs to completion,
+/// holding the receivers alive until its task exits — an item sent right after `drop(pool)` may still be processed.
+/// join use [`Self::wait_stopping`] or [`Self::stop_and_wait`].
 pub struct AsyncPool<AR: AsyncRuntime> {
     state: Arc<State>,
     workers: WorkerHandles<AR::JoinHandle>,
@@ -142,6 +169,17 @@ impl<AR: AsyncRuntime> AsyncPool<AR> {
         }
     }
 
+    pub fn is_stopped(&self) -> bool {
+        self.state.is_stopped()
+    }
+
+    /// Stop without awaiting: sets the stop flag and abandons the handles (dropping a runtime's JoinHandle detaches the task).
+    /// Path that  can never hang; prefer [`Self::stop_and_wait`] when the handlers are known to terminate.
+    pub fn stop_and_detach(self) {
+        self.state.stop();
+        lock_workers(&self.workers).clear();
+    }
+
     pub async fn wait_stopping(self) {
         self.join_all().await;
     }
@@ -153,10 +191,10 @@ impl<AR: AsyncRuntime> AsyncPool<AR> {
     }
 }
 
-/// RAII: dropping the handle must stop the workers.
-/// Drop cannot `.await`, so no join here, stop flag alone is enough:
-/// every worker task re-checks it after each pass and each idle sleep, sees it and returns, releasing the receivers.
-/// Without this plain `drop(pool)` left the tasks running forever with no way to reach them.
+/// RAII: dropping the handle must stop the workers. Drop cannot `.await`, 
+/// so no join here and only the stop flag. A worker rechecks it between items and idle sleeps,
+/// but a handler already in flight finishes first, so this is a signal, not a synchronous guarantee.
+/// Without this a plain `drop(pool)` left the tasks running forever with no way to reach them.
 impl<AR: AsyncRuntime> Drop for AsyncPool<AR> {
     fn drop(&mut self) {
         self.state.stop();

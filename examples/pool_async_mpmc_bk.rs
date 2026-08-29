@@ -63,7 +63,7 @@ fn main() {
                 }
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         let producers: Vec<_> = (0..4)
             .map(|p| {

@@ -120,7 +120,7 @@ pub fn recv_batch<T, const CAP: usize>(
     deadline: Option<Instant>,
 ) -> (usize, bool) {
     if max == 0 {
-        return (0, false);
+        return (0, inner.is_tx_closed() && inner.is_empty());
     }
     match recv_impl(inner, deadline) {
         Ok(v) => buf.push(v),
@@ -317,13 +317,21 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
     }
 
     pub fn recv_timeout(&self, d: Duration) -> Result<T, RecvError> {
-        recv_impl(self.inner.as_ref(), deadline_after(d))
+        let start = Instant::now();
+        recv_impl
+        (
+            self.inner.as_ref(), 
+            Some(deadline_after(d))
+        ).map_err(|e| match e {
+            RecvError::TimeOut(_) => RecvError::TimeOut(start.elapsed()),
+            other => other
+        })  
     }
 
     #[inline]
     pub fn try_recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         if max == 0 {
-            return (0, false);
+            return (0, self.inner.is_tx_closed() && self.inner.is_empty());
         }
         let (n, dc) = self.inner.pop_batch(buf, max);
         if n > 0 {
@@ -334,12 +342,16 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
         }
     }
 
+    /// Deadline too large for an `Instant` (e.g. `Duration::MAX`) is clamped to the farthest representable point - centuries away,
+    /// so effectively unbounded, but the call still returns `TimeOut` eventually instead of hanging forever.
+    /// Deadline bounds only the wait for the first element, once something arrived, the rest of the batch is collected without
+    /// blocking (latency first). The send-side twin `send_batch_timeout` bounds the whole batch instead - the pair is asymmetric on purpose.
     pub fn recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         recv_batch(self.inner.as_ref(), buf, max, None)
     }
 
     pub fn recv_batch_timeout(&self, buf: &mut Vec<T>, max: usize, d: Duration) -> (usize, bool) {
-        recv_batch(self.inner.as_ref(), buf, max, deadline_after(d))
+        recv_batch(self.inner.as_ref(), buf, max, Some(deadline_after(d)))
     }
 
     pub fn recv_async(&self) -> ReceiverFuture<'_, T, CAP, I> {
@@ -352,7 +364,7 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
 
     pub async fn recv_batch_async(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         if max == 0 {
-            return (0, false);
+            return (0, self.inner.is_tx_closed() && self.inner.is_empty());
         }
         match self.recv_async().await {
             Ok(v) => buf.push(v),
@@ -471,7 +483,7 @@ pub struct SingleReceiver<T, const CAP: usize> {
 pub type SingleRecvFuture<'a, T, const CAP: usize> =
     GenericRecvFuture<'a, T, CAP, SingleInner<T, CAP>>;
 
-pub type SignleRecvStream<'a, T, const CAP: usize> =
+pub type SingleRecvStream<'a, T, const CAP: usize> =
     GenericRecvStream<'a, T, CAP, SingleInner<T, CAP>>;
 
 impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
@@ -488,20 +500,47 @@ impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
     }
 
     pub fn recv_timeout(&mut self, d: Duration) -> Result<T, RecvError> {
-        recv_impl(self.inner.as_ref(), deadline_after(d))
+        let start = Instant::now();
+        recv_impl(self.inner.as_ref(), Some(deadline_after(d)))
+        .map_err(|e| match e {
+            RecvError::TimeOut(_) => RecvError::TimeOut(start.elapsed()),
+            other => other
+        })
+    }
+
+    /// Non blocking batch receive
+    pub fn try_recv_batch(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
+        if max == 0 {
+            // Still report disconnect (audit 2, N13).
+            return (0, self.inner.is_tx_closed() && self.inner.is_empty());
+        }
+        let (n, dc) = self.inner.pop_batch(buf, max);
+        if n > 0 {
+            crate::internal_channel::traits::InnerChannel::notify_senders_n(
+                self.inner.as_ref(),
+                n,
+            );
+            (n, false)
+        } else {
+            (0, dc)
+        }
     }
 
     pub fn recv_batch(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         recv_batch(self.inner.as_ref(), buf, max, None)
     }
-
+    
+    /// Deadline too large for an `Instant` (e.g. `Duration::MAX`) is clamped to the farthest representable point -centuries away
+    /// so effectively unbounded, but the call still returns `TimeOut` eventually instead of hanging forever.
+    /// Deadline bounds only the wait for the first element; the rest is collected without blocking.
+    /// See the MPMC for the rationale.
     pub fn recv_batch_timeout(
         &mut self,
         buf: &mut Vec<T>,
         max: usize,
         d: Duration,
     ) -> (usize, bool) {
-        recv_batch(self.inner.as_ref(), buf, max, deadline_after(d))
+        recv_batch(self.inner.as_ref(), buf, max, Some(deadline_after(d)))
     }
 
     pub fn recv_async(&mut self) -> SingleRecvFuture<'_, T, CAP> {
@@ -514,7 +553,7 @@ impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
 
     pub async fn recv_batch_async(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         if max == 0 {
-            return (0, false);
+            return (0, self.inner.is_tx_closed() && self.inner.is_empty());
         }
         match self.recv_async().await {
             Ok(v) => buf.push(v),
@@ -524,11 +563,29 @@ impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
         (1 + n, dc)
     }
 
+    /// Queue depth right now (approximate under concurrency).
+    #[inline]
+    pub fn queued(&self) -> usize {
+        self.inner.queued()
+    }
+
+    /// Whether the queue appears empty right now (approximate, see `queued`).
+    #[inline]
+    pub fn is_queued_empty(&self) -> bool {
+        self.queued() == 0
+    }
+
+    /// Fixed capacity of this ring.
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        CAP
+    }
+
     pub fn iter(&mut self) -> SingleIter<'_, T, CAP> {
         SingleIter { r: self }
     }
 
-    pub fn stream(&mut self) -> SignleRecvStream<'_, T, CAP> {
+    pub fn stream(&mut self) -> SingleRecvStream<'_, T, CAP> {
         GenericRecvStream {
             inner: &self.inner,
             slot: None,

@@ -62,7 +62,7 @@ fn main() {
                 }
             }),
             |_poison, _panic_info| {},
-        );
+        ).unwrap();
 
         let token = CancellationToken::new();
 

@@ -41,6 +41,7 @@ pub struct Config {
     /// Turns load aware placement on or off. When false the pool falls back to
     /// the plain shard % active mapping with no hotspot isolation.
     pub hotspot_isolation: bool,
+    pub stall_takeover: Option<Duration>,
 }
 
 impl Config {
@@ -57,6 +58,7 @@ impl Config {
             hotspot_fill: 0.80,
             rebalance_margin: 0.15,
             hotspot_isolation: true,
+            stall_takeover: None,
         }
     }
 
@@ -65,6 +67,9 @@ impl Config {
         self.min_consumers = self.min_consumers.clamp(1, self.max_consumers);
         self.batch_size = self.batch_size.max(1);
         self.sample_interval = self.sample_interval.max(Duration::from_millis(1));
+        if let Some(d) = self.stall_takeover {
+            self.stall_takeover = Some(d.max(self.sample_interval));
+        }
         self
     }
 
@@ -113,6 +118,11 @@ impl Config {
         self
     }
 
+    pub fn stall_takeover(mut self, d: Duration) -> Self {
+        self.stall_takeover = Some(d);
+        self
+    }
+
     #[inline]
     fn decide(&self, current: usize, fill: f64) -> usize {
         if fill > self.scale_up_fill {
@@ -144,6 +154,10 @@ pub struct State {
     closed: Vec<AtomicBool>,   // closed[shard] = shard empty AND senders dropped
     closed_count: AtomicUsize, // how many shards are closed
     handler_panics: AtomicU64, // panics caught in worker loops (cold path only)
+    beats: Vec<AtomicU64>,     // beats[worker] += 1 per completed item (stall detection)
+    stalled: Vec<AtomicBool>,  // stalled[worker]: over the stall budget, not placement capacity
+    busy: Vec<AtomicBool>, // busy[worker]: inside user code for one item (handler/dead_letter/drop)
+    cur_shard: Vec<AtomicUsize>, // cur_shard[worker]: shard whose batch sits in the worker's buffer
 }
 
 impl State {
@@ -165,6 +179,11 @@ impl State {
             closed: (0..shards).map(|_| AtomicBool::new(false)).collect(),
             closed_count: AtomicUsize::new(0),
             handler_panics: AtomicU64::new(0),
+            // One per potential worker: ids are capped by the shard count.
+            beats: (0..shards).map(|_| AtomicU64::new(0)).collect(),
+            stalled: (0..shards).map(|_| AtomicBool::new(false)).collect(),
+            busy: (0..shards).map(|_| AtomicBool::new(false)).collect(),
+            cur_shard: (0..shards).map(|_| AtomicUsize::new(NONE)).collect(),
         })
     }
 
@@ -209,6 +228,61 @@ impl State {
     #[inline]
     pub(crate) fn note_handler_panic(&self) -> u64 {
         self.handler_panics.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn beat(&self, id: usize) {
+        if let Some(b) = self.beats.get(id) {
+            b.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn beat_of(&self, id: usize) -> u64 {
+        self.beats.get(id).map_or(0, |b| b.load(Ordering::Relaxed))
+    }
+
+    /// Worker `id` is inside user code (handler, dead_letter, or the item's Drop) for one item.
+    /// Together with an unmoving beat this is the stall signal:
+    /// idle worker is `busy == false` and is never treated as stalled, and a slow worker clears the moment the item ends.
+    #[inline]
+    pub(crate) fn set_worker_busy(&self, id: usize, v: bool) {
+        if let Some(b) = self.busy.get(id) {
+            b.store(v, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn worker_busy(&self, id: usize) -> bool {
+        self.busy.get(id).is_some_and(|b| b.load(Ordering::Relaxed))
+    }
+
+    /// The shard whose batch currently sits in worker `id`'s buffer, or none.
+    /// The takeover must not steal it while it holds items:
+    /// worker's buffer only ever holds one shard's batch,
+    /// so every other shard is stealable with zero data in flight and zero order at risk.
+    #[inline]
+    pub(crate) fn set_current_shard(&self, id: usize, shard: usize) {
+        if let Some(s) = self.cur_shard.get(id) {
+            s.store(shard, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn current_shard(&self, id: usize) -> usize {
+        self.cur_shard.get(id).map_or(NONE, |s| s.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub(crate) fn set_worker_stalled(&self, id: usize, v: bool) {
+        if let Some(s) = self.stalled.get(id) {
+            s.store(v, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn worker_stalled(&self, id: usize) -> bool {
+        self.stalled.get(id).is_some_and(|s| s.load(Ordering::Relaxed))
     }
 
     #[inline]
@@ -287,7 +361,9 @@ pub(crate) fn claim_or_release_to(state: &State, id: usize, shard: usize, target
                 .is_ok();
         }
     } else if cur == id {
-        state.owner(shard).store(NONE, Ordering::Release);
+        let _ = state
+            .owner(shard)
+            .compare_exchange(id, NONE, Ordering::AcqRel, Ordering::Relaxed);
     }
     false
 }
@@ -341,15 +417,31 @@ fn rebalance(state: &State, loads: &[usize], active: usize, margin: usize) {
 
     let mut worker_load = vec![0usize; active];
     for &s in &order {
-        // Keep the current owner for stickiness. If it has been retired, fall
-        // back to the shard % active home.
+        // Keep the current owner for stickiness. If it has been retired or
+        // is STALLED (over the stall-takeover budget), fall back: a stalled
+        // worker must never be handed work it cannot pick up.
         let anchor = {
             let cur = state.desired(s);
-            if cur < active { cur } else { s % active }
+            if cur < active && !state.worker_stalled(cur) {
+                cur
+            } else {
+                let home = s % active;
+                if !state.worker_stalled(home) {
+                    home
+                } else {
+                    // First live worker; if EVERY active worker is stalled,
+                    // keep the home - the takeover pass raises `active` and
+                    // brings up a fresh one.
+                    (0..active).find(|&w| !state.worker_stalled(w)).unwrap_or(home)
+                }
+            }
         };
         let mut best = anchor;
         let mut best_load = worker_load[anchor];
         for (w, &l) in worker_load.iter().enumerate() {
+            if state.worker_stalled(w) {
+                continue;
+            }
             // Move only when another worker is lighter by more than the margin.
             if l + margin < best_load {
                 best = w;
@@ -410,6 +502,13 @@ pub fn monitor<T, const CAP: usize, I>(
         want = want.max((hot + 1).min(cfg.max_consumers));
     }
 
+    // Stalled workers are not capacity (audit 2, N2): a scale-down that
+    // counted them used to hand every shard back to the stuck owner and
+    // oscillate against the takeover pass. Grow `want` by the number of
+    // stalled workers inside the window so the live ones remain enough.
+    let stalled_inside = (0..want).filter(|&w| state.worker_stalled(w)).count();
+    want = want.saturating_add(stalled_inside).min(cfg.max_consumers);
+
     if want != cur {
         state.set_active(want);
     }
@@ -418,6 +517,84 @@ pub fn monitor<T, const CAP: usize, I>(
     // zone in items that stops placement from thrashing on small load changes.
     let margin = (cfg.rebalance_margin * CAP as f64) as usize;
     rebalance(state, &loads, want, margin);
+}
+
+#[inline]
+pub(crate) fn stall_takeover_pass<T, const CAP: usize, I>(
+    cfg: &Config,
+    state: &State,
+    receivers: &[Receiver<T, CAP, I>],
+    prev: &mut [u64],
+    stall: &mut [u32],
+    spawned: usize,
+) -> bool
+where
+    T: Send + 'static,
+    I: InnerChannel<T, CAP>,
+{
+    let Some(d) = cfg.stall_takeover else {
+        return false;
+    };
+    if !I::MULTI_CONSUMER {
+        return false;
+    }
+    let ticks = stall_ticks(d, cfg.sample_interval);
+
+    for (w, p) in prev.iter_mut().enumerate().take(spawned) {
+        let b = state.beat_of(w);
+        if b != *p || !state.worker_busy(w) {
+            *p = b;
+            stall[w] = 0;
+            state.set_worker_stalled(w, false);
+        } else {
+            stall[w] = stall[w].saturating_add(1);
+            if stall[w] >= ticks {
+                state.set_worker_stalled(w, true);
+            }
+        }
+    }
+
+    let is_stalled = |w: usize| w < spawned && stall.get(w).is_some_and(|&s| s >= ticks);
+    let mut took = false;
+    for (s, r) in receivers.iter().enumerate() {
+        let o = state.owner(s).load(Ordering::Acquire);
+        if o == NONE || !is_stalled(o) {
+            continue;
+        }
+        if state.current_shard(o) == s && r.queued() > 0 {
+            continue;
+        }
+        // A live target: the first active worker that is not stalled. If all
+        // of them are, ask for one more (the lazy spawner brings it up).
+        let active = state.active();
+        let target = (0..active).find(|&w| w != o && !is_stalled(w)).or_else(|| {
+            let want = active.saturating_add(1).min(cfg.max_consumers);
+            if want > active {
+                state.set_active(want);
+                Some(want - 1)
+            } else {
+                None
+            }
+        });
+        let Some(target) = target else { continue };
+        // CAS, not a store: the owner may be releasing it right now itself.
+        if state
+            .owner(s)
+            .compare_exchange(o, NONE, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            state.set_desired(s, target);
+            took = true;
+        }
+    }
+    took
+}
+
+
+#[inline]
+pub(crate) fn stall_ticks(d: Duration, interval: Duration) -> u32 {
+    (d.as_nanos() / interval.as_nanos().max(1))
+        .clamp(1, u32::MAX as u128) as u32
 }
 
 /// What an idle worker should do when it found no work this pass. The caller
@@ -449,6 +626,16 @@ mod placement_tests {
 
     fn desired_vec(state: &State) -> Vec<usize> {
         (0..state.shards()).map(|s| state.desired(s)).collect()
+    }
+
+    #[test]
+    fn init_floors_the_sample_interval() {
+        let mut cfg = Config::new(1, 1);
+        cfg.sample_interval = Duration::ZERO;
+        assert!(cfg.init().sample_interval >= Duration::from_millis(1));
+        
+        let ok = Config::new(2, 8).sample_interval(Duration::from_millis(100)).init();
+        assert_eq!(ok.sample_interval, Duration::from_millis(100));
     }
 
     /// An even or idle load must reproduce the plain shard % active mapping
@@ -641,5 +828,20 @@ mod placement_tests {
         assert_eq!(cfg.decide(2, 0.9), 4, "scale up to target");
         assert_eq!(cfg.decide(3, 0.5), 3, "hold inside the band");
         assert_eq!(cfg.decide(3, 0.1), 2, "scale down one step");
+    }
+
+    #[test]
+    fn stall_ticks_never_truncates_to_zero() {
+        let interval = Duration::from_millis(1);
+        assert_eq!(stall_ticks(Duration::from_millis(100), interval), 100);
+        assert_eq!(stall_ticks(Duration::ZERO, interval), 1, "floor is one tick");
+        let huge = interval * u32::MAX; // 2^32 - 1 ticks: still exact
+        assert_eq!(stall_ticks(huge, interval), u32::MAX);
+        let wrap = Duration::from_nanos(1_000_000u64 * 4_294_967_296); // 2^32 ticks
+        assert_eq!(
+            stall_ticks(wrap, interval),
+            u32::MAX,
+            "2^32 ticks must clamp, not wrap to zero"
+        );
     }
 }

@@ -422,7 +422,12 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
     }
 
     pub fn send_timeout(&self, value: T, d: Duration) -> Result<(), SendError<T>> {
-        send_impl(self.inner.as_ref(), value, deadline_after(d))
+        let start = Instant::now();
+        send_impl(self.inner.as_ref(), value, Some(deadline_after(d)))
+        .map_err(|e| match e {
+            SendError::TimeOut((v,_)) => SendError::TimeOut((v,start.elapsed())),
+            other => other,
+        })
     }
 
     /// Non blocking batch send: fast path only, no blocking fallback.
@@ -443,7 +448,7 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
         buf: &mut Vec<T>,
         d: Duration,
     ) -> Result<usize, BatchSendError<SendBatchError>> {
-        send_batch_impl(self.inner.as_ref(), buf, deadline_after(d))
+        send_batch_impl(self.inner.as_ref(), buf, Some(deadline_after(d)))
     }
 
     pub fn send_async(&self, value: T) -> SenderFuture<'_, T, CAP, I> {
@@ -584,7 +589,17 @@ impl<T: Send + 'static, const CAP: usize> SingleSender<T, CAP> {
     }
 
     pub fn send_timeout(&mut self, value: T, d: Duration) -> Result<(), SendError<T>> {
-        send_impl(self.inner.as_ref(), value, deadline_after(d))
+        let start = Instant::now();
+        send_impl
+        (
+            self.inner.as_ref(), 
+            value, 
+            Some(deadline_after(d))
+        ).map_err(|e| match e {
+            SendError::TimeOut((v,_)) => SendError::TimeOut((v,start.elapsed())),
+            other => other
+        })
+
     }
 
     /// Non blocking batch send: fast path only, no blocking fallback.
@@ -608,7 +623,7 @@ impl<T: Send + 'static, const CAP: usize> SingleSender<T, CAP> {
         buf: &mut Vec<T>,
         d: Duration,
     ) -> Result<usize, BatchSendError<SendBatchError>> {
-        send_batch_impl(self.inner.as_ref(), buf, deadline_after(d))
+        send_batch_impl(self.inner.as_ref(), buf, Some(deadline_after(d)))
     }
 
     pub fn send_async(&mut self, value: T) -> SenderFuture<'_, T, CAP, SingleInner<T, CAP>> {

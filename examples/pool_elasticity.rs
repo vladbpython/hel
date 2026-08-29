@@ -34,7 +34,7 @@ fn measure_rampup(shards: usize, max_consumers: usize, work: u32) {
             p.fetch_add(1, Ordering::Relaxed);
         }),
         |_poison, _panic_info| {},
-    );
+    ).unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
 
@@ -111,7 +111,7 @@ fn measure_rampdown(shards: usize, max_consumers: usize, work: u32) {
             p.fetch_add(1, Ordering::Relaxed);
         }),
         |_poison, _panic_info| {},
-    );
+    ).unwrap();
 
     let stop = Arc::new(AtomicBool::new(false));
 
