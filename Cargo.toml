@@ -1,17 +1,27 @@
 [package]
 name = "hel-rs"
-version = "2.6.0"
+version = "2.7.0"
 edition = "2024"
 authors = ["Bieliaiev Vladyslav <vladbpython@gmail.com>"]
-description = "High-performance lock-free sharded sync+async MPMC/SPSC channels with keyed routing"
+description = "High-performance sharded sync+async MPMC/SPSC channels with keyed routing"
 license = "MIT"
 repository = "https://github.com/vladbpython/hel"
 readme = "README.md"
-keywords = ["channel", "mpmc", "spsc", "lock-free", "concurrency"]
+keywords = ["channel", "mpmc", "spsc", "concurrency"]
 categories = ["concurrency", "asynchronous"]
+rust-version = "1.88"
 exclude = [
     "**/.DS_Store",
 ]
+include = [
+    "src/**",
+    "README.md",
+    "LICENSE",
+    "change_log/*.md",
+]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 atomic-waker = "1"

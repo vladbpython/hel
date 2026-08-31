@@ -180,7 +180,7 @@ mod tests {
             tx.try_send("ETH", i).unwrap();
         }
         let mut buf = Vec::new();
-        rx.get_receiver(s).unwrap().recv_batch(&mut buf, 5);
+        let _ = rx.get_receiver(s).unwrap().recv_batch(&mut buf, 5);
         assert_eq!(buf, vec![0, 1, 2, 3, 4]);
     }
 

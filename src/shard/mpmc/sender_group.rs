@@ -10,6 +10,7 @@ use crate::internal_channel::{
 use std::{
     any::Any,
     collections::HashMap,
+    fmt::Debug,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::Arc,
     time::{Duration, Instant},
@@ -92,11 +93,12 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         map: HashMap<String, usize>,
         num_groups: usize,
     ) -> (Self, ShardReceiver<T, CAP>) {
-        let n = shard_power_of_two(num_groups.max(1));
+        let groups = num_groups.max(1);
+        let n = shard_power_of_two(groups);
         let (senders, receivers): (Vec<_>, Vec<_>) =
             (0..n).map(|_| mpmc_bounded::<T, CAP>()).unzip();
 
-        let route: HashMap<String, usize> = map.into_iter().map(|(k, g)| (k, g % n)).collect();
+        let route: HashMap<String, usize> = map.into_iter().map(|(k, g)| (k, g % groups)).collect();
 
         let group = Self {
             senders: senders.into(),
@@ -504,6 +506,14 @@ impl<T: Send + 'static, const CAP: usize> Clone for ShardGroup<T, CAP> {
     }
 }
 
+impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + 'static> Debug
+    for ShardGroup<T, CAP, I>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardGroup").finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(miri, allow(unused_imports))]
 mod tests {
@@ -578,7 +588,7 @@ mod tests {
         assert_eq!(sent, 4);
         assert!(buf.is_empty());
         let mut out = Vec::new();
-        rx.get_receiver(a.shard()).unwrap().recv_batch(&mut out, 8);
+        let _ = rx.get_receiver(a.shard()).unwrap().recv_batch(&mut out, 8);
         assert_eq!(
             out,
             vec![
@@ -612,7 +622,7 @@ mod tests {
         assert!(buf.is_empty());
         let receivers = rx.into_receivers();
         let mut out_a = Vec::new();
-        receivers[a.shard()].recv_batch(&mut out_a, 8);
+        let _ = receivers[a.shard()].recv_batch(&mut out_a, 8);
         assert_eq!(
             out_a,
             vec![
@@ -623,7 +633,7 @@ mod tests {
             ]
         );
         let mut out_b = Vec::new();
-        receivers[b.shard()].recv_batch(&mut out_b, 8);
+        let _ = receivers[b.shard()].recv_batch(&mut out_b, 8);
         assert_eq!(
             out_b,
             vec![
@@ -906,5 +916,28 @@ mod key_fn_panic_and_orphan_tests {
             assert_eq!(sent, 0, "round {round}: nothing is routable");
             assert_eq!(buf.len(), 1, "round {round}: orphan stays in buf");
         }
+    }
+
+    #[test]
+    fn out_of_range_group_index_folds_into_real_groups() {
+        let map: HashMap<String, usize> = [("A", 0usize), ("B", 1), ("C", 2), ("D", 3)]
+            .into_iter()
+            .map(|(k, g)| (k.to_string(), g))
+            .collect();
+        let (tx, mut rx) = ShardGroup::<u64, 4>::from_map(map, 3);
+        // 'D' folds into group 3 % 3 = 0, a group a consumer actually reads.
+        let d = tx.handle("D").expect("key D is in the table");
+        for i in 0..40u64 {
+            // Drain the caller visible groups each round,
+            // like a consumer that knows about 3 groups would.
+            for s in 0..3 {
+                while rx.try_recv(s).is_ok() {}
+            }
+            tx.try_send(d, i).unwrap_or_else(|e| {
+                panic!("send {i} of key D bounced: {e} - phantom shard is back")
+            });
+        }
+        // The phantom shard stays empty: nothing routes there any more.
+        assert!(rx.try_recv(3).is_err(), "phantom shard must stay empty");
     }
 }

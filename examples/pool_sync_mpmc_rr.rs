@@ -18,7 +18,8 @@ fn main() {
             s.fetch_add(*v, Relaxed);
         }),
         |_poison, _panic_info| {},
-    ).unwrap();
+    )
+    .unwrap();
 
     for i in 0..10_000u64 {
         tx.send(i).unwrap();

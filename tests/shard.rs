@@ -164,7 +164,7 @@ fn errors_are_real_errors() {
     let e = boxed().unwrap_err();
     let text = format!("{e}");
     assert!(
-        text.contains("Disconnected"),
+        text.contains("disconnected"),
         "human readable message, got: {text}"
     );
     let (tx, rx) = round_robin::<u64, 8>(1);
@@ -240,4 +240,19 @@ fn get_receiver_is_the_non_panicking_route() {
     );
     let r = rx.get_receiver(0).expect("shard 0 exists");
     let _ = r.try_recv();
+}
+
+#[test]
+fn send_errors_convert_to_boxed_error_for_non_debug_payloads() {
+    struct Opaque; // not Debug
+    fn produces() -> Result<(), Box<dyn std::error::Error>> {
+        let (tx, rx) = round_robin::<Opaque, 2>(1);
+        drop(rx);
+        tx.try_send(Opaque)?; // must convert via `?`
+        Ok(())
+    }
+    assert!(
+        produces().is_err(),
+        "disconnected send must surface as an error"
+    );
 }

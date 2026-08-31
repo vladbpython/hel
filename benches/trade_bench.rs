@@ -64,9 +64,10 @@ fn make_trade(i: u64, producer: u64) -> Trade {
 
 #[inline(always)]
 fn bench_hash(key: &str) -> usize {
-    key.bytes().fold(14695981039346656037u64, |h, b| {
+    let h = key.bytes().fold(14695981039346656037u64, |h, b| {
         (h ^ b as u64).wrapping_mul(1099511628211)
-    }) as usize
+    });
+    (h.wrapping_mul(0x9E3779B97F4A7C15) >> 32) as usize
 }
 
 // POOLS allocated ONCE per group, out of measurement, reused

@@ -60,7 +60,8 @@ fn main() {
                 }
             }),
             |_poison, _panic_info| {},
-        ).unwrap();
+        )
+        .unwrap();
 
         for i in 0..10_000u64 {
             tx.send_async(i).await.unwrap();

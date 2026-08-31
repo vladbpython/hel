@@ -36,7 +36,7 @@
 
 use super::errors as shard_error;
 use crate::internal_channel::{core::SingleInner, receiver::SingleReceiver, sender::SingleSender};
-use std::time::Duration;
+use std::{fmt::Debug, time::Duration};
 
 // Spsc sharded channel
 
@@ -51,8 +51,12 @@ pub struct SpscShard<T: Send + 'static, const CAP: usize> {
 impl<T: Send + 'static, const CAP: usize> SpscShard<T, CAP> {
     /// We create N independent SPSC channels.
     /// `num_shards` does not have to be a power of two (no hash routing).
+    ///
+    /// ```compile_fail
+    /// let ch = hel::channel::spsc::SpscShard::<u64, 3>::new(2);
+    /// ```
     pub fn new(num_shards: usize) -> Self {
-        assert!(num_shards > 0, "num_shards must be > 0");
+        let num_shards = num_shards.max(1);
         let pairs: Vec<Option<(SingleSender<T, CAP>, SingleReceiver<T, CAP>)>> = (0..num_shards)
             .map(|_| {
                 let inner = SingleInner::new();
@@ -141,6 +145,10 @@ pub struct SpscReceiver<T: Send + 'static, const CAP: usize> {
 }
 
 impl<T: Send + 'static, const CAP: usize> SpscSender<T, CAP> {
+    pub fn shard_id(&self) -> usize {
+        self.shard_id
+    }
+
     pub fn try_send(&mut self, v: T) -> Result<(), shard_error::ShardTrySendError<T>> {
         self.inner
             .try_send(v)
@@ -285,10 +293,12 @@ impl<T: Send + 'static, const CAP: usize> SpscReceiver<T, CAP> {
             })
     }
 
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub fn recv_batch(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         self.inner.recv_batch(buf, max)
     }
 
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub fn recv_batch_timeout(
         &mut self,
         buf: &mut Vec<T>,
@@ -298,6 +308,7 @@ impl<T: Send + 'static, const CAP: usize> SpscReceiver<T, CAP> {
         self.inner.recv_batch_timeout(buf, max, d)
     }
 
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub async fn recv_batch_async(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         self.inner.recv_batch_async(buf, max).await
     }
@@ -336,6 +347,22 @@ pub fn shard_spsc<T: Send + 'static, const CAP: usize>(num_shards: usize) -> Sps
     SpscShard::new(num_shards)
 }
 
+impl<T: Send + 'static, const CAP: usize> Debug for SpscShard<T, CAP> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpscShard").finish_non_exhaustive()
+    }
+}
+impl<T: Send + 'static, const CAP: usize> Debug for SpscSender<T, CAP> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpscSender").finish_non_exhaustive()
+    }
+}
+impl<T: Send + 'static, const CAP: usize> Debug for SpscReceiver<T, CAP> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpscReceiver").finish_non_exhaustive()
+    }
+}
+
 // Tests
 
 #[cfg(test)]
@@ -362,12 +389,6 @@ mod tests {
     fn non_power_of_two_shards_ok() {
         let ch = SpscShard::<u64, 8>::new(3);
         assert_eq!(ch.shards(), 3);
-    }
-
-    #[test]
-    fn panic_on_zero_shards() {
-        let r = std::panic::catch_unwind(|| SpscShard::<u64, 8>::new(0));
-        assert!(r.is_err());
     }
 
     #[test]
@@ -617,5 +638,11 @@ mod tests {
         assert_eq!(err.shard, 0);
         assert_eq!(err.err, AsyncSendRefError::Disconnected);
         assert_eq!(slot, Some(5), "disconnect must keep the value in the slot");
+    }
+
+    #[test]
+    fn zero_shards_floors_to_one_like_mpmc() {
+        let ch = SpscShard::<u64, 8>::new(0);
+        assert_eq!(ch.shards(), 1, "zero shards must floor to one");
     }
 }

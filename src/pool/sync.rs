@@ -1,9 +1,11 @@
 use super::{
     instance::State,
     signal::Stop,
+    stats,
     traits::{AsyncJoinHandle, AsyncRuntime},
 };
 use std::{
+    fmt::Debug,
     sync::{Arc, Mutex, MutexGuard},
     thread::JoinHandle,
 };
@@ -15,8 +17,8 @@ pub(crate) fn lock_workers<H>(m: &Mutex<Vec<H>>) -> MutexGuard<'_, Vec<H>> {
 }
 
 /// Handle to a running sync pool.
-/// Dropping the handle stops the pool and join worker threads, 
-/// so `drop(pool)` blocks until every worker exits its loop - wedged handler  wedges the drop with it. 
+/// Dropping the handle stops the pool and join worker threads,
+/// so `drop(pool)` blocks until every worker exits its loop - wedged handler  wedges the drop with it.
 /// Batch already in flight is always finished (zero loss), batch: up to `batch_size` handler calls per worker.
 /// so the drop waits at least the remainder of the current.
 /// Use
@@ -28,12 +30,47 @@ pub struct SyncPool {
 }
 
 impl SyncPool {
-    pub fn new(state: Arc<State>, workers: WorkerHandles<JoinHandle<()>>) -> Self {
+    pub(crate) fn new(state: Arc<State>, workers: WorkerHandles<JoinHandle<()>>) -> Self {
         Self { state, workers }
     }
 
     pub fn processed(&self) -> u64 {
         self.state.processed()
+    }
+
+    pub fn shards(&self) -> usize {
+        self.state.shards()
+    }
+
+    pub fn shard_queued(&self, shard: usize) -> Option<usize> {
+        if shard < self.state.shards() && self.depths_live() {
+            Some(self.state.depth(shard))
+        } else {
+            None
+        }
+    }
+
+    pub fn depths(&self) -> Option<Vec<usize>> {
+        if !self.depths_live() {
+            return None;
+        }
+        Some(
+            (0..self.state.shards())
+                .map(|s| self.state.depth(s))
+                .collect(),
+        )
+    }
+
+    fn depths_live(&self) -> bool {
+        !self.state.channels_closed()
+    }
+
+    pub fn takeovers(&self) -> u64 {
+        self.state.takeovers()
+    }
+
+    pub fn stats(&self) -> stats::Pool {
+        stats::snapshot(&self.state)
     }
 
     pub fn handler_panics(&self) -> u64 {
@@ -126,12 +163,47 @@ pub struct AsyncPool<AR: AsyncRuntime> {
 }
 
 impl<AR: AsyncRuntime> AsyncPool<AR> {
-    pub fn new(state: Arc<State>, workers: WorkerHandles<AR::JoinHandle>) -> Self {
+    pub(crate) fn new(state: Arc<State>, workers: WorkerHandles<AR::JoinHandle>) -> Self {
         Self { state, workers }
     }
 
     pub fn processed(&self) -> u64 {
         self.state.processed()
+    }
+
+    pub fn shards(&self) -> usize {
+        self.state.shards()
+    }
+
+    pub fn shard_queued(&self, shard: usize) -> Option<usize> {
+        if shard < self.state.shards() && self.depths_live() {
+            Some(self.state.depth(shard))
+        } else {
+            None
+        }
+    }
+
+    pub fn depths(&self) -> Option<Vec<usize>> {
+        if !self.depths_live() {
+            return None;
+        }
+        Some(
+            (0..self.state.shards())
+                .map(|s| self.state.depth(s))
+                .collect(),
+        )
+    }
+
+    fn depths_live(&self) -> bool {
+        !self.state.channels_closed()
+    }
+
+    pub fn takeovers(&self) -> u64 {
+        self.state.takeovers()
+    }
+
+    pub fn stats(&self) -> stats::Pool {
+        stats::snapshot(&self.state)
     }
 
     pub fn handler_panics(&self) -> u64 {
@@ -191,12 +263,23 @@ impl<AR: AsyncRuntime> AsyncPool<AR> {
     }
 }
 
-/// RAII: dropping the handle must stop the workers. Drop cannot `.await`, 
+/// RAII: dropping the handle must stop the workers. Drop cannot `.await`,
 /// so no join here and only the stop flag. A worker rechecks it between items and idle sleeps,
 /// but a handler already in flight finishes first, so this is a signal, not a synchronous guarantee.
 /// Without this a plain `drop(pool)` left the tasks running forever with no way to reach them.
 impl<AR: AsyncRuntime> Drop for AsyncPool<AR> {
     fn drop(&mut self) {
         self.state.stop();
+    }
+}
+
+impl Debug for SyncPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncPool").finish_non_exhaustive()
+    }
+}
+impl<AR: AsyncRuntime> Debug for AsyncPool<AR> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AsyncPool").finish_non_exhaustive()
     }
 }

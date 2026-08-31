@@ -110,7 +110,7 @@ where
     acc
 }
 
-/// ASYNC batch drain, where the hook takes ownership of the ENTIRE batch (Vec<T>) and
+/// ASYNC batch drain, where the hook takes ownership of the ENTIRE batch (`Vec<T>`) and
 /// returns it (empty) back to send the array over the network/to the database in one
 /// an async call, WITHOUT copying. Allocation is reused.
 /// `sink` gets the elements themselves (as opposed to element-wise drain_batch_async):

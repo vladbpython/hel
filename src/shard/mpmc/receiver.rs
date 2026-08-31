@@ -36,6 +36,7 @@ use crate::internal_channel::{
     traits::InnerChannel,
 };
 use std::{
+    fmt::Debug,
     future::Future,
     pin::Pin,
     sync::{Arc, atomic::Ordering},
@@ -133,12 +134,14 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardReceiver
         Ok(None)
     }
 
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub fn recv_batch(&mut self, shard: usize, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         self.receivers[self.check_shard(shard)].recv_batch(buf, max)
     }
 
     /// Async batch recv from a specific shard.
     /// Returns `Ok(count)` or `Err(ShardedBatchRecvError)` if sender is closed.
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub async fn recv_batch_async(
         &self,
         shard: usize,
@@ -153,6 +156,7 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardReceiver
     /// Returns `(count, disconnected)`; same convention as `pop_batch`:
     /// `disconnected` is true only when nothing was received and every shard is closed and drained,
     /// so a polling loop knows when to stop instead of spinning core forever.
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub fn try_recv_batch_any(&mut self, buf: &mut Vec<T>, max_per_shard: usize) -> (usize, bool) {
         let n = self.receivers.len();
         let start = self.cursor;
@@ -351,6 +355,21 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Drop
                     .notify_one();
             }
         }
+    }
+}
+
+impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + 'static> Debug
+    for ShardReceiver<T, CAP, I>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardReceiver").finish_non_exhaustive()
+    }
+}
+impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + 'static> Debug
+    for RecvAnyFuture<'_, T, CAP, I>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecvAnyFuture").finish_non_exhaustive()
     }
 }
 

@@ -10,6 +10,7 @@ use crate::internal_channel::{
 };
 use std::{
     any::Any,
+    fmt::Debug,
     panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::Arc,
     time::{Duration, Instant},
@@ -366,6 +367,12 @@ pub fn shard_key<T: Send + 'static, const CAP: usize>(
     )
 }
 
+impl<T: Send + 'static, const CAP: usize> Debug for ShardKey<T, CAP> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardKey").finish_non_exhaustive()
+    }
+}
+
 // Tests
 
 #[cfg(test)]
@@ -414,7 +421,7 @@ mod tests {
             tx.try_send("AAPL", i).unwrap();
         }
         let mut buf = Vec::new();
-        rx.get_receiver(shard).unwrap().recv_batch(&mut buf, 10);
+        let _ = rx.get_receiver(shard).unwrap().recv_batch(&mut buf, 10);
         assert_eq!(buf, (0..10u64).collect::<Vec<_>>());
     }
 
@@ -461,8 +468,8 @@ mod tests {
         assert_eq!(sent, 4);
         let mut ba = Vec::new();
         let mut bb = Vec::new();
-        rx.recv_batch(sa, &mut ba, 10);
-        rx.recv_batch(sb, &mut bb, 10);
+        let _ = rx.recv_batch(sa, &mut ba, 10);
+        let _ = rx.recv_batch(sb, &mut bb, 10);
         assert!(ba.iter().all(|(s, _)| s == "AAPL"));
         assert!(bb.iter().all(|(s, _)| s == "MSFT"));
     }

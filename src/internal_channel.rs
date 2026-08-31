@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(buf.len() + 2, before, "sent + remainder == original size");
         // Those who left came in the right order.
         let mut got = Vec::new();
-        rx.recv_batch(&mut got, 8);
+        let (_, _result) = rx.recv_batch(&mut got, 8);
         assert_eq!(&got[got.len() - 2..], &[100, 101]);
     }
 

@@ -212,9 +212,9 @@ impl<E: Display> Display for BatchSendError<E> {
     }
 }
 
-impl<T: Debug> StdError for TrySendError<T> {}
-impl<T: Debug> StdError for SendError<T> {}
-impl<T: Debug> StdError for AsyncSendError<T> {}
+impl<T> StdError for TrySendError<T> {}
+impl<T> StdError for SendError<T> {}
+impl<T> StdError for AsyncSendError<T> {}
 impl StdError for AsyncSendRefError {}
 impl StdError for TryRecvError {}
 impl StdError for RecvError {}

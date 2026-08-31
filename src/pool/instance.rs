@@ -62,7 +62,19 @@ impl Config {
         }
     }
 
+    fn frac(v: f64, default: f64) -> f64 {
+        if v.is_finite() && (0.0..=1.0).contains(&v) {
+            v
+        } else {
+            default
+        }
+    }
+
     pub(crate) fn init(mut self) -> Self {
+        self.scale_up_fill = Self::frac(self.scale_up_fill, 0.80);
+        self.scale_down_fill = Self::frac(self.scale_down_fill, 0.20);
+        self.hotspot_fill = Self::frac(self.hotspot_fill, 0.80);
+        self.rebalance_margin = Self::frac(self.rebalance_margin, 0.15);
         self.max_consumers = self.max_consumers.max(1);
         self.min_consumers = self.min_consumers.clamp(1, self.max_consumers);
         self.batch_size = self.batch_size.max(1);
@@ -73,51 +85,61 @@ impl Config {
         self
     }
 
+    #[must_use = "builders return a new Config - assign the result, original is unchanged"]
     pub fn min_consumers(mut self, value: usize) -> Self {
         self.min_consumers = value;
         self
     }
 
+    #[must_use = "builders return a new Config - assign the result, original is unchanged"]
     pub fn max_consumers(mut self, value: usize) -> Self {
         self.max_consumers = value;
         self
     }
 
+    #[must_use = "builders return a new Config - assign the result, original is unchanged"]
     pub fn scale_up_fill(mut self, value: f64) -> Self {
         self.scale_up_fill = value;
         self
     }
 
+    #[must_use = "builders return a new Config - assign the result, original is unchanged"]
     pub fn scale_down_fill(mut self, value: f64) -> Self {
         self.scale_down_fill = value;
         self
     }
 
+    #[must_use = "builders return a new Config - assign the result, original is unchanged"]
     pub fn sample_interval(mut self, value: Duration) -> Self {
         self.sample_interval = value;
         self
     }
 
+    #[must_use = "builders return a new Config - assign the result, original is unchanged"]
     pub fn batch_size(mut self, value: usize) -> Self {
         self.batch_size = value;
         self
     }
 
+    #[must_use = "builders return a new Config - assign the result, original is unchanged"]
     pub fn hotspot_fill(mut self, value: f64) -> Self {
         self.hotspot_fill = value;
         self
     }
 
+    #[must_use = "builders return a new Config - assign the result, original is unchanged"]
     pub fn rebalance_margin(mut self, value: f64) -> Self {
         self.rebalance_margin = value;
         self
     }
 
+    #[must_use = "builders return a new Config - assign the result, original is unchanged"]
     pub fn hotspot_isolation(mut self, value: bool) -> Self {
         self.hotspot_isolation = value;
         self
     }
 
+    #[must_use = "builders return a new Config - assign the result, original is unchanged"]
     pub fn stall_takeover(mut self, d: Duration) -> Self {
         self.stall_takeover = Some(d);
         self
@@ -144,20 +166,24 @@ impl Config {
 /// Handle to the pool's shared state: shard ownership, active count, stop flag,
 /// metrics, and per shard close tracking for autodrain.
 pub struct State {
-    owner: Vec<AtomicUsize>,   // owner[shard] = worker id, or NONE
-    desired: Vec<AtomicUsize>, // desired[shard] = worker id that should own it, picked by load
-    active: AtomicUsize,       // current active consumers
-    max_active: AtomicUsize,   // peak active reached
-    shutdown: AtomicBool,      // stop flag (set by cancel/shutdown or autodrain)
-    processed: AtomicU64,      // total items processed
-    shards: usize,             // shard count (immutable)
-    closed: Vec<AtomicBool>,   // closed[shard] = shard empty AND senders dropped
-    closed_count: AtomicUsize, // how many shards are closed
-    handler_panics: AtomicU64, // panics caught in worker loops (cold path only)
-    beats: Vec<AtomicU64>,     // beats[worker] += 1 per completed item (stall detection)
-    stalled: Vec<AtomicBool>,  // stalled[worker]: over the stall budget, not placement capacity
+    owner: Vec<AtomicUsize>,     // owner[shard] = worker id, or NONE
+    desired: Vec<AtomicUsize>,   // desired[shard] = worker id that should own it, picked by load
+    active: AtomicUsize,         // current active consumers
+    max_active: AtomicUsize,     // peak active reached
+    shutdown: AtomicBool,        // stop flag (set by cancel/shutdown or autodrain)
+    processed: AtomicU64,        // total items processed
+    shards: usize,               // shard count (immutable)
+    closed: Vec<AtomicBool>,     // closed[shard] = shard empty AND senders dropped
+    closed_count: AtomicUsize,   // how many shards are closed
+    handler_panics: AtomicU64,   // panics caught in worker loops (cold path only)
+    takeovers: AtomicU64,        // shards moved off a stalled owner (one per shard)
+    spawn_failures: AtomicU64,   // worker spawns the OS refused (lazy scale up)
+    beats: Vec<AtomicU64>,       // beats[worker] += 1 per completed item (stall detection)
+    stalled: Vec<AtomicBool>,    // stalled[worker]: over the stall budget, not placement capacity
     busy: Vec<AtomicBool>, // busy[worker]: inside user code for one item (handler/dead_letter/drop)
     cur_shard: Vec<AtomicUsize>, // cur_shard[worker]: shard whose batch sits in the worker's buffer
+    depths: Vec<AtomicUsize>, // depths[shard]: queue depth mirror, published by the monitor
+    channels_closed: AtomicBool, // every receiver dropped: depth reads are frozen history now
 }
 
 impl State {
@@ -179,11 +205,15 @@ impl State {
             closed: (0..shards).map(|_| AtomicBool::new(false)).collect(),
             closed_count: AtomicUsize::new(0),
             handler_panics: AtomicU64::new(0),
+            takeovers: AtomicU64::new(0),
+            spawn_failures: AtomicU64::new(0),
             // One per potential worker: ids are capped by the shard count.
             beats: (0..shards).map(|_| AtomicU64::new(0)).collect(),
             stalled: (0..shards).map(|_| AtomicBool::new(false)).collect(),
             busy: (0..shards).map(|_| AtomicBool::new(false)).collect(),
             cur_shard: (0..shards).map(|_| AtomicUsize::new(NONE)).collect(),
+            depths: (0..shards).map(|_| AtomicUsize::new(0)).collect(),
+            channels_closed: AtomicBool::new(false),
         })
     }
 
@@ -230,6 +260,27 @@ impl State {
         self.handler_panics.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Shards moved off a stalled owner by `stall_takeover`, one per shard.
+    #[inline]
+    pub(crate) fn note_takeover(&self) {
+        self.takeovers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn takeovers(&self) -> u64 {
+        self.takeovers.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn spawn_failures(&self) -> u64 {
+        self.spawn_failures.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn note_spawn_failure(&self) {
+        self.spawn_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[inline]
     pub(crate) fn beat(&self, id: usize) {
         if let Some(b) = self.beats.get(id) {
@@ -269,8 +320,10 @@ impl State {
     }
 
     #[inline]
-    pub(crate) fn current_shard(&self, id: usize) -> usize {
-        self.cur_shard.get(id).map_or(NONE, |s| s.load(Ordering::Relaxed))
+    pub(crate) fn current_shard_of(&self, id: usize) -> usize {
+        self.cur_shard
+            .get(id)
+            .map_or(NONE, |s| s.load(Ordering::Relaxed))
     }
 
     #[inline]
@@ -282,7 +335,23 @@ impl State {
 
     #[inline]
     pub(crate) fn worker_stalled(&self, id: usize) -> bool {
-        self.stalled.get(id).is_some_and(|s| s.load(Ordering::Relaxed))
+        self.stalled
+            .get(id)
+            .is_some_and(|s| s.load(Ordering::Relaxed))
+    }
+
+    #[inline]
+    pub(crate) fn set_depth(&self, shard: usize, queued: usize) {
+        if let Some(d) = self.depths.get(shard) {
+            d.store(queued, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn depth(&self, shard: usize) -> usize {
+        self.depths
+            .get(shard)
+            .map_or(0, |d| d.load(Ordering::Relaxed))
     }
 
     #[inline]
@@ -295,6 +364,16 @@ impl State {
     /// The current batch is NOT torn (safe).
     pub fn stop(&self) {
         self.shutdown.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn mark_channels_closed(&self) {
+        self.channels_closed.store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn channels_closed(&self) -> bool {
+        self.channels_closed.load(Ordering::Acquire)
     }
 
     /// The owner of the shard records its closure (empty + senders gone).
@@ -376,6 +455,40 @@ pub(crate) fn claim_or_release(state: &State, id: usize, shard: usize) -> bool {
     claim_or_release_to(state, id, shard, state.desired(shard))
 }
 
+pub(crate) struct ReceiverSet<
+    T: Send + 'static,
+    const CAP: usize,
+    I: InnerChannel<T, CAP> + 'static,
+> {
+    receivers: Vec<Receiver<T, CAP, I>>,
+    state: Arc<State>,
+}
+
+impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + 'static>
+    ReceiverSet<T, CAP, I>
+{
+    pub(crate) fn new(receivers: Vec<Receiver<T, CAP, I>>, state: Arc<State>) -> Self {
+        Self { receivers, state }
+    }
+}
+
+impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + 'static> std::ops::Deref
+    for ReceiverSet<T, CAP, I>
+{
+    type Target = [Receiver<T, CAP, I>];
+    fn deref(&self) -> &Self::Target {
+        &self.receivers
+    }
+}
+
+impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP> + 'static> Drop
+    for ReceiverSet<T, CAP, I>
+{
+    fn drop(&mut self) {
+        self.state.mark_channels_closed();
+    }
+}
+
 //  metrics
 
 /// Queue depth of every shard, capped at CAP. Read once and used both for the
@@ -432,7 +545,9 @@ fn rebalance(state: &State, loads: &[usize], active: usize, margin: usize) {
                     // First live worker; if EVERY active worker is stalled,
                     // keep the home - the takeover pass raises `active` and
                     // brings up a fresh one.
-                    (0..active).find(|&w| !state.worker_stalled(w)).unwrap_or(home)
+                    (0..active)
+                        .find(|&w| !state.worker_stalled(w))
+                        .unwrap_or(home)
                 }
             }
         };
@@ -466,6 +581,10 @@ pub fn monitor<T, const CAP: usize, I>(
     let n = loads.len();
     if n == 0 {
         return;
+    }
+
+    for (s, &q) in loads.iter().enumerate() {
+        state.set_depth(s, q);
     }
 
     // The average fill over all shards tells us how many workers we want.
@@ -561,7 +680,7 @@ where
         if o == NONE || !is_stalled(o) {
             continue;
         }
-        if state.current_shard(o) == s && r.queued() > 0 {
+        if state.current_shard_of(o) == s && r.queued() > 0 {
             continue;
         }
         // A live target: the first active worker that is not stalled. If all
@@ -584,17 +703,16 @@ where
             .is_ok()
         {
             state.set_desired(s, target);
+            state.note_takeover();
             took = true;
         }
     }
     took
 }
 
-
 #[inline]
 pub(crate) fn stall_ticks(d: Duration, interval: Duration) -> u32 {
-    (d.as_nanos() / interval.as_nanos().max(1))
-        .clamp(1, u32::MAX as u128) as u32
+    (d.as_nanos() / interval.as_nanos().max(1)).clamp(1, u32::MAX as u128) as u32
 }
 
 /// What an idle worker should do when it found no work this pass. The caller
@@ -633,9 +751,32 @@ mod placement_tests {
         let mut cfg = Config::new(1, 1);
         cfg.sample_interval = Duration::ZERO;
         assert!(cfg.init().sample_interval >= Duration::from_millis(1));
-        
-        let ok = Config::new(2, 8).sample_interval(Duration::from_millis(100)).init();
+
+        let ok = Config::new(2, 8)
+            .sample_interval(Duration::from_millis(100))
+            .init();
         assert_eq!(ok.sample_interval, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn init_repairs_broken_fractions() {
+        let cfg = Config::new(1, 4)
+            .scale_up_fill(80.0)
+            .scale_down_fill(f64::NAN)
+            .hotspot_fill(-3.0)
+            .rebalance_margin(f64::INFINITY)
+            .init();
+        assert_eq!(cfg.scale_up_fill, 0.80, "percent value must fall back");
+        assert_eq!(cfg.scale_down_fill, 0.20, "NaN must fall back");
+        assert_eq!(cfg.hotspot_fill, 0.80, "negative must fall back");
+        assert_eq!(cfg.rebalance_margin, 0.15, "infinity must fall back");
+
+        // In-range values pass through untouched.
+        let ok = Config::new(1, 4)
+            .scale_up_fill(0.5)
+            .scale_down_fill(0.1)
+            .init();
+        assert_eq!((ok.scale_up_fill, ok.scale_down_fill), (0.5, 0.1));
     }
 
     /// An even or idle load must reproduce the plain shard % active mapping
@@ -834,7 +975,11 @@ mod placement_tests {
     fn stall_ticks_never_truncates_to_zero() {
         let interval = Duration::from_millis(1);
         assert_eq!(stall_ticks(Duration::from_millis(100), interval), 100);
-        assert_eq!(stall_ticks(Duration::ZERO, interval), 1, "floor is one tick");
+        assert_eq!(
+            stall_ticks(Duration::ZERO, interval),
+            1,
+            "floor is one tick"
+        );
         let huge = interval * u32::MAX; // 2^32 - 1 ticks: still exact
         assert_eq!(stall_ticks(huge, interval), u32::MAX);
         let wrap = Duration::from_nanos(1_000_000u64 * 4_294_967_296); // 2^32 ticks

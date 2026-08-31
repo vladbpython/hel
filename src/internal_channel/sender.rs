@@ -10,6 +10,7 @@ use super::{
 };
 use crate::shim::loom::{park, park_timeout};
 use std::{
+    fmt::Debug,
     future::Future,
     marker::PhantomData,
     pin::Pin,
@@ -42,9 +43,8 @@ pub fn send_impl<T: Send + 'static, const CAP: usize>(
     mut value: T,
     deadline: Option<Instant>,
 ) -> Result<(), SendError<T>> {
-    // No deadline: try push_blocking first.
-    // ARM SeqInner: fetch_add blocks internally \u2192 Ok or Err(rx_closed) only.
-    // Intel / SingleInner: push_blocking == push (CAS) \u2192 may return Err(Full) \u2192 fall through.
+    // No deadline: push_blocking waits inside for SeqInner (Ok or disconnected),
+    // for SingleInner it does not wait - Err(full) falls through to the park loop.
     if deadline.is_none() {
         if inner.is_rx_closed() {
             return Err(SendError::Disconnected(value));
@@ -58,7 +58,7 @@ pub fn send_impl<T: Send + 'static, const CAP: usize>(
                 if inner.is_rx_closed() {
                     return Err(SendError::Disconnected(v));
                 }
-                value = v; // Err(Full) on Intel/SPSC fall through to spin+park
+                value = v; // Err(Full) on SPSC fall through to spin+park
             }
         }
     }
@@ -423,9 +423,8 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
 
     pub fn send_timeout(&self, value: T, d: Duration) -> Result<(), SendError<T>> {
         let start = Instant::now();
-        send_impl(self.inner.as_ref(), value, Some(deadline_after(d)))
-        .map_err(|e| match e {
-            SendError::TimeOut((v,_)) => SendError::TimeOut((v,start.elapsed())),
+        send_impl(self.inner.as_ref(), value, Some(deadline_after(d))).map_err(|e| match e {
+            SendError::TimeOut((v, _)) => SendError::TimeOut((v, start.elapsed())),
             other => other,
         })
     }
@@ -483,7 +482,7 @@ impl<T: Send, const CAP: usize, I: SenderOps<T, CAP>> Sender<T, CAP, I> {
     /// tokio::select! {
     ///     r = tx.send_ref_async(&mut slot) => match r {
     ///     Ok(()) => { /*sent, slot == None */}
-    ///     Err(SendRefError::Disconnected) => {
+    ///     Err(AsyncSendRefError::Disconnected) => {
     ///         let order = slot.take().unwrap(); //value is integer
     ///         }
     ///     },
@@ -590,16 +589,10 @@ impl<T: Send + 'static, const CAP: usize> SingleSender<T, CAP> {
 
     pub fn send_timeout(&mut self, value: T, d: Duration) -> Result<(), SendError<T>> {
         let start = Instant::now();
-        send_impl
-        (
-            self.inner.as_ref(), 
-            value, 
-            Some(deadline_after(d))
-        ).map_err(|e| match e {
-            SendError::TimeOut((v,_)) => SendError::TimeOut((v,start.elapsed())),
-            other => other
+        send_impl(self.inner.as_ref(), value, Some(deadline_after(d))).map_err(|e| match e {
+            SendError::TimeOut((v, _)) => SendError::TimeOut((v, start.elapsed())),
+            other => other,
         })
-
     }
 
     /// Non blocking batch send: fast path only, no blocking fallback.
@@ -679,5 +672,23 @@ impl<T: Send + 'static, const CAP: usize> Drop for SingleSender<T, CAP> {
             self.inner.tx_close();
             self.inner.notify_all_on_tx_close();
         }
+    }
+}
+
+impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Debug for Sender<T, CAP, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sender").finish_non_exhaustive()
+    }
+}
+impl<T: Send + 'static, const CAP: usize> Debug for SingleSender<T, CAP> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleSender").finish_non_exhaustive()
+    }
+}
+impl<T: Send + 'static, const CAP: usize, I: SenderOps<T, CAP>> Debug
+    for GenericSendFuture<'_, T, CAP, I>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenericSendFuture").finish_non_exhaustive()
     }
 }

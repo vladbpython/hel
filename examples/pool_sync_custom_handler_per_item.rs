@@ -60,7 +60,8 @@ fn main() {
         |poison: u64, panic_info: PanicReason| {
             eprintln!("dead-letter: item={poison} panic_info={panic_info:?}");
         },
-    ).unwrap();
+    )
+    .unwrap();
 
     const TOTAL: u64 = 100_000;
     let producers: Vec<_> = (0..4)

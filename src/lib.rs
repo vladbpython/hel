@@ -11,16 +11,16 @@ pub(crate) mod shim;
 pub use num_cpus as _num_cpus;
 
 pub mod channel {
+    #[doc(hidden)]
+    pub use super::internal_channel::errors;
     pub use super::internal_channel::{
-        errors, nearest_power_of_two,
+        nearest_power_of_two,
         receiver::{
-            GenericRecvFuture, GenericRecvStream, IntoIter, Iter, Receiver,
-            ReceiverFuture, ReceiverStream, SingleIntoIter, SingleIter,
-            SingleReceiver, SingleRecvFuture, SingleRecvStream,
+            GenericRecvFuture, GenericRecvStream, IntoIter, Iter, Receiver, ReceiverFuture,
+            ReceiverStream, SingleIntoIter, SingleIter, SingleReceiver, SingleRecvFuture,
+            SingleRecvStream,
         },
-        sender::{
-            GenericSendFuture, Sender, SenderFuture, SingleSender
-        },
+        sender::{GenericSendFuture, Sender, SenderFuture, SingleSender},
         shard_power_of_two,
     };
     pub mod mpmc {

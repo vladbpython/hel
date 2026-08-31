@@ -8,6 +8,7 @@ use super::{
 use crate::shim::loom::{park, park_timeout, yield_now};
 use futures_core::Stream;
 use std::{
+    fmt::Debug,
     future::Future,
     hint::spin_loop,
     marker::PhantomData,
@@ -318,17 +319,14 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
 
     pub fn recv_timeout(&self, d: Duration) -> Result<T, RecvError> {
         let start = Instant::now();
-        recv_impl
-        (
-            self.inner.as_ref(), 
-            Some(deadline_after(d))
-        ).map_err(|e| match e {
+        recv_impl(self.inner.as_ref(), Some(deadline_after(d))).map_err(|e| match e {
             RecvError::TimeOut(_) => RecvError::TimeOut(start.elapsed()),
-            other => other
-        })  
+            other => other,
+        })
     }
 
     #[inline]
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub fn try_recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         if max == 0 {
             return (0, self.inner.is_tx_closed() && self.inner.is_empty());
@@ -346,10 +344,12 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
     /// so effectively unbounded, but the call still returns `TimeOut` eventually instead of hanging forever.
     /// Deadline bounds only the wait for the first element, once something arrived, the rest of the batch is collected without
     /// blocking (latency first). The send-side twin `send_batch_timeout` bounds the whole batch instead - the pair is asymmetric on purpose.
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub fn recv_batch(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         recv_batch(self.inner.as_ref(), buf, max, None)
     }
 
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub fn recv_batch_timeout(&self, buf: &mut Vec<T>, max: usize, d: Duration) -> (usize, bool) {
         recv_batch(self.inner.as_ref(), buf, max, Some(deadline_after(d)))
     }
@@ -362,6 +362,7 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Receiver<T, C
         }
     }
 
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub async fn recv_batch_async(&self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         if max == 0 {
             return (0, self.inner.is_tx_closed() && self.inner.is_empty());
@@ -501,14 +502,14 @@ impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
 
     pub fn recv_timeout(&mut self, d: Duration) -> Result<T, RecvError> {
         let start = Instant::now();
-        recv_impl(self.inner.as_ref(), Some(deadline_after(d)))
-        .map_err(|e| match e {
+        recv_impl(self.inner.as_ref(), Some(deadline_after(d))).map_err(|e| match e {
             RecvError::TimeOut(_) => RecvError::TimeOut(start.elapsed()),
-            other => other
+            other => other,
         })
     }
 
     /// Non blocking batch receive
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub fn try_recv_batch(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         if max == 0 {
             // Still report disconnect (audit 2, N13).
@@ -516,24 +517,23 @@ impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
         }
         let (n, dc) = self.inner.pop_batch(buf, max);
         if n > 0 {
-            crate::internal_channel::traits::InnerChannel::notify_senders_n(
-                self.inner.as_ref(),
-                n,
-            );
+            crate::internal_channel::traits::InnerChannel::notify_senders_n(self.inner.as_ref(), n);
             (n, false)
         } else {
             (0, dc)
         }
     }
 
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub fn recv_batch(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         recv_batch(self.inner.as_ref(), buf, max, None)
     }
-    
+
     /// Deadline too large for an `Instant` (e.g. `Duration::MAX`) is clamped to the farthest representable point -centuries away
     /// so effectively unbounded, but the call still returns `TimeOut` eventually instead of hanging forever.
     /// Deadline bounds only the wait for the first element; the rest is collected without blocking.
     /// See the MPMC for the rationale.
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub fn recv_batch_timeout(
         &mut self,
         buf: &mut Vec<T>,
@@ -551,6 +551,7 @@ impl<T: Send + 'static, const CAP: usize> SingleReceiver<T, CAP> {
         }
     }
 
+    #[must_use = "the bool is the disconnect flag - dropping it loses the only exit condition of a drain loop"]
     pub async fn recv_batch_async(&mut self, buf: &mut Vec<T>, max: usize) -> (usize, bool) {
         if max == 0 {
             return (0, self.inner.is_tx_closed() && self.inner.is_empty());
@@ -638,5 +639,50 @@ impl<'a, T: Send + 'static, const CAP: usize> IntoIterator for &'a mut SingleRec
     type IntoIter = SingleIter<'a, T, CAP>;
     fn into_iter(self) -> SingleIter<'a, T, CAP> {
         SingleIter { r: self }
+    }
+}
+
+impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Debug for Receiver<T, CAP, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Receiver").finish_non_exhaustive()
+    }
+}
+impl<T, const CAP: usize> std::fmt::Debug for SingleReceiver<T, CAP> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleReceiver").finish_non_exhaustive()
+    }
+}
+impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Debug
+    for GenericRecvFuture<'_, T, CAP, I>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenericRecvFuture").finish_non_exhaustive()
+    }
+}
+impl<T: Send + 'static, const CAP: usize, I: ReceiverOps<T, CAP>> Debug
+    for GenericRecvStream<'_, T, CAP, I>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenericRecvStream").finish_non_exhaustive()
+    }
+}
+impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Debug for Iter<'_, T, CAP, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Iter").finish_non_exhaustive()
+    }
+}
+impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Debug for IntoIter<T, CAP, I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IntoIter").finish_non_exhaustive()
+    }
+}
+impl<T, const CAP: usize> Debug for SingleIter<'_, T, CAP> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleIter").finish_non_exhaustive()
+    }
+}
+impl<T, const CAP: usize> Debug for SingleIntoIter<T, CAP> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SingleIntoIter").finish_non_exhaustive()
     }
 }

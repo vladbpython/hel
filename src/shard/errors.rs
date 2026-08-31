@@ -14,7 +14,7 @@ impl<T> Display for ShardTrySendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardTrySendError {{ shard: {}, err: {:?} }}",
+            "ShardTrySendError {{ shard: {}, err: {} }}",
             self.shard, self.err
         )
     }
@@ -39,7 +39,7 @@ impl<T> Display for ShardSendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardSendError {{ shard: {}, err: {:?} }}",
+            "ShardSendError {{ shard: {}, err: {} }}",
             self.shard, self.err
         )
     }
@@ -65,7 +65,7 @@ impl<T> Display for ShardKeyTrySendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardKeyTrySendError {{ key: {}, shard: {}, err: {:?} }}",
+            "ShardKeyTrySendError {{ key: {}, shard: {}, err: {} }}",
             self.key, self.shard, self.err
         )
     }
@@ -92,7 +92,7 @@ impl<T> Display for ShardKeySendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardKeySendError {{ key: {}, shard: {}, err: {:?} }}",
+            "ShardKeySendError {{ key: {}, shard: {}, err: {} }}",
             self.key, self.shard, self.err
         )
     }
@@ -120,7 +120,7 @@ impl<T> Display for ShardAsyncSendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardAsyncSendError {{ shard: {}, err: {:?} }}",
+            "ShardAsyncSendError {{ shard: {}, err: {} }}",
             self.shard, self.err
         )
     }
@@ -147,7 +147,7 @@ impl<T> Display for ShardKeyAsyncSendError<T> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardKeyAsyncSendError {{ key: {}, shard: {}, err: {:?} }}",
+            "ShardKeyAsyncSendError {{ key: {}, shard: {}, err: {} }}",
             self.key, self.shard, self.err
         )
     }
@@ -186,11 +186,7 @@ pub struct ShardKeyAsyncSendRefError {
 
 impl Display for ShardKeyAsyncSendRefError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        write!(
-            f,
-            "key {:?} -> shard {}: {}",
-            self.key, self.shard, self.err
-        )
+        write!(f, "key {} -> shard {}: {}", self.key, self.shard, self.err)
     }
 }
 
@@ -205,7 +201,7 @@ impl Display for ShardTryRecvError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardTryRecvError {{ shard: {}, err: {:?} }}",
+            "ShardTryRecvError {{ shard: {}, err: {} }}",
             self.shard, self.err
         )
     }
@@ -224,7 +220,7 @@ impl Display for ShardRecvError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardRecvError {{ shard: {}, err: {:?} }}",
+            "ShardRecvError {{ shard: {}, err: {} }}",
             self.shard, self.err
         )
     }
@@ -241,7 +237,7 @@ impl Display for ShardAsyncRecvError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardAsyncRecvError {{ shard: {}, err: {:?} }}",
+            "ShardAsyncRecvError {{ shard: {}, err: {} }}",
             self.shard, self.err
         )
     }
@@ -260,7 +256,7 @@ impl std::fmt::Display for ShardTryBatchSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ShardTryBatchSendError {{ shard: {}, sent: {}, reason: {:?} }}",
+            "ShardTryBatchSendError {{ shard: {}, sent: {}, reason: {} }}",
             self.shard, self.sent, self.reason
         )
     }
@@ -279,7 +275,7 @@ impl std::fmt::Display for ShardBatchSendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "ShardBatchSendError {{ shard: {}, sent: {}, reason: {:?} }}",
+            "ShardBatchSendError {{ shard: {}, sent: {}, reason: {} }}",
             self.shard, self.sent, self.reason
         )
     }
@@ -317,7 +313,7 @@ impl Display for ShardKeyTryBatchSendError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardKeyTryBatchSendError {{ key: {}, shard: {}, sent: {}, reason: {:?} }}",
+            "ShardKeyTryBatchSendError {{ key: {}, shard: {}, sent: {}, reason: {} }}",
             self.key, self.shard, self.sent, self.reason
         )
     }
@@ -337,7 +333,7 @@ impl Display for ShardKeyBatchSendError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardKeyBatchSendError {{ key: {}, shard: {}, sent: {}, reason: {:?} }}",
+            "ShardKeyBatchSendError {{ key: {}, shard: {}, sent: {}, reason: {} }}",
             self.key, self.shard, self.sent, self.reason
         )
     }
@@ -374,18 +370,18 @@ impl Display for ShardRecvAnyError {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         write!(
             f,
-            "ShardRecvAnyError {{ disconnected: {}, err: {:?} }}",
+            "ShardRecvAnyError {{ disconnected: {}, err: {} }}",
             self.disconnected_shards, self.err
         )
     }
 }
 
-impl<T: Debug> StdError for ShardTrySendError<T> {}
-impl<T: Debug> StdError for ShardSendError<T> {}
-impl<T: Debug> StdError for ShardKeyTrySendError<T> {}
-impl<T: Debug> StdError for ShardKeySendError<T> {}
-impl<T: Debug> StdError for ShardAsyncSendError<T> {}
-impl<T: Debug> StdError for ShardKeyAsyncSendError<T> {}
+impl<T> StdError for ShardTrySendError<T> {}
+impl<T> StdError for ShardSendError<T> {}
+impl<T> StdError for ShardKeyTrySendError<T> {}
+impl<T> StdError for ShardKeySendError<T> {}
+impl<T> StdError for ShardAsyncSendError<T> {}
+impl<T> StdError for ShardKeyAsyncSendError<T> {}
 impl StdError for ShardAsyncSendRefError {}
 impl StdError for ShardKeyAsyncSendRefError {}
 impl StdError for ShardTryRecvError {}

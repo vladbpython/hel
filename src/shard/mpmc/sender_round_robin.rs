@@ -30,11 +30,12 @@ use super::{buf::RestoreOne, receiver::ShardReceiver};
 
 use crate::{
     internal_channel::{
-        core::SeqInner, mpmc_bounded, sender::Sender, shard_power_of_two, traits::InnerChannel,
+        core::SeqInner, errors, helper::deadline_after, mpmc_bounded, sender::Sender,
+        shard_power_of_two, traits::InnerChannel,
     },
     shim::loom::{AtomicUsize, Ordering},
 };
-use std::{sync::Arc, time::Duration};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 
 /// Sharded channel with round robin routing.
 /// Each `push` goes to the next shard in sequence.
@@ -62,18 +63,63 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardRoundRob
     #[inline]
     pub fn try_send(&self, value: T) -> Result<(), shard_error::ShardTrySendError<T>> {
         let shard = self.next_shard();
-        self.senders[shard]
-            .try_send(value)
-            .map_err(|err| shard_error::ShardTrySendError { shard, err })
+        match self.senders[shard].try_send(value) {
+            Ok(()) => Ok(()),
+            Err(errors::TrySendError::Disconnected(v)) => self.try_send_skip_dead(shard, v),
+            Err(err) => Err(shard_error::ShardTrySendError { shard, err }),
+        }
+    }
+
+    /// Cold path of [`Self::try_send`]: probe the remaining shards in order.
+    #[cold]
+    fn try_send_skip_dead(
+        &self,
+        from: usize,
+        mut value: T,
+    ) -> Result<(), shard_error::ShardTrySendError<T>> {
+        for step in 1..=self.mask {
+            let shard = (from + step) & self.mask;
+            match self.senders[shard].try_send(value) {
+                Ok(()) => return Ok(()),
+                Err(errors::TrySendError::Disconnected(v)) => value = v,
+                Err(err) => return Err(shard_error::ShardTrySendError { shard, err }),
+            }
+        }
+        Err(shard_error::ShardTrySendError {
+            shard: from,
+            err: errors::TrySendError::Disconnected(value),
+        })
+    }
+
+    #[cold]
+    fn send_skip_dead(
+        &self,
+        from: usize,
+        mut value: T,
+    ) -> Result<(), shard_error::ShardSendError<T>> {
+        for step in 1..=self.mask {
+            let shard = (from + step) & self.mask;
+            match self.senders[shard].send(value) {
+                Ok(()) => return Ok(()),
+                Err(errors::SendError::Disconnected(v)) => value = v,
+                Err(err) => return Err(shard_error::ShardSendError { shard, err }),
+            }
+        }
+        Err(shard_error::ShardSendError {
+            shard: from,
+            err: errors::SendError::Disconnected(value),
+        })
     }
 
     /// Blocking sending to the next shard.
     #[inline]
     pub fn send(&self, value: T) -> Result<(), shard_error::ShardSendError<T>> {
         let shard = self.next_shard();
-        self.senders[shard]
-            .send(value)
-            .map_err(|err| shard_error::ShardSendError { shard, err })
+        match self.senders[shard].send(value) {
+            Ok(()) => Ok(()),
+            Err(errors::SendError::Disconnected(v)) => self.send_skip_dead(shard, v),
+            Err(err) => Err(shard_error::ShardSendError { shard, err }),
+        }
     }
 
     /// Blocking sending with deadline.
@@ -84,19 +130,69 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardRoundRob
         d: Duration,
     ) -> Result<(), shard_error::ShardSendError<T>> {
         let shard = self.next_shard();
-        self.senders[shard]
-            .send_timeout(value, d)
-            .map_err(|err| shard_error::ShardSendError { shard, err })
+        let deadline = deadline_after(d);
+        match self.senders[shard].send_timeout(value, d) {
+            Ok(()) => Ok(()),
+            Err(errors::SendError::Disconnected(v)) => {
+                self.send_timeout_skip_dead(shard, v, deadline, d)
+            }
+            Err(err) => Err(shard_error::ShardSendError { shard, err }),
+        }
+    }
+
+    #[cold]
+    fn send_timeout_skip_dead(
+        &self,
+        from: usize,
+        mut value: T,
+        deadline: std::time::Instant,
+        d: Duration,
+    ) -> Result<(), shard_error::ShardSendError<T>> {
+        for step in 1..=self.mask {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                // Budget exhausted with live shards unprobed: this is a
+                // timeout, not proof that every shard is dead. The value
+                // rides back inside the error like every other TimeOut.
+                return Err(shard_error::ShardSendError {
+                    shard: from,
+                    err: errors::SendError::TimeOut((value, d)),
+                });
+            }
+            let shard = (from + step) & self.mask;
+            match self.senders[shard].send_timeout(value, left) {
+                Ok(()) => return Ok(()),
+                Err(errors::SendError::Disconnected(v)) => value = v,
+                Err(err) => return Err(shard_error::ShardSendError { shard, err }),
+            }
+        }
+        Err(shard_error::ShardSendError {
+            shard: from,
+            err: errors::SendError::Disconnected(value),
+        })
     }
 
     /// Async sending to the next shard.
     #[inline]
     pub async fn send_async(&self, value: T) -> Result<(), shard_error::ShardAsyncSendError<T>> {
-        let shard = self.next_shard();
-        self.senders[shard]
-            .send_async(value)
-            .await
-            .map_err(|err| shard_error::ShardAsyncSendError { shard, err })
+        let mut shard = self.next_shard();
+        let mut value = value;
+        for step in 0..=self.mask {
+            match self.senders[shard].send_async(value).await {
+                Ok(()) => return Ok(()),
+                Err(errors::AsyncSendError::Disconnected(v)) => {
+                    if step == self.mask {
+                        return Err(shard_error::ShardAsyncSendError {
+                            shard,
+                            err: errors::AsyncSendError::Disconnected(v),
+                        });
+                    }
+                    value = v;
+                    shard = (shard + 1) & self.mask;
+                }
+            }
+        }
+        unreachable!("the loop always returns")
     }
 
     /// Cancel safe async send to the next shard without value loss.
@@ -111,11 +207,18 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardRoundRob
         &self,
         slot: &mut Option<T>,
     ) -> Result<(), shard_error::ShardAsyncSendRefError> {
-        let shard = self.next_shard();
-        self.senders[shard]
-            .send_ref_async(slot)
-            .await
-            .map_err(|err| shard_error::ShardAsyncSendRefError { shard, err })
+        let mut shard = self.next_shard();
+        for step in 0..=self.mask {
+            match self.senders[shard].send_ref_async(slot).await {
+                Ok(()) => return Ok(()),
+                // Disconnected leaves the value in `slot`, so probing the next shard is loss-free.
+                Err(err) if step == self.mask => {
+                    return Err(shard_error::ShardAsyncSendRefError { shard, err });
+                }
+                Err(_) => shard = (shard + 1) & self.mask,
+            }
+        }
+        unreachable!("the loop always returns")
     }
 
     /// Number of shards.
@@ -247,6 +350,10 @@ impl<
 }
 
 /// Constructor RoundRobin sharded channel. `num_shards` is a power of two.
+///
+/// ```compile_fail
+/// let (_tx, _rx) = hel::channel::mpmc::round_robin::<u64, 100>(4);
+/// ```
 pub fn round_robin<T: Send + 'static, const CAP: usize>(
     num_shards: usize,
 ) -> (ShardRoundRobin<T, CAP>, ShardReceiver<T, CAP>) {
@@ -261,6 +368,14 @@ pub fn round_robin<T: Send + 'static, const CAP: usize>(
         },
         ShardReceiver::new(receivers),
     )
+}
+
+impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> Debug
+    for ShardRoundRobin<T, CAP, I>
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShardRoundRobin").finish_non_exhaustive()
+    }
 }
 
 // Tests
@@ -306,7 +421,7 @@ mod tests {
         let counts: Vec<usize> = (0..4)
             .map(|s| {
                 let mut buf = Vec::new();
-                rx.recv_batch(s, &mut buf, 8);
+                let _ = rx.recv_batch(s, &mut buf, 8);
                 buf.len()
             })
             .collect();
@@ -335,7 +450,7 @@ mod tests {
         let total: usize = (0..4)
             .map(|s| {
                 let mut buf = Vec::new();
-                rx.recv_batch(s, &mut buf, 8);
+                let _ = rx.recv_batch(s, &mut buf, 8);
                 buf.len()
             })
             .sum();
@@ -444,7 +559,7 @@ mod tests {
         drop(tx);
         // receivers are alive, data is available
         let mut buf = Vec::new();
-        rx.get_receiver(0).unwrap().recv_batch(&mut buf, 8);
+        let _ = rx.get_receiver(0).unwrap().recv_batch(&mut buf, 8);
         // rx drops last correct order
     }
 
@@ -608,5 +723,58 @@ mod tests {
         let err = tx.send_ref_async(&mut slot).await.unwrap_err();
         assert_eq!(err.err, AsyncSendRefError::Disconnected);
         assert_eq!(slot, Some(1));
+    }
+
+    #[test]
+    fn dead_shards_are_skipped_not_served() {
+        let (tx, rx) = round_robin::<u64, 8>(4);
+        let mut receivers = rx.into_receivers();
+        let kept = receivers.split_off(2); // keep shards 2 and 3
+        drop(receivers); // shards 0 and 1 are dead
+        for i in 0..40u64 {
+            tx.try_send(i)
+                .unwrap_or_else(|e| panic!("send {i} bounced off a dead shard: {e}"));
+            // Drain so the live rings never fill.
+            for r in &kept {
+                while r.try_recv().is_ok() {}
+            }
+        }
+        // Every shard dead -> the error finally surfaces.
+        drop(kept);
+        assert!(tx.try_send(99).is_err(), "all shards dead must error");
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn send_timeout_budget_is_shared_across_probed_shards() {
+        let (tx, rx) = round_robin::<u64, 2>(2);
+        let mut receivers = rx.into_receivers();
+        let rx1 = receivers.pop().unwrap();
+        let rx0 = receivers.pop().unwrap();
+        // Fill both shards so every path has to wait.
+        while tx.try_send(0).is_ok() {}
+        // Align the cursor so the next send starts on shard 0, the one
+        // whose receiver dies mid wait.
+        let _ = tx.try_send(0);
+        let killer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            drop(rx0);
+        });
+        let budget = Duration::from_millis(400);
+        let t = std::time::Instant::now();
+        let err = tx
+            .send_timeout(42, budget)
+            .expect_err("both shards stay full: the send cannot succeed");
+        let elapsed = t.elapsed();
+        killer.join().unwrap();
+        assert!(
+            matches!(err.err, errors::SendError::TimeOut(_)),
+            "a live full shard within budget is a timeout, not disconnect: {err:?}"
+        );
+        assert!(
+            elapsed < budget + Duration::from_millis(60),
+            "budget restarted on the probed shard: spent {elapsed:?} of {budget:?}"
+        );
+        drop(rx1);
     }
 }

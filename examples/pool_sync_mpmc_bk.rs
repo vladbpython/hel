@@ -26,7 +26,8 @@ fn main() {
             s.fetch_add(*v, Relaxed);
         }),
         |_poison, _panic_info| {},
-    ).unwrap();
+    )
+    .unwrap();
 
     let producers: Vec<_> = (0..4)
         .map(|p| {

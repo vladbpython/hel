@@ -4,9 +4,7 @@
 use super::guard::OwnerGuard;
 use super::instance::{self, NONE, State};
 use loom::thread;
-use std::{
-    sync::atomic::Ordering as StdOrdering
-};
+use std::sync::atomic::Ordering as StdOrdering;
 
 #[test]
 fn loom_pool_claim_never_double_owns() {

@@ -1,15 +1,15 @@
 use super::{
-    sync::{Slot, SyncList},
+    sync::{Slot, SyncList, SyncNode},
     traits::{InnerChannel, MultiConsumer, MultiProducer},
 };
 use crate::{cache::Padding, shim};
-use shim::loom::{AtomicBool, AtomicUsize, Ordering};
+use shim::loom::{AtomicBool, AtomicUsize, Ordering, fence, park_timeout, yield_now};
 
 #[cfg(not(loom))]
 use std::hint;
 #[cfg(not(loom))]
 use std::time;
-use std::{mem::MaybeUninit,panic, ptr::addr_of_mut, sync::Arc, thread};
+use std::{mem::MaybeUninit, panic, ptr::addr_of_mut, sync::Arc, thread};
 
 /// Waiting phases push_fetch_add (escalation spin -> yield -> sleep)
 /// Spin budget ≈ cost of the yield stage (~0.5 µs): 64 × ~20 ns ≈ 1.3 µs.
@@ -20,11 +20,17 @@ pub const SENDER_SPIN_COUNT: u32 = 64;
 /// waiting at yield ~0.5-5 µs under load), then the plug is prolonged.
 #[cfg(not(loom))]
 const YIELD_UNTIL: u32 = 256;
-/// Consumer's protracted plug: we sleep in quanta, DO NOT burn the core, which
-/// needed by the consumer himself. Price up to 20 µs of excess latency per
-/// waking up after an already long period of inactivity.
+
+/// Consumer's protracted plug: park on the sender list, do not burn the core,
+/// which is needed by the consumer himself.
+/// This is the starting park timeout; it escalates up to [`PARK_MAX`].
 #[cfg(not(loom))]
-const SLEEP: std::time::Duration = time::Duration::from_micros(20);
+const PARK_MIN: time::Duration = time::Duration::from_micros(20);
+
+/// Cap for the escalating park timeout: notify can wake the wrong waiter,
+/// so the right one must wake on its own - at worst within ~1 ms.
+#[cfg(not(loom))]
+const PARK_MAX: time::Duration = time::Duration::from_millis(1);
 
 #[inline]
 fn notify_one_waiter(list: &SyncList) {
@@ -34,7 +40,7 @@ fn notify_one_waiter(list: &SyncList) {
     // read count==0 before its store becomes visible to the consumer,
     // consumer reread the old seq and park. Lost wakeup,
     // caught Miri (weak memory) on a spinning producer with a full channel.
-    shim::loom::fence(shim::loom::Ordering::SeqCst);
+    fence(Ordering::SeqCst);
     let a = list.async_count_seqcst();
     let b = list.blocking_count_acquire();
     if a > 0 || b > 0 {
@@ -79,11 +85,12 @@ pub struct SeqInner<T, const CAP: usize> {
 
 impl<T, const CAP: usize> SeqInner<T, CAP> {
     pub fn new() -> Arc<Self> {
-        assert!(CAP.is_power_of_two(), "CAP must be a power of two");
-        assert!(
-            CAP >= 2,
-            "sequence ring requires CAP >= 2: at CAP=1 the 'free' (seq == pos) and 'consumed' (seq == pos + CAP) conditions collide, allowing silent overwrite (found by loom algo_ring_1p1c_wraparound_exact)"
-        );
+        const {
+            assert!(
+                CAP.is_power_of_two() && CAP >= 2,
+                "channel CAP must be a power of two and >= 2"
+            );
+        }
         let mut uninit: Arc<MaybeUninit<Self>> = Arc::new_uninit();
         // get_mut gives &mut MaybeUninit<Self> (Arc is unique, just created)
         let slot_ptr = Arc::get_mut(&mut uninit).unwrap();
@@ -175,7 +182,7 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
             #[cfg(loom)]
             {
                 let _ = waits;
-                shim::loom::yield_now(); // every wait step is a loom branch
+                yield_now(); // every wait step is a loom branch
             }
             #[cfg(not(loom))]
             if waits < SENDER_SPIN_COUNT {
@@ -183,7 +190,31 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
             } else if waits < YIELD_UNTIL {
                 thread::yield_now();
             } else {
-                thread::sleep(SLEEP);
+                let mut timeout = PARK_MIN;
+                let mut seen_head = self.head.load(Ordering::Acquire);
+                loop {
+                    let mut node = SyncNode::new_blocking();
+                    let parked = self.send_waiters.sync_guard(&mut node);
+                    if slot.sequence.load(Ordering::Acquire) == pos {
+                        drop(parked);
+                        break;
+                    }
+                    if self.rx_closed.load(Ordering::Acquire) {
+                        drop(parked);
+                        return Err(value);
+                    }
+                    park_timeout(timeout);
+                    drop(parked);
+                    let h = self.head.load(Ordering::Acquire);
+                    if h != seen_head {
+                        seen_head = h;
+                        if slot.sequence.load(Ordering::Acquire) != pos {
+                            notify_one_waiter(&self.send_waiters);
+                        }
+                    }
+                    timeout = (timeout * 2).min(PARK_MAX);
+                }
+                break;
             }
         }
         slot.data.with_mut(|p| unsafe { (*p).write(value) });
@@ -232,7 +263,7 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
 
 impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, CAP> {
     const MULTI_CONSUMER: bool = true;
-    
+
     #[inline]
     fn push(&self, v: T) -> Result<(), T> {
         self.push_inner(v)
@@ -292,7 +323,7 @@ impl<T: Send + 'static, const CAP: usize> InnerChannel<T, CAP> for SeqInner<T, C
                 // Window “CAS head -> seq.store” for the consumer. yield_now, as in
                 // push_fetch_add: gives the scheduler (and Miri) a switch point;
                 // pure spin_loop here livelock under Miri with preemption rate=0.
-                shim::loom::yield_now();
+                yield_now();
             }
         }
         for (i, value) in buf.drain(..k).enumerate() {
@@ -401,7 +432,6 @@ impl<T, const CAP: usize> Drop for SeqInner<T, CAP> {
                     slot.data.with_mut(|p| unsafe { (*p).assume_init_drop() });
                 }));
             }
-            
         }
     }
 }
@@ -425,11 +455,12 @@ pub struct SingleInner<T, const CAP: usize> {
 
 impl<T, const CAP: usize> SingleInner<T, CAP> {
     pub fn new() -> Arc<Self> {
-        assert!(CAP.is_power_of_two(), "CAP must be a power of two");
-        assert!(
-            CAP >= 2,
-            "sequence ring requires CAP >= 2: at CAP=1 the 'free' (seq == pos) and 'consumed' (seq == pos + CAP) conditions collide, allowing silent overwrite (found by loom algo_ring_1p1c_wraparound_exact)"
-        );
+        const {
+            assert!(
+                CAP.is_power_of_two() && CAP >= 2,
+                "channel CAP must be a power of two and >= 2"
+            );
+        }
         let mut uninit: Arc<MaybeUninit<Self>> = Arc::new_uninit();
         let ptr = Arc::get_mut(&mut uninit).unwrap().as_mut_ptr();
         unsafe {
@@ -511,7 +542,7 @@ impl<T, const CAP: usize> SingleInner<T, CAP> {
                 }
                 // Window CAS head -> seq.store for the consumer. yield_now, as in
                 // push_fetch_add: gives the scheduler a switch point.
-                shim::loom::yield_now();
+                yield_now();
             }
         }
         self.tail.store(pos.wrapping_add(k), Ordering::Relaxed);
@@ -685,12 +716,11 @@ impl<T, const CAP: usize> Drop for SingleInner<T, CAP> {
         for n in 0..count {
             let pos = head.wrapping_add(n);
             let slot = &self.slots[pos & mask];
-            if slot.sequence.load(Ordering::Relaxed) == pos.wrapping_add(1){
+            if slot.sequence.load(Ordering::Relaxed) == pos.wrapping_add(1) {
                 let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                     slot.data.with_mut(|p| unsafe { (*p).assume_init_drop() });
                 }));
             }
-            
         }
     }
 }
@@ -704,8 +734,8 @@ mod core_init_tests {
     use std::{
         panic,
         sync::{
-            atomic::{AtomicU32,Ordering},
             Once,
+            atomic::{AtomicU32, Ordering},
         },
         time::{Duration, Instant},
     };
@@ -854,18 +884,6 @@ mod core_init_tests {
         let (n, _closed) = inner.pop_batch(&mut out, 10);
         assert_eq!(n, 4);
         assert_eq!(out, vec![1, 2, 3, 4]); // FIFO order
-    }
-
-    #[test]
-    #[should_panic(expected = "CAP >= 2")]
-    fn seq_cap_one_rejected() {
-        let _ = SeqInner::<u64, 1>::new();
-    }
-
-    #[test]
-    #[should_panic(expected = "CAP >= 2")]
-    fn single_cap_one_rejected() {
-        let _ = SingleInner::<u64, 1>::new();
     }
 
     #[test]
@@ -1075,6 +1093,31 @@ mod core_init_tests {
             5,
             "sealed/reserved slot was dropped (UB) or a recorded one leaked"
         );
+    }
+
+    #[test]
+    fn parked_blocked_producer_is_admitted_after_one_pop() {
+        let inner = SeqInner::<u64, 2>::new();
+        inner.push_fetch_add(1).unwrap();
+        inner.push_fetch_add(2).unwrap(); // full
+        let t = {
+            let inner = inner.clone();
+            thread::spawn(move || inner.push_fetch_add(3))
+        };
+        // Far past spin (64) + yield (192) - the producer is parked.
+        thread::sleep(Duration::from_millis(50));
+        let start = Instant::now();
+        assert_eq!(inner.pop(), Some(1));
+        inner.notify_senders(); // what every recv path does after a pop
+        t.join().unwrap().unwrap();
+        #[cfg(not(miri))] // miri's interpreter overhead makes wall time meaningless
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "parked producer was not admitted promptly after a pop: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(inner.pop(), Some(2));
+        assert_eq!(inner.pop(), Some(3));
     }
 
     #[test]

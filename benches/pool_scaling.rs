@@ -73,7 +73,8 @@ fn run_sync(shards: usize, consumers: usize, work: u32, n: u64) -> Duration {
             p.fetch_add(1, Ordering::Relaxed);
         }),
         |_poison: u64, _panic_info| {},
-    ).unwrap();
+    )
+    .unwrap();
 
     thread::sleep(Duration::from_millis(5)); // warming up workers
 
@@ -122,7 +123,8 @@ fn run_async(rt: &Runtime, shards: usize, consumers: usize, work: u32, n: u64) -
                 }
             }),
             |_poison: u64, _panic_info| {},
-        ).unwrap();
+        )
+        .unwrap();
 
         tokio::time::sleep(Duration::from_millis(5)).await; // warming up workers
 
@@ -171,7 +173,8 @@ fn run_sync_key(shards: usize, consumers: usize, work: u32, n: u64) -> Duration 
             p.fetch_add(1, Ordering::Relaxed);
         }),
         |_poison: u64, _panic_info| {},
-    ).unwrap();
+    )
+    .unwrap();
     thread::sleep(Duration::from_millis(5));
 
     let keys = Arc::new(make_keys(shards));
@@ -220,7 +223,8 @@ fn run_sync_group(shards: usize, consumers: usize, work: u32, n: u64) -> Duratio
             p.fetch_add(1, Ordering::Relaxed);
         }),
         |_poison: u64, _panic_info| {},
-    ).unwrap();
+    )
+    .unwrap();
     thread::sleep(Duration::from_millis(5));
 
     let n_producers = 2;
@@ -266,7 +270,8 @@ fn run_async_key(rt: &Runtime, shards: usize, consumers: usize, work: u32, n: u6
                 }
             }),
             |_poison: u64, _panic_info| {},
-        ).unwrap();
+        )
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
 
         let keys = Arc::new(make_keys(shards));
@@ -322,7 +327,8 @@ fn run_async_group(rt: &Runtime, shards: usize, consumers: usize, work: u32, n: 
                 }
             }),
             |_poison: u64, _panic_info| {},
-        ).unwrap();
+        )
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
 
         let n_producers = 2;
@@ -525,7 +531,8 @@ fn run_sync_faults(
             dc.fetch_add(1, Ordering::Relaxed);
             ds.fetch_add(poison, Ordering::Relaxed);
         },
-    ).unwrap();
+    )
+    .unwrap();
     thread::sleep(Duration::from_millis(5));
 
     let n_producers = 2;
@@ -601,7 +608,8 @@ fn run_async_faults(
                 dc.fetch_add(1, Ordering::Relaxed);
                 ds.fetch_add(poison, Ordering::Relaxed);
             },
-        ).unwrap();
+        )
+        .unwrap();
         tokio::time::sleep(Duration::from_millis(5)).await;
 
         let n_producers = 2;
