@@ -4,7 +4,7 @@ use super::{
     receiver::ShardReceiver,
 };
 use crate::internal_channel::{
-    core::SeqInner, helper::deadline_after, mpmc_bounded, sender::Sender, shard_power_of_two,
+    core::SeqInner, helper::deadline_after, mpmc_bounded, sender::Sender,
     traits::InnerChannel,
 };
 use std::{
@@ -62,13 +62,14 @@ pub struct ShardGroup<
     /// key → shard index (group). For Arc cheap to clone and divide
     /// with ShardHandle. Used when resolving (handle), not on the hot path.
     route: Arc<HashMap<String, usize>>,
-    mask: usize,
+    /// Index of the last shard.
+    last: usize,
 }
 
 impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
     /// Create from an explicit list of groups. Group i → shard i.
     pub fn from_groups(groups: &[&[&str]]) -> (Self, ShardReceiver<T, CAP>) {
-        let n = shard_power_of_two(groups.len().max(1));
+        let n = groups.len().max(1);
         let (senders, receivers): (Vec<_>, Vec<_>) =
             (0..n).map(|_| mpmc_bounded::<T, CAP>()).unzip();
 
@@ -82,7 +83,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         let group = Self {
             senders: senders.into(),
             route: Arc::new(route),
-            mask: n - 1,
+            last: n - 1,
         };
         (group, ShardReceiver::new(receivers))
     }
@@ -94,7 +95,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         num_groups: usize,
     ) -> (Self, ShardReceiver<T, CAP>) {
         let groups = num_groups.max(1);
-        let n = shard_power_of_two(groups);
+        let n = groups;
         let (senders, receivers): (Vec<_>, Vec<_>) =
             (0..n).map(|_| mpmc_bounded::<T, CAP>()).unzip();
 
@@ -103,7 +104,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         let group = Self {
             senders: senders.into(),
             route: Arc::new(route),
-            mask: n - 1,
+            last: n - 1,
         };
         (group, ShardReceiver::new(receivers))
     }
@@ -126,7 +127,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
     /// Number of shards (groups).
     #[inline(always)]
     pub fn shards(&self) -> usize {
-        self.mask + 1
+        self.last + 1
     }
 
     /// How many keys are registered.
@@ -142,7 +143,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         h: SymbolHandle,
         value: T,
     ) -> Result<(), shard_error::ShardTrySendError<T>> {
-        let idx = h.shard & self.mask;
+        let idx = h.shard.min(self.last);
         self.senders[idx]
             .try_send(value)
             .map_err(|err| shard_error::ShardTrySendError { shard: idx, err })
@@ -151,7 +152,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
     /// Blocking sending by handle.
     #[inline(always)]
     pub fn send(&self, h: SymbolHandle, value: T) -> Result<(), shard_error::ShardSendError<T>> {
-        let idx = h.shard & self.mask;
+        let idx = h.shard.min(self.last);
         self.senders[idx]
             .send(value)
             .map_err(|err| shard_error::ShardSendError { shard: idx, err })
@@ -165,7 +166,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         value: T,
         d: Duration,
     ) -> Result<(), shard_error::ShardSendError<T>> {
-        let idx = h.shard & self.mask;
+        let idx = h.shard.min(self.last);
         self.senders[idx]
             .send_timeout(value, d)
             .map_err(|err| shard_error::ShardSendError { shard: idx, err })
@@ -178,7 +179,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         h: SymbolHandle,
         value: T,
     ) -> Result<(), shard_error::ShardAsyncSendError<T>> {
-        let idx = h.shard & self.mask;
+        let idx = h.shard.min(self.last);
         self.senders[idx]
             .send_async(value)
             .await
@@ -195,7 +196,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         h: SymbolHandle,
         slot: &mut Option<T>,
     ) -> Result<(), shard_error::ShardAsyncSendRefError> {
-        let idx = h.shard & self.mask;
+        let idx = h.shard.min(self.last);
         self.senders[idx]
             .send_ref_async(slot)
             .await
@@ -211,7 +212,7 @@ impl<T: Send + 'static, const CAP: usize> ShardGroup<T, CAP> {
         buf: &mut Vec<T>,
         key_fn: impl for<'k> Fn(&'k T) -> &'k str,
     ) -> (Vec<Vec<T>>, Vec<T>) {
-        let n = self.mask + 1;
+        let n = self.last + 1;
         let mut groups: Vec<Vec<T>> = (0..n).map(|_| Vec::new()).collect();
         let mut unused: Vec<T> = Vec::new();
         let mut poisoned: Option<(Box<dyn Any + Send>, Vec<T>)> = None;
@@ -501,7 +502,7 @@ impl<T: Send + 'static, const CAP: usize> Clone for ShardGroup<T, CAP> {
         Self {
             senders,
             route: self.route.clone(),
-            mask: self.mask,
+            last: self.last,
         }
     }
 }
@@ -938,6 +939,24 @@ mod key_fn_panic_and_orphan_tests {
             });
         }
         // The phantom shard stays empty: nothing routes there any more.
-        assert!(rx.try_recv(3).is_err(), "phantom shard must stay empty");
+        assert_eq!(tx.shards(), 3, "3 declared groups must be 3 shards");
+    }
+    
+    #[test]
+    fn shard_count_matches_declared_groups_exactly() {
+        let (tx, rx) = ShardGroup::<u64, 4>::from_groups(&[&["a"], &["b"], &["c"]]);
+        assert_eq!(tx.shards(), 3, "3 groups are 3 shards, not 4");
+        assert_eq!(
+            rx.into_receivers().len(),
+            3,
+            "no receiver for a phantom shard"
+        );
+        let map: HashMap<String, usize> = [("k".to_string(), 0usize)].into_iter().collect();
+        let (tx, rx) = ShardGroup::<u64, 4>::from_map(map, 5);
+        assert_eq!(tx.shards(), 5, "5 declared groups are 5 shards, not 8");
+        assert_eq!(rx.into_receivers().len(), 5);
+        // Degenerate input still floors to one shard, as before.
+        let (tx, _rx) = ShardGroup::<u64, 4>::from_map(HashMap::new(), 0);
+        assert_eq!(tx.shards(), 1);
     }
 }

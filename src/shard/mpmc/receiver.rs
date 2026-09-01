@@ -51,16 +51,13 @@ pub struct ShardReceiver<
 > {
     pub(crate) receivers: Vec<Receiver<T, CAP, I>>,
     cursor: usize,
-    mask: usize,
 }
 
 impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardReceiver<T, CAP, I> {
     pub(crate) fn new(receivers: Vec<Receiver<T, CAP, I>>) -> Self {
-        let mask = receivers.len().saturating_sub(1);
         Self {
             receivers,
             cursor: 0,
-            mask,
         }
     }
 
@@ -70,7 +67,7 @@ impl<T: Send + 'static, const CAP: usize, I: InnerChannel<T, CAP>> ShardReceiver
 
     /// The shard index for the key is only for ByKey (ShardedKey).
     pub fn shard_for(&self, key: &str) -> usize {
-        hash_key(key) & self.mask
+        hash_key(key) % self.receivers.len().max(1)
     }
 
     #[inline]

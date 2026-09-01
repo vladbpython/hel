@@ -55,10 +55,11 @@ mod tests {
 
     #[test]
     fn short_key_distribution_stays_even() {
+        const N: u64 = if cfg!(miri) { 2_000 } else { 100_000 };
         for shards in [4usize, 16] {
             let mask = shards - 1;
             let mut counts = vec![0usize; shards];
-            for i in 0..100_000u64 {
+            for i in 0..N {
                 counts[hash_key(&format!("user:{i}")) & mask] += 1;
             }
             let (min, max) = (*counts.iter().min().unwrap(), *counts.iter().max().unwrap());
