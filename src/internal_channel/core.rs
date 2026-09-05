@@ -1,4 +1,5 @@
 use super::{
+    helper::backoff,
     sync::{Slot, SyncList, SyncNode},
     traits::{InnerChannel, MultiConsumer, MultiProducer},
 };
@@ -120,6 +121,7 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
     fn push_inner(&self, value: T) -> Result<(), T> {
         let mask = CAP - 1;
         let mut tail = self.tail.load(Ordering::Relaxed);
+        let mut wait = 0u32;
         loop {
             let slot = &self.slots[tail & mask];
             let seq = slot.sequence.load(Ordering::Acquire);
@@ -136,11 +138,15 @@ impl<T, const CAP: usize> SeqInner<T, CAP> {
                         slot.sequence.store(tail.wrapping_add(1), Ordering::Release);
                         return Ok(());
                     }
-                    Err(t) => tail = t,
+                    Err(t) => {
+                        tail = t;
+                        backoff(&mut wait);
+                    }       
                 }
             } else if diff < 0 {
                 return Err(value);
             } else {
+                backoff(&mut wait);
                 tail = self.tail.load(Ordering::Acquire);
             }
         }

@@ -1,6 +1,6 @@
 [package]
 name = "hel-rs"
-version = "2.7.1"
+version = "2.7.2"
 edition = "2024"
 authors = ["Bieliaiev Vladyslav <vladbpython@gmail.com>"]
 description = "High-performance sharded sync+async MPMC/SPSC channels with keyed routing"
